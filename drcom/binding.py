@@ -284,7 +284,11 @@ def find_port_holders(port: int) -> list[str]:
     for line in output.splitlines():
         parts = line.split()
         if len(parts) >= 4 and parts[0].upper().startswith("UDP") and parts[1].endswith(needle):
-            pids.add(parts[-1])
+            candidate = parts[-1]
+            # Only digits: the value is interpolated into a tasklist filter, and
+            # netstat output is not something we control.
+            if candidate.isdigit():
+                pids.add(candidate)
 
     holders: list[str] = []
     for pid in pids:

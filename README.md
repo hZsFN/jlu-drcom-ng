@@ -114,11 +114,26 @@ Off by default; enable it under *Settings → Local status API*.
 
 ```
 GET  /status   /health   /metrics   /stats   /logs   /diag
-POST /login    /logout   /reconnect /probe
+POST /login    /logout   /reconnect /probe        (needs a token)
 ```
 
-It binds to `127.0.0.1` only. `/metrics` is Prometheus text format, so it drops
-straight into a dashboard. A JSON status file is written alongside it.
+Read endpoints are open; the four control endpoints require a per-run token in
+the `X-DrCOM-Token` header. The token is generated at startup, written to
+`api-token.txt` in the data directory, and also shown on the *About* page:
+
+```bash
+TOKEN=$(cat ~/AppData/Roaming/DrCOM-JLU/api-token.txt)
+curl -X POST -H "X-DrCOM-Token: $TOKEN" http://127.0.0.1:8848/reconnect
+```
+
+Why a token and not just "localhost only": the request comes *from* 127.0.0.1
+even when it is a web page in your browser that made it, so an address check
+alone lets any site you visit POST to the API (cross-site request forgery).
+Requiring a custom header forces a CORS preflight, which the server never
+grants. `Origin` and `Host` are validated too, which also blocks DNS rebinding.
+
+It binds to `127.0.0.1` by default. `/metrics` is Prometheus text format, so it
+drops straight into a dashboard. A JSON status file is written alongside it.
 
 ---
 

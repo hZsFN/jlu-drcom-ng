@@ -11,6 +11,7 @@ actually holds the window open is ``page.window.prevent_close``.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -36,9 +37,16 @@ class _StubTray:
 
 @pytest.fixture
 def exits(monkeypatch) -> list:
-    """Capture ``os._exit`` so a quit test does not kill the runner."""
+    """Intercept the real process exit.
+
+    Patch ``DrcomApp._hard_exit`` rather than ``os._exit``: the watchdog thread
+    exists precisely to call it, and patching ``os`` globally would leave that
+    thread armed with the real exit once the test's monkeypatch expired.
+    """
+    import drcom.ui.app as ui_app
+
     recorded: list = []
-    monkeypatch.setattr("os._exit", lambda code=0: recorded.append(code))
+    monkeypatch.setattr(ui_app.DrcomApp, "_hard_exit", lambda self: recorded.append(0))
     return recorded
 
 
@@ -52,6 +60,9 @@ def app(controller, monkeypatch):
     monkeypatch.setattr(type(controller), "start_background", lambda self: None)
 
     instance = ui_app.DrcomApp(controller, enable_tray=False)
+    # Long enough that a test which does not finish the shutdown cannot have its
+    # watchdog fire into the next test.
+    instance.quit_watchdog_seconds = 60.0
     instance.page = FakePage()
     return instance
 
@@ -181,10 +192,73 @@ def test_tray_without_a_tray_minimises_instead(app) -> None:
 
 
 def test_quit_exits(app, exits) -> None:
+    """Quit must tear down synchronously and hand the window close to Flet.
+
+    The old code called ``page.window.destroy()`` without awaiting it.  In Flet
+    1.0 that method is a coroutine, so the call built an object and dropped it:
+    the client was never told to close, Python died, and the native window was
+    left on screen with no backend -- alive-looking but inert.  That orphan is
+    what made "点设置没反应" look like a broken settings tab.
+    """
     app.controller.config.ui.close_action = "quit"
     app._on_window_event(close_event())
-    assert exits == [0]
+
+    # Teardown happens now...
     assert app.page.window.prevent_close is False, "the intercept must be released"
+    # ...and the window close is queued as a task rather than fired and dropped.
+    assert app.page.tasks, "the window close was never scheduled"
+    handler, _ = app.page.tasks[-1]
+    assert handler == app._finish_quit
+
+    asyncio.run(app._finish_quit())  # stands the watchdog down
+    assert exits == [0]
+
+
+def test_finish_quit_awaits_the_destroy(app, exits) -> None:
+    """The scheduled finaliser must actually await destroy(), then exit."""
+    destroyed: list = []
+
+    class _RecordingWindow:
+        prevent_close = False
+
+        async def destroy(self) -> None:      # async, exactly like Flet 1.0
+            destroyed.append(True)
+
+    app.page.window = _RecordingWindow()
+    asyncio.run(app._finish_quit())
+
+    assert destroyed == [True], "destroy() was not awaited"
+    assert exits == [0], "the process never exited"
+
+
+def test_finish_quit_exits_even_if_destroy_fails(app, exits) -> None:
+    class _BrokenWindow:
+        async def destroy(self) -> None:
+            raise RuntimeError("client is wedged")
+
+    app.page.window = _BrokenWindow()
+    asyncio.run(app._finish_quit())
+    assert exits == [0], "a wedged client must not strand the process"
+
+
+def test_quit_starts_a_watchdog(app, exits) -> None:
+    """Belt and braces: even if the finaliser never runs, the process exits."""
+    app.quit_watchdog_seconds = 0.05
+    app._quit()
+    time.sleep(0.6)
+    assert exits == [0], "the watchdog never fired"
+
+
+def test_watchdog_stands_down_after_a_clean_shutdown(app, exits) -> None:
+    """A completed shutdown must not leave the watchdog armed."""
+    app.quit_watchdog_seconds = 0.05
+    app._quit()
+    asyncio.run(app._finish_quit())
+    assert exits == [0]
+
+    exits.clear()
+    time.sleep(0.6)
+    assert exits == [], "the watchdog fired after the shutdown had finished"
 
 
 def test_other_window_events_are_ignored(app) -> None:
@@ -221,7 +295,8 @@ def test_choosing_quit_remembers_it(app, exits) -> None:
     click(button_labelled(dialog, "退出程序"))
 
     assert app.controller.config.ui.close_action == "quit"
-    assert exits == [0]
+    assert app.page.window.prevent_close is False
+    assert app.page.tasks, "quitting must schedule the window close"
 
 
 def test_choice_is_not_remembered_unless_ticked(app) -> None:
@@ -276,9 +351,9 @@ def test_settings_selector_reflects_and_changes_the_action(app) -> None:
     view = app._build_view("设置")
 
     control = app.close_action_control
-    assert control.selected == {"ask"}
+    assert control.selected == ["ask"]
 
-    control.selected = {"quit"}
+    control.selected = ["quit"]
     control.on_change(FakeEvent(control=control, data="quit"))
 
     assert app.controller.config.ui.close_action == "quit"
@@ -293,7 +368,7 @@ def test_settings_event_shapes_are_all_accepted(app) -> None:
     control = app.close_action_control
 
     # Shape 1, the normal one: the control already holds the new selection.
-    control.selected = {"tray"}
+    control.selected = ["tray"]
     app._on_close_action_change(FakeEvent(control=control))
     assert app.controller.config.ui.close_action == "tray"
 
@@ -301,8 +376,8 @@ def test_settings_event_shapes_are_all_accepted(app) -> None:
     app._on_close_action_change(FakeEvent(control=None, data="quit"))
     assert app.controller.config.ui.close_action == "quit"
 
-    # Shape 3: same, but as a one-element set.
-    app._on_close_action_change(FakeEvent(control=None, data={"ask"}))
+    # Shape 3: same, but as a one-element list (Flet's declared type).
+    app._on_close_action_change(FakeEvent(control=None, data=["ask"]))
     assert app.controller.config.ui.close_action == "ask"
 
 
@@ -318,11 +393,11 @@ def test_remembering_refreshes_the_settings_control(app_with_tray) -> None:
     # request that fixture resolves to the module-level fixture *function*.
     app_with_tray.view_host = None
     app_with_tray._build_view("设置")
-    assert app_with_tray.close_action_control.selected == {"ask"}
+    assert app_with_tray.close_action_control.selected == ["ask"]
 
     app_with_tray._on_window_event(close_event())
     dialog = app_with_tray.page.dialogs[-1]
     checkbox_in(dialog).value = True
     click(button_labelled(dialog, "最小化到托盘"))
 
-    assert app_with_tray.close_action_control.selected == {"tray"}, "the settings view is now stale"
+    assert app_with_tray.close_action_control.selected == ["tray"], "the settings view is now stale"

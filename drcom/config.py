@@ -169,10 +169,23 @@ class ReconnectConfig:
     quiet_hours_delay: float = 300.0
 
 
+#: What the window's X button does.  Three states rather than a bool, because
+#: "remember my choice" needs a third answer that is also the default: ask.
+CLOSE_ACTIONS = ("ask", "tray", "quit")
+
+#: Human-readable names, shared by the settings selector and the toast.
+CLOSE_ACTION_LABELS = {
+    "ask": "每次询问",
+    "tray": "最小化到托盘",
+    "quit": "直接退出",
+}
+
+
 @dataclass
 class UiConfig:
     minimize_to_tray: bool = True
-    close_to_tray: bool = True
+    #: "ask" pops a chooser, "tray" hides to the tray, "quit" exits.
+    close_action: str = "ask"
     start_minimized: bool = False
     autostart: bool = False
     auto_login_on_launch: bool = True
@@ -188,6 +201,12 @@ class UiConfig:
     #: a monitoring panel a moving highlight reads as flicker rather than as
     #: information.  The static fine scanlines stay on either way.
     scanline_animation: bool = False
+
+    def __post_init__(self) -> None:
+        # A hand-edited config could hold anything; an unknown action must not
+        # leave the X button dead, so fall back to asking.
+        if self.close_action not in CLOSE_ACTIONS:
+            self.close_action = "ask"
 
 
 @dataclass

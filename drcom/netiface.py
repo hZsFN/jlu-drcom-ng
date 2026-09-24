@@ -425,18 +425,3 @@ def _interface_addresses() -> dict[int, list[str]]:
         mapping[int(entry.IfIndex)] = addrs
         node = entry.Next
     return mapping
-
-
-def _run(cmd: list[str], timeout: float = 5.0) -> str:
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            creationflags=0x08000000 if IS_WINDOWS else 0,
-            errors="replace",
-        )
-        return proc.stdout or ""
-    except (OSError, subprocess.SubprocessError):
-        return ""

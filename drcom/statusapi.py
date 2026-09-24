@@ -15,8 +15,10 @@ state change so it is always self-consistent.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -26,6 +28,32 @@ from pathlib import Path
 __all__ = ["StatusServer", "StatusWriter", "build_status_payload"]
 
 MAX_BODY = 4096
+
+#: Host header values that mean "this machine".  Anything else is refused, which
+#: is what stops a DNS-rebinding page from reaching the API through a name it
+#: controls but that resolves to 127.0.0.1.
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", ""}
+
+
+def _prometheus_escape(value: str) -> str:
+    """Escape a Prometheus label value (backslash, quote, newline)."""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _parse_content_length(raw: str | None) -> int:
+    """Content-Length -> a sane non-negative int, never an exception.
+
+    A bare ``int()`` here raised ValueError inside the request handler for any
+    malformed header, which a trivial ``Content-Length: abc`` request could
+    trigger.
+    """
+    try:
+        value = int(str(raw or "0").strip() or "0")
+    except (TypeError, ValueError):
+        return 0
+    if value <= 0:
+        return 0
+    return min(value, MAX_BODY)
 
 
 def build_status_payload(controller) -> dict:
@@ -107,7 +135,9 @@ def render_metrics(payload: dict) -> str:
         if key in traffic:
             lines.append(emit(f"drcom_traffic_{key}", traffic[key], f"Traffic: {key}"))
     for item in payload.get("quality") or []:
-        target = item.get("target", "")
+        # A target can contain quotes or newlines, which would otherwise break
+        # out of the label and inject bogus metrics into the exposition output.
+        target = _prometheus_escape(item.get("target", ""))
         if item.get("rtt_ms") is not None:
             lines.append(
                 emit("drcom_probe_rtt_ms", item["rtt_ms"], "Probe RTT", f'target="{target}"')
@@ -148,6 +178,11 @@ class StatusServer:
         self.log = log
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        #: Random per-run token required on every control (POST) endpoint.
+        #: Requiring a custom header is what actually defeats cross-site
+        #: requests: a browser must preflight any request carrying one, and we
+        #: never answer the preflight, so the call never reaches the handler.
+        self.control_token = secrets.token_urlsafe(24)
 
     @property
     def is_running(self) -> bool:
@@ -159,10 +194,37 @@ class StatusServer:
             return self.port
         return self._server.server_address[1]
 
+    @property
+    def is_loopback(self) -> bool:
+        return (self.host or "").strip() in ("127.0.0.1", "localhost", "::1")
+
     def start(self) -> tuple[bool, str]:
         if self.is_running:
             return True, f"已在运行：http://{self.host}:{self.bound_port}/status"
         controller = self.controller
+
+        if self.log:
+            self.log.info(
+                "状态接口控制令牌（POST 端点需要它，取值见 %s）：%s",
+                self.controller.data_dir / "api-token.txt",
+                self.control_token,
+            )
+            if not self.is_loopback:
+                self.log.warning(
+                    "状态接口绑定在 %s（非回环地址），局域网内其他机器也能访问；"
+                    "控制端点仍要求令牌，但请确认这确实是你想要的。",
+                    self.host,
+                )
+        try:
+            (self.controller.data_dir / "api-token.txt").write_text(
+                self.control_token + "\n", encoding="utf-8"
+            )
+            try:
+                os.chmod(self.controller.data_dir / "api-token.txt", 0o600)
+            except OSError:
+                pass
+        except OSError:
+            pass
 
         class Handler(BaseHTTPRequestHandler):
             server_version = "DrCOM-JLU"
@@ -185,11 +247,79 @@ class StatusServer:
                 self._send(json.dumps(data, ensure_ascii=False).encode("utf-8"), status)
 
             def _local_only(self) -> bool:
+                """Is the peer on this machine?  First of three checks."""
                 peer = self.client_address[0] if self.client_address else ""
                 return peer in ("127.0.0.1", "::1", "localhost")
 
+            def _host_is_loopback(self) -> bool:
+                """Reject DNS-rebinding: the Host must name this machine.
+
+                A page on evil.example can point that name at 127.0.0.1, but it
+                cannot stop the browser from sending ``Host: evil.example``.
+                """
+                host = (self.headers.get("Host") or "").strip()
+                if not host:
+                    return True  # HTTP/1.0 clients may omit it; token still applies
+                bare = host.rsplit(":", 1)[0] if not host.startswith("[") else host.split("]")[0] + "]"
+                return bare.lower() in _LOOPBACK_HOSTS
+
+            def _origin_is_same_site(self) -> bool:
+                """Reject cross-site requests by Origin, when the browser sends one."""
+                origin = (self.headers.get("Origin") or "").strip()
+                if not origin or origin == "null":
+                    # A missing Origin is normal for non-browser clients; the
+                    # token requirement below still applies.
+                    return True
+                for prefix in ("http://127.0.0.1", "http://localhost", "http://[::1]"):
+                    if origin.startswith(prefix):
+                        return True
+                return False
+
+            def _token_ok(self) -> bool:
+                supplied = self.headers.get("X-DrCOM-Token") or ""
+                # `controller` is captured from the enclosing scope; the token
+                # lives on the StatusServer, not on the HTTP server object.
+                expected = controller.api.control_token
+                return bool(supplied) and hmac.compare_digest(supplied, expected)
+
+            def _authorise_control(self) -> bool:
+                """All three guards must pass for a state-changing endpoint."""
+                if not self._local_only():
+                    self._json({"error": "control endpoints are localhost-only"}, status=403)
+                    return False
+                if not self._host_is_loopback():
+                    self._json(
+                        {"error": "bad Host header", "hint": "use 127.0.0.1 or localhost"},
+                        status=403,
+                    )
+                    return False
+                if not self._origin_is_same_site():
+                    self._json({"error": "cross-site requests are refused"}, status=403)
+                    return False
+                if not self._token_ok():
+                    self._json(
+                        {
+                            "error": "missing or bad X-DrCOM-Token",
+                            "hint": "the token is in api-token.txt in the data directory",
+                        },
+                        status=403,
+                    )
+                    return False
+                return True
+
             # -- routes --
+            def do_OPTIONS(self) -> None:  # noqa: N802 - never grant CORS
+                # Deliberately no Access-Control-Allow-* headers: cross-origin
+                # requests carrying X-DrCOM-Token must fail their preflight.
+                self.send_response(405)
+                self.send_header("Allow", "GET, POST")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
             def do_GET(self) -> None:  # noqa: N802 - http.server API
+                if not self._host_is_loopback():
+                    self._json({"error": "bad Host header"}, status=403)
+                    return
                 route = self.path.split("?", 1)[0].rstrip("/") or "/"
                 try:
                     payload = build_status_payload(controller)
@@ -215,13 +345,20 @@ class StatusServer:
                     self._json({"error": "unknown route", "routes": _ROUTES}, status=404)
 
             def do_POST(self) -> None:  # noqa: N802
-                if not self._local_only():
-                    self._json({"error": "control endpoints are localhost-only"}, status=403)
+                # Control endpoints take no body and no keep-alive: a lying
+                # Content-Length must not be able to park a worker thread (or
+                # desync the framing for the next request on this socket).
+                self.close_connection = True
+                if not self._authorise_control():
                     return
                 route = self.path.split("?", 1)[0].rstrip("/")
-                length = min(int(self.headers.get("Content-Length") or 0), MAX_BODY)
+                length = _parse_content_length(self.headers.get("Content-Length"))
                 if length:
-                    self.rfile.read(length)
+                    try:
+                        self.connection.settimeout(2.0)
+                        self.rfile.read(length)
+                    except (OSError, ValueError):
+                        pass
                 if route == "/login":
                     controller.request_login()
                     self._json({"ok": True, "action": "login"})

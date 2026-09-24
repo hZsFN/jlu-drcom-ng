@@ -290,8 +290,17 @@ def test_http_api_serves_status_and_control(controller) -> None:
             urllib.request.urlopen(f"{base}/nope", timeout=5)
         assert info.value.code == 404
 
-        # Local control endpoint is reachable from localhost.
-        request = urllib.request.Request(f"{base}/logout", data=b"", method="POST")
+        # A local control endpoint needs the per-run token.  Without it the
+        # request must be refused (see tests/test_security.py for the why).
+        bare = urllib.request.Request(f"{base}/logout", data=b"", method="POST")
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            urllib.request.urlopen(bare, timeout=5)
+        assert refused.value.code == 403
+
+        request = urllib.request.Request(
+            f"{base}/logout", data=b"", method="POST",
+            headers={"X-DrCOM-Token": controller.api.control_token},
+        )
         with urllib.request.urlopen(request, timeout=5) as response:
             assert json.loads(response.read())["ok"] is True
     finally:

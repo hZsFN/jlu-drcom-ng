@@ -1006,8 +1006,13 @@ class DrcomApp:
                                                        setattr(controller.status_writer, "enabled", e.control.value),
                                                        persist()))
         api_note = self._text(
-            f"仅监听 127.0.0.1。GET /status /health /metrics /stats /logs /diag；"
-            f"POST /login /logout /reconnect /probe。状态文件：{controller.status_writer.path}",
+            chr(10).join([
+                "GET /status /health /metrics /stats /logs /diag 开放读取。",
+                "POST /login /logout /reconnect /probe 需要 X-DrCOM-Token 头"
+                "（否则你浏览的网页可以跨站调用本机接口）。",
+                f"令牌写在 {controller.data_dir / 'api-token.txt'}，「关于」页也会显示。",
+                f"状态文件：{controller.status_writer.path}",
+            ]),
             color=self.palette.text_muted,
             size=self.hud.size_micro,
             selectable=True,
@@ -1108,6 +1113,11 @@ class DrcomApp:
             ("日志文件", str(controller.log.file_path or "")),
             ("状态文件", str(controller.status_writer.path)),
         ]
+        if controller.config.api.enabled:
+            lines.append(
+                ("控制令牌", controller.api.control_token if controller.api.is_running
+                 else "（接口未运行）")
+            )
         rows = [
             ft.Row(
                 [

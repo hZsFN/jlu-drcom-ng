@@ -107,10 +107,23 @@ python main.py --cli set --account 2023xxxxxxxx --mac AA:BB:CC:DD:EE:FF --passwo
 
 ```
 GET  /status   /health   /metrics   /stats   /logs   /diag
-POST /login    /logout   /reconnect /probe
+POST /login    /logout   /reconnect /probe        （需要令牌）
 ```
 
-只监听 `127.0.0.1`。`/metrics` 是 Prometheus 文本格式，可以直接接进监控面板；
+读接口开放；四个控制接口要求在 `X-DrCOM-Token` 头里带上令牌。
+令牌每次启动随机生成，写在数据目录的 `api-token.txt`，「关于」页也会显示：
+
+```bash
+TOKEN=$(cat "$APPDATA/DrCOM-JLU/api-token.txt")
+curl -X POST -H "X-DrCOM-Token: $TOKEN" http://127.0.0.1:8848/reconnect
+```
+
+为什么不能只靠「仅本机」：**即使是浏览器里的网页发起的请求，来源地址也是 127.0.0.1**，
+只校验地址的话，你访问的任何网站都能 POST 这个接口（CSRF）。
+要求自定义头会强制浏览器先发 CORS 预检，而服务器从不放行预检，请求就发不出来。
+同时校验 `Origin` 与 `Host`，DNS rebinding 也一并挡住。
+
+默认只监听 `127.0.0.1`。`/metrics` 是 Prometheus 文本格式，可以直接接进监控面板；
 同时会写一份 JSON 状态文件。
 
 ---

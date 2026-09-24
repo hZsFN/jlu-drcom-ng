@@ -48,6 +48,16 @@ class PingResult:
         return self.received > 0
 
 
+#: Hostnames/IPs only.  A target beginning with "-" would otherwise be read by
+#: ping as an option (e.g. "-f" = flood), turning a config typo into a flood.
+_SAFE_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]{0,253}$")
+
+
+def is_safe_target(target: str) -> bool:
+    """Whether *target* is safe to hand to ``ping`` as a positional argument."""
+    return bool(_SAFE_TARGET.match(target or "")) and not target.startswith("-")
+
+
 def ping_once(
     target: str,
     *,
@@ -62,6 +72,11 @@ def ping_once(
     probe measures the wrong link — which is exactly how you end up reporting
     "100% loss to the auth server" while happily authenticated over Ethernet.
     """
+    if not is_safe_target(target):
+        return PingResult(target, count, 0, None)
+    if source and not is_safe_target(source):
+        source = ""
+
     if IS_WINDOWS:
         argv = ["ping", "-n", str(count), "-w", str(timeout_ms)]
         if source:
@@ -72,7 +87,7 @@ def ping_once(
         argv = ["ping", "-c", str(count), "-W", str(timeout_s)]
         if source:
             argv += ["-I", source]
-        argv.append(target)
+        argv += ["--", target]  # end of options
 
     try:
         proc = subprocess.run(

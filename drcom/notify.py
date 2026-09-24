@@ -129,9 +129,15 @@ class Notifier:
         )
 
     def _webhook(self, event: NotificationEvent) -> None:
+        url = (self.config.webhook or "").strip()
+        # Only http(s): urllib happily opens file://, ftp:// and friends, and the
+        # webhook field is a free-text setting.
+        if not url.lower().startswith(("http://", "https://")):
+            self.log.warning("webhook 地址必须以 http:// 或 https:// 开头，已跳过：%r", url)
+            return
         payload = json.dumps(event.as_dict(), ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
-            self.config.webhook,
+            url,
             data=payload,
             headers={"Content-Type": "application/json; charset=utf-8"},
             method="POST",
@@ -144,16 +150,30 @@ class Notifier:
 
     def _command(self, event: NotificationEvent) -> None:
         template = self.config.command
-        rendered = (
-            template.replace("{event}", event.kind)
-            .replace("{title}", event.title)
-            .replace("{body}", event.body)
-            .replace("{ip}", event.ip)
-            .replace("{detail}", event.detail)
-        )
-        argv = shlex.split(rendered, posix=not IS_WINDOWS)
+        # Split FIRST, substitute SECOND.
+        #
+        # Substituting into the raw template and then tokenising let event data
+        # change the argument structure: with a template like
+        #   bash -c "notify-send \"{title}\""
+        # a quote inside a server-supplied message could close the string early
+        # and turn the rest of the message into separate argv entries.  Working
+        # per token means substituted values can never re-tokenise anything.
+        argv = shlex.split(template, posix=not IS_WINDOWS)
         if not argv:
             return
+        replacements = {
+            "{event}": event.kind,
+            "{title}": event.title,
+            "{body}": event.body,
+            "{ip}": event.ip,
+            "{detail}": event.detail,
+        }
+        rendered = []
+        for token in argv:
+            for placeholder, value in replacements.items():
+                token = token.replace(placeholder, value)
+            rendered.append(token)
+        argv = rendered
         subprocess.run(
             argv,
             capture_output=True,

@@ -138,7 +138,7 @@ def write_fingerprint_sidecar(archive: Path) -> None:
     print(f"wrote fingerprint {sidecar.name}")
 
 
-def build(*, onefile: bool = False, name: str = "DrCOM-JLU", console: bool = False) -> int:
+def build(*, onefile: bool = False, name: str = "JLU-DrCOM-NG", console: bool = False) -> int:
     arguments = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean",
@@ -203,10 +203,10 @@ def build(*, onefile: bool = False, name: str = "DrCOM-JLU", console: bool = Fal
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Package the DrCOM JLU client")
+    parser = argparse.ArgumentParser(description="Package the JLU DrCOM NG client")
     parser.add_argument("--onefile", action="store_true",
                         help="single .exe instead of a folder")
-    parser.add_argument("--name", default="DrCOM-JLU", help="output name")
+    parser.add_argument("--name", default="JLU-DrCOM-NG", help="output name")
     parser.add_argument("--console", action="store_true",
                         help="keep a console window (troubleshooting)")
     parser.add_argument("--fetch-runtime", action="store_true",

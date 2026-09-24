@@ -1,4 +1,4 @@
-# DrCOM JLU
+# JLU DrCOM NG
 
 吉林大学校园网认证客户端，用 Python 重写，界面是基于 Flet 的 **HUD（平视显示器）风格**面板。
 
@@ -114,7 +114,7 @@ POST /login    /logout   /reconnect /probe        （需要令牌）
 令牌每次启动随机生成，写在数据目录的 `api-token.txt`，「关于」页也会显示：
 
 ```bash
-TOKEN=$(cat "$APPDATA/DrCOM-JLU/api-token.txt")
+TOKEN=$(cat "$APPDATA/JLU-DrCOM-NG/api-token.txt")
 curl -X POST -H "X-DrCOM-Token: $TOKEN" http://127.0.0.1:8848/reconnect
 ```
 

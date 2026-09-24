@@ -192,3 +192,57 @@ def test_save_is_atomic(tmp_path: Path) -> None:
     store.save()
     assert not (tmp_path / "config.json.tmp").exists()
     assert json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))["version"] == 1
+
+
+# --------------------------------------------------------------------------
+# the project was renamed to jlu-drcom-ng; existing installs must not break
+# --------------------------------------------------------------------------
+def test_legacy_data_dir_is_migrated(tmp_path: Path) -> None:
+    """A pre-rename install keeps its config instead of silently starting fresh."""
+    from drcom.config import migrate_legacy_data_dir
+
+    base = tmp_path / "Roaming"
+    legacy = base / "DrCOM-JLU"
+    legacy.mkdir(parents=True)
+    (legacy / "config.json").write_text('{"version": 1}', encoding="utf-8")
+    (legacy / "key.bin").write_bytes(b"secret-key-material")
+
+    primary = base / "JLU-DrCOM-NG"
+    note = migrate_legacy_data_dir(primary)
+
+    assert note, "migration should report what it did"
+    assert primary.exists()
+    assert (primary / "config.json").read_text(encoding="utf-8") == '{"version": 1}'
+    assert (primary / "key.bin").read_bytes() == b"secret-key-material"
+    assert not legacy.exists()
+
+
+def test_migration_is_a_no_op_when_the_new_dir_has_data(tmp_path: Path) -> None:
+    from drcom.config import migrate_legacy_data_dir
+
+    base = tmp_path / "Roaming"
+    primary = base / "JLU-DrCOM-NG"
+    primary.mkdir(parents=True)
+    (primary / "config.json").write_text('{"version": 1, "mine": true}', encoding="utf-8")
+
+    legacy = base / "DrCOM-JLU"
+    legacy.mkdir(parents=True)
+    (legacy / "config.json").write_text('{"version": 1, "old": true}', encoding="utf-8")
+
+    assert migrate_legacy_data_dir(primary) == ""
+    assert "mine" in (primary / "config.json").read_text(encoding="utf-8")
+    assert legacy.exists(), "the old directory should be left alone"
+
+
+def test_migration_is_a_no_op_on_a_clean_machine(tmp_path: Path) -> None:
+    from drcom.config import migrate_legacy_data_dir
+
+    assert migrate_legacy_data_dir(tmp_path / "nothing-here") == ""
+
+
+def test_app_name_is_the_new_one() -> None:
+    from drcom.config import APP_NAME, APP_SLUG, LEGACY_APP_NAME
+
+    assert APP_NAME == "JLU-DrCOM-NG"
+    assert APP_SLUG == "jlu-drcom-ng"
+    assert LEGACY_APP_NAME == "DrCOM-JLU"

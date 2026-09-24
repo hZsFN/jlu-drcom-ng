@@ -39,15 +39,15 @@ _EXIT_FATAL = 3
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="drcom-jlu",
+        prog="jlu-drcom-ng",
         description="吉林大学 Dr.COM 校园网认证客户端",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例：\n"
-            "  drcom-jlu --cli login            前台登录并保持在线\n"
-            "  drcom-jlu --cli status --json    输出 JSON 状态\n"
-            "  drcom-jlu --cli diag             诊断 61440 端口被谁占了\n"
-            "  drcom-jlu --cli set --account 2023xxxx --mac AA:BB:CC:DD:EE:FF\n"
+            "  jlu-drcom-ng --cli login            前台登录并保持在线\n"
+            "  jlu-drcom-ng --cli status --json    输出 JSON 状态\n"
+            "  jlu-drcom-ng --cli diag             诊断 61440 端口被谁占了\n"
+            "  jlu-drcom-ng --cli set --account 2023xxxx --mac AA:BB:CC:DD:EE:FF\n"
         ),
     )
     parser.add_argument("--data-dir", type=Path, help="配置文件/日志目录")

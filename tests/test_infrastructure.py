@@ -234,7 +234,7 @@ def test_status_payload_has_the_documented_keys(controller) -> None:
     payload = build_status_payload(controller)
     for key in ("app", "version", "state", "online", "ip", "account", "uptime_seconds", "timestamp"):
         assert key in payload
-    assert payload["app"] == "DrCOM-JLU"
+    assert payload["app"] == "JLU-DrCOM-NG"
     assert payload["state"] == "idle"
 
 
@@ -263,7 +263,7 @@ def test_status_file_is_written(controller, temp_data_dir: Path) -> None:
     controller._write_status()
     path = temp_data_dir / "status.json"
     assert path.exists()
-    assert json.loads(path.read_text(encoding="utf-8"))["app"] == "DrCOM-JLU"
+    assert json.loads(path.read_text(encoding="utf-8"))["app"] == "JLU-DrCOM-NG"
 
 
 def test_http_api_serves_status_and_control(controller) -> None:
@@ -274,7 +274,7 @@ def test_http_api_serves_status_and_control(controller) -> None:
         base = f"http://127.0.0.1:{controller.api.bound_port}"
         with urllib.request.urlopen(f"{base}/status", timeout=5) as response:
             payload = json.loads(response.read())
-        assert payload["app"] == "DrCOM-JLU"
+        assert payload["app"] == "JLU-DrCOM-NG"
 
         with urllib.request.urlopen(f"{base}/health", timeout=5) as response:
             assert "online" in json.loads(response.read())
@@ -335,7 +335,7 @@ def test_cli_status_json_is_valid(controller, capsys) -> None:
     args = build_parser().parse_args(["--cli", "status", "--json"])
     _cmd_status(controller, args)
     payload = json.loads(capsys.readouterr().out)
-    assert payload["app"] == "DrCOM-JLU"
+    assert payload["app"] == "JLU-DrCOM-NG"
 
 
 def test_cli_set_stores_credentials_encrypted(controller, temp_data_dir: Path) -> None:

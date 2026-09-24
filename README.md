@@ -1,4 +1,4 @@
-# DrCOM JLU
+# JLU DrCOM NG
 
 A campus-network authentication client for Jilin University, rewritten in
 Python with a **HUD-styled** (heads-up display) interface built on Flet.
@@ -122,7 +122,7 @@ the `X-DrCOM-Token` header. The token is generated at startup, written to
 `api-token.txt` in the data directory, and also shown on the *About* page:
 
 ```bash
-TOKEN=$(cat ~/AppData/Roaming/DrCOM-JLU/api-token.txt)
+TOKEN=$(cat ~/AppData/Roaming/JLU-DrCOM-NG/api-token.txt)
 curl -X POST -H "X-DrCOM-Token: $TOKEN" http://127.0.0.1:8848/reconnect
 ```
 

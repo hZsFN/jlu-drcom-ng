@@ -18,7 +18,13 @@ from pathlib import Path
 from typing import Callable
 
 from . import __version__
-from .config import Account, AppConfig, ConfigStore, default_data_dir
+from .config import (
+    Account,
+    AppConfig,
+    ConfigStore,
+    default_data_dir,
+    migrate_legacy_data_dir,
+)
 from .engine import AuthEngine, EngineEvent, EngineState, OfflineReason
 from .logbus import LogBus
 from .netprobe import NetworkProbe
@@ -65,6 +71,9 @@ class AppController:
     ) -> None:
         self.data_dir = Path(data_dir) if data_dir else default_data_dir()
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        # Pick up a pre-rename data directory the first time we run, so an
+        # existing install keeps its account and encrypted password.
+        self.migration_note = migrate_legacy_data_dir(self.data_dir)
 
         self.store = ConfigStore(self.data_dir)
         self.config: AppConfig = self.store.load()
@@ -80,6 +89,8 @@ class AppController:
             keep_days=self.config.logging.keep_days,
             max_file_mb=self.config.logging.max_file_mb,
         )
+        if self.migration_note:
+            self.log.info(self.migration_note)
         self.stats = StatsStore(self.data_dir / "stats.json")
         self.notifier = Notifier(self.config.notify, self.log)
         self.traffic = TrafficMeter(

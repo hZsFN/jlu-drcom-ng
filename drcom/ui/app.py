@@ -33,6 +33,7 @@ from pathlib import Path
 
 import flet as ft
 
+from ..config import CLOSE_ACTION_LABELS, CLOSE_ACTIONS
 from ..controller import AppController, ControllerEvent
 from ..engine import EngineState
 from ..logbus import LogRecordView
@@ -260,6 +261,15 @@ class DrcomApp:
 
         # -- window ------------------------------------------------------
         try:
+            # Arm the close intercept first.  The native window appears as soon
+            # as the client connects, well before this method finishes building
+            # the shell, so installing it at the end left a window (seconds
+            # long) where the X button would really close the app.
+            page.window.prevent_close = True
+            page.window.on_event = self._on_window_event
+        except Exception:
+            pass
+        try:
             page.window.width = max(1000, int(cfg.ui.window_width))
             page.window.height = max(700, int(cfg.ui.window_height))
             page.window.min_width = 900
@@ -312,6 +322,9 @@ class DrcomApp:
             self.controller.start_background()
 
         try:
+            # Re-assert the intercept: the window may have been hidden at
+            # launch, and a client reconnect can drop window state.
+            page.window.prevent_close = True
             page.window.on_event = self._on_window_event
         except Exception:
             pass
@@ -963,9 +976,26 @@ class DrcomApp:
             controller.autostart_enabled(),
             on_change=lambda e: self._on_autostart(e.control.value),
         )
-        close_to_tray = make_switch("关闭窗口时隐藏而不是退出", cfg.ui.close_to_tray,
-                                    on_change=lambda e: (setattr(cfg.ui, "close_to_tray", e.control.value), persist()),
-                                    disabled=not tray_available())
+        close_action_note = self._text(
+            "", color=self.palette.text_muted, size=self.hud.size_micro
+        )
+        close_action = ft.SegmentedButton(
+            segments=[
+                ft.Segment(value="ask", label=ft.Text("每次询问")),
+                ft.Segment(value="tray", label=ft.Text("最小化到托盘")),
+                ft.Segment(value="quit", label=ft.Text("直接退出")),
+            ],
+            selected={cfg.ui.close_action if cfg.ui.close_action in CLOSE_ACTIONS else "ask"},
+            allow_empty_selection=False,
+            allow_multiple_selection=False,
+            show_selected_icon=False,
+            style=ft.ButtonStyle(color=self.palette.text_dim, bgcolor=self.palette.panel_sunk),
+            on_change=lambda e: self._on_close_action_change(e),
+        )
+        # Stored so the chooser can refresh it after "记住我的选择".
+        self.close_action_control = close_action
+        self.close_action_note = close_action_note
+        self._sync_close_action_control()
         auto_login_launch = make_switch("启动后自动登录", cfg.ui.auto_login_on_launch,
                                         on_change=lambda e: (setattr(cfg.ui, "auto_login_on_launch", e.control.value), persist()))
 
@@ -1074,8 +1104,20 @@ class DrcomApp:
                                        quiet_enabled, ft.Row([quiet_start, quiet_end], spacing=10),
                                        self._button("保存重连策略", save_reconnect, accent=self.palette.cyan)],
                                       spacing=self.hud.gap), title="重连与节流"),
-                self._panel(ft.Column([autostart, close_to_tray, auto_login_launch], spacing=4),
-                            title="启动与窗口"),
+                self._panel(
+                    ft.Column(
+                        [
+                            autostart,
+                            auto_login_launch,
+                            self._text("点击窗口右上角关闭按钮时：", color=self.palette.text_dim,
+                                       size=self.hud.size_body),
+                            close_action,
+                            close_action_note,
+                        ],
+                        spacing=6,
+                    ),
+                    title="启动与窗口",
+                ),
                 self._panel(ft.Column([reduce_motion, high_contrast, decorations, scanline, contrast_note],
                                       spacing=4), title="界面与无障碍"),
                 self._panel(ft.Column([notify_desktop, webhook, hook_command,
@@ -1218,6 +1260,58 @@ class DrcomApp:
             controller.api.stop()
             self._flash("本地状态接口已停止", True)
 
+    def _close_action_from_event(self, event) -> str:
+        """Read the chosen value out of a SegmentedButton event.
+
+        ``selected`` is a set, and on some Flet builds the event carries the
+        value rather than the control, so accept all three shapes.
+        """
+        control = getattr(event, "control", None)
+        selected = getattr(control, "selected", None)
+        if selected is None:
+            value = getattr(event, "data", None) or getattr(event, "value", None)
+            if isinstance(value, str):
+                return value
+            selected = value
+        if isinstance(selected, str):
+            return selected
+        if selected:
+            return next(iter(selected))
+        return ""
+
+    def _on_close_action_change(self, event) -> None:
+        action = self._close_action_from_event(event)
+        if action not in CLOSE_ACTIONS:
+            return
+        self.controller.config.ui.close_action = action
+        self.controller.store.save()
+        self._sync_close_action_control()
+        self._flash(f"关闭窗口时：{CLOSE_ACTION_LABELS[action]}", True)
+
+    def _sync_close_action_control(self) -> None:
+        """Keep the settings selector and its hint in step with the config."""
+        control = getattr(self, "close_action_control", None)
+        if control is None:
+            return
+        action = self.controller.config.ui.close_action
+        try:
+            control.selected = {action}
+        except Exception:
+            pass
+        note = getattr(self, "close_action_note", None)
+        if note is not None:
+            if action == "ask":
+                note.value = "每次点关闭都会询问，并可选「记住我的选择」。"
+            elif action == "tray":
+                note.value = (
+                    "关闭即隐藏到托盘，认证继续在后台运行；"
+                    "要真正退出请用托盘菜单的「退出」，或在「设置」里改回。"
+                )
+            else:
+                note.value = "关闭即退出程序，认证会中断。"
+            note.color = self.palette.amber if action == "quit" else self.palette.text_muted
+        self._safe_update()
+
     def _set_ui_flag(self, name: str, value: bool) -> None:
         setattr(self.controller.config.ui, name, value)
         self.controller.store.save()
@@ -1302,16 +1396,17 @@ class DrcomApp:
             self._tray = None
 
     def _hide_window(self) -> None:
+        """Hide to the tray, or minimise if there is no tray to come back from."""
         if self.page is None:
             return
-        try:
-            if self._tray is not None and self.controller.config.ui.close_to_tray:
+        if self._tray is not None:
+            try:
                 self.page.window.visible = False
                 self.page.window.skip_task_bar = True
                 self._safe_update()
                 return
-        except Exception:
-            pass
+            except Exception:
+                pass
         self._minimize()
 
     def _minimize(self) -> None:
@@ -1336,18 +1431,91 @@ class DrcomApp:
             pass
 
     def _on_window_event(self, event) -> None:
+        """Decide what the X button does.
+
+        Note the mechanism: Flet delivers the event, but the window only stays
+        open because ``page.window.prevent_close`` is set once at startup.
+        Flet 1.0's ``WindowEvent`` is a plain object with no ``prevent_default``
+        field, so setting that attribute on the event (as this used to) is
+        silently ignored -- the window closed and the app exited no matter what
+        the setting said.
+        """
         try:
-            if event.type == ft.WindowEventType.CLOSE and self.controller.config.ui.close_to_tray:
-                if self._tray is not None:
-                    event.prevent_default = True  # keep the app alive in the tray
-                    self._hide_window()
-                else:
-                    # No tray: minimise instead of hiding, so the window stays reachable.
-                    event.prevent_default = True
-                    self._minimize()
-                    self._flash("已最小化到任务栏（未安装 pystray，无法隐藏到托盘）", True)
-        except Exception:
-            pass
+            close_event = getattr(ft.WindowEventType, "CLOSE", None)
+            if close_event is not None and event.type != close_event:
+                return
+
+            action = self.controller.config.ui.close_action
+            if action == "tray":
+                self._hide_window()
+            elif action == "quit":
+                self._quit()
+            else:
+                self._ask_close_action()
+        except Exception as exc:  # pragma: no cover - never kill the app here
+            self.controller.log.warning(f"处理关闭事件失败：{exc!r}")
+
+    def _ask_close_action(self) -> None:
+        """The first-time (and not-yet-remembered) chooser."""
+        if self.page is None:
+            return
+
+        remember = ft.Checkbox(
+            label="记住我的选择（之后不再询问，可在「设置」里改）",
+            value=False,
+            check_color=self.palette.panel,
+            active_color=self.palette.green,
+            label_style=ft.TextStyle(color=self.palette.text_dim, size=self.hud.size_body),
+        )
+
+        tray_ok = self._tray is not None
+        hint = (
+            "隐藏到托盘后，认证继续在后台运行，双击托盘图标可以再打开。"
+            if tray_ok
+            else "未安装 pystray，无法隐藏到托盘，将改为最小化到任务栏。安装：pip install pystray"
+        )
+
+        def choose(action: str) -> None:
+            if remember.value:
+                cfg = self.controller.config
+                cfg.ui.close_action = action
+                self.controller.store.save()
+                self._sync_close_action_control()
+            self._close_dialog()
+            if action == "tray":
+                self._hide_window()
+                self._flash("已隐藏到托盘，认证继续在后台运行", True)
+            else:
+                self._quit()
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=self._text("关闭窗口", color=self.palette.cyan, size=self.hud.size_title, mono=True),
+            content=ft.Container(
+                content=ft.Column(
+                    [
+                        self._text(
+                            "要让程序退到后台继续认证，还是彻底退出？",
+                            color=self.palette.text, size=self.hud.size_body,
+                        ),
+                        self._text(hint, color=self.palette.text_muted, size=self.hud.size_micro),
+                        remember,
+                    ],
+                    spacing=10,
+                    tight=True,
+                ),
+                width=460,
+            ),
+            bgcolor=self.palette.panel,
+            actions=[
+                self._button("最小化到托盘", lambda e: choose("tray"), primary=True,
+                             accent=self.palette.green, icon=ft.Icons.MINIMIZE),
+                self._button("退出程序", lambda e: choose("quit"), accent=self.palette.amber,
+                             icon=ft.Icons.POWER_SETTINGS_NEW),
+                self._button("取消", lambda e: self._close_dialog(), accent=self.palette.cyan),
+            ],
+        )
+        self.page.show_dialog(dialog)
 
     # ------------------------------------------------------------------
     # async loops
@@ -1717,6 +1885,9 @@ class DrcomApp:
             if self.page is not None:
                 self.page.window.visible = True
                 self.page.window.skip_task_bar = False
+                # Release the intercept installed at startup, so nothing can
+                # turn this exit into another close request.
+                self.page.window.prevent_close = False
         except Exception:
             pass
         self.controller.shutdown()

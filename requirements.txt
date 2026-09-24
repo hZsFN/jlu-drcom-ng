@@ -1,0 +1,22 @@
+# 运行期依赖
+#
+# 全部选型原则：优先纯 Python 或体积小的包，方便打包成单文件 exe。
+#
+#   flet          界面框架（任务指定）。底层是 Flutter 渲染，桌面模式首次运行
+#                 会下载一次客户端运行时（约 100 MB），之后离线可用。
+#   pystray       系统托盘（可选）。纯 Python；Flet 1.x 没有托盘控件，
+#                 所以托盘只能靠它。缺失时程序会降级为「关闭即最小化」，
+#                 绝不会出现「窗口藏起来找不回」的情况。
+#   Pillow        生成托盘图标位图（pystray 的依赖；很多环境本来就有）。
+#
+# 标准库覆盖、无需第三方包的部分：
+#   加密/摘要   hashlib + 自写 md4.py（hashlib 不含 MD4）
+#   密码保护    Windows DPAPI（ctypes 调 crypt32），非 Windows 降级到
+#               cryptography 的 Fernet（若已安装），再不行才用可逆混淆并告警
+#   网卡信息    ctypes 调 iphlpapi（GetIfTable2 / GetAdaptersAddresses）
+#   延迟探测    直接调用系统 ping，无需 raw socket 权限
+#   本地 API    http.server
+#
+flet>=0.28
+pystray>=0.19 ; sys_platform == "win32" or sys_platform == "darwin"
+Pillow>=9.0

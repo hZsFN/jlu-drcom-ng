@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Build output
+build/
+dist/
+release/
+*.spec
+
+# Runtime data — never commit these
+# (config holds an encrypted password; logs hold traffic and timestamps)
+/data/
+*.log
+config.json
+stats.json
+status.json
+key.bin
+
+# Vendored Flet desktop runtime (38 MB) — fetched by `python build.py --fetch-runtime`
+vendor/
+
+# Local scratch
+.readme-backup/
+_readme*.md

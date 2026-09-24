@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import threading
 import time
 from pathlib import Path
 
@@ -62,6 +63,11 @@ STATE_LABELS = {
 class DrcomApp:
     """Builds and drives the UI.  One instance per Flet page."""
 
+    #: Hard ceiling on shutdown.  If the client never acknowledges the window
+    #: destroy we exit anyway, so a wedged client cannot keep the process --
+    #: and port 61440 -- alive.
+    quit_watchdog_seconds: float = 4.0
+
     def __init__(
         self,
         controller: AppController,
@@ -72,6 +78,8 @@ class DrcomApp:
         self.controller = controller
         self.minimized = minimized
         self.enable_tray = enable_tray
+        #: Set once shutdown has finished, so the quit watchdog can stand down.
+        self._exit_now = threading.Event()
 
         self.page: ft.Page | None = None
         self.hud = self._make_hud()
@@ -985,11 +993,24 @@ class DrcomApp:
                 ft.Segment(value="tray", label=ft.Text("最小化到托盘")),
                 ft.Segment(value="quit", label=ft.Text("直接退出")),
             ],
-            selected={cfg.ui.close_action if cfg.ui.close_action in CLOSE_ACTIONS else "ask"},
+            # NB: a *list*, not a set.  Flet 1.0 annotates `selected` as
+            # list[str]; handing it a set makes msgpack raise
+            # "TypeError: can not serialize 'set' object" when the patch is
+            # sent, and because _safe_update swallows that, the whole view
+            # silently failed to render -- the settings tab looked dead.
+            selected=[cfg.ui.close_action if cfg.ui.close_action in CLOSE_ACTIONS else "ask"],
             allow_empty_selection=False,
             allow_multiple_selection=False,
-            show_selected_icon=False,
-            style=ft.ButtonStyle(color=self.palette.text_dim, bgcolor=self.palette.panel_sunk),
+            # Keep the tick: with three short labels the coloured underline
+            # alone is easy to miss, and this is a setting the user has to be
+            # able to read at a glance.
+            show_selected_icon=True,
+            selected_icon=ft.Icon(ft.Icons.CHECK, color=self.palette.green, size=16),
+            style=ft.ButtonStyle(
+                color=self.palette.text,                 # 17.7:1 on panel_sunk
+                bgcolor=self.palette.panel_sunk,
+                side=ft.BorderSide(1, self.palette.border),
+            ),
             on_change=lambda e: self._on_close_action_change(e),
         )
         # Stored so the chooser can refresh it after "记住我的选择".
@@ -1263,8 +1284,8 @@ class DrcomApp:
     def _close_action_from_event(self, event) -> str:
         """Read the chosen value out of a SegmentedButton event.
 
-        ``selected`` is a set, and on some Flet builds the event carries the
-        value rather than the control, so accept all three shapes.
+        ``selected`` is a list in Flet 1.0, and the value may also arrive on the
+        event itself, so accept every shape rather than trusting one.
         """
         control = getattr(event, "control", None)
         selected = getattr(control, "selected", None)
@@ -1295,7 +1316,7 @@ class DrcomApp:
             return
         action = self.controller.config.ui.close_action
         try:
-            control.selected = {action}
+            control.selected = [action]
         except Exception:
             pass
         note = getattr(self, "close_action_note", None)
@@ -1891,11 +1912,60 @@ class DrcomApp:
         except Exception:
             pass
         self.controller.shutdown()
+
+        # Never let a wedged client keep the process (and port 61440) alive.
+        # The event lets a completed shutdown stand the watchdog down, so it
+        # cannot fire later against a process that already exited cleanly.
+        self._exit_now.clear()
+        threading.Thread(
+            target=self._force_exit_after,
+            args=(self.quit_watchdog_seconds,),
+            daemon=True,
+        ).start()
+        try:
+            self.page.run_task(self._finish_quit)
+        except Exception:
+            self._finish_quit_now()
+
+    def _finish_quit_now(self) -> None:
+        self._exit_now.set()
+        self._hard_exit()
+
+    async def _finish_quit(self) -> None:
+        """Ask the client to close, then exit.
+
+        ``Window.destroy()`` is a coroutine in Flet 1.0.  The old code called it
+        without awaiting, so the coroutine was created and thrown away: the
+        client was never told to close, ``os._exit`` killed Python immediately
+        after, and the native window was left on screen with no backend.  The
+        window looked alive, so every click on it (a tab, a button) silently did
+        nothing -- which is how "点设置没反应" got reported.
+        """
         try:
             if self.page is not None:
-                self.page.window.destroy()
+                await self.page.window.destroy()
+                self.page.update()
+                # Give the client a moment to process the message before the
+                # socket is torn down underneath it.
+                await asyncio.sleep(0.2)
         except Exception:
             pass
+        finally:
+            self._finish_quit_now()
+
+    def _force_exit_after(self, delay: float) -> None:
+        """Watchdog: exit if the graceful path has not finished within *delay*."""
+        if delay and not self._exit_now.wait(delay):
+            self._hard_exit()
+
+    @staticmethod
+    def _hard_exit() -> None:
+        """End the process for real.
+
+        A separate method so tests can intercept it without patching ``os``
+        globally -- which would also disarm the watchdog thread that exists
+        precisely to guarantee this happens.
+        """
         import os
 
         os._exit(0)

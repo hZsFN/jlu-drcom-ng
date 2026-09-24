@@ -719,7 +719,11 @@ class DrcomApp:
         def detect_mac(_event) -> None:
             from ..netiface import pick_relevant_interface
 
-            iface = pick_relevant_interface(controller.config.auth.server, controller.config.auth.port)
+            # pick_relevant_interface is keyword-only on purpose; passing these
+            # positionally raised TypeError on every click of this button.
+            iface = pick_relevant_interface(
+                server=controller.config.auth.server, port=controller.config.auth.port
+            )
             if iface and iface.mac:
                 mac_field.value = iface.mac
                 mac_field.update()

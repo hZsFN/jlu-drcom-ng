@@ -199,6 +199,7 @@ Dr.COM variants made the JLU-specific quirks much easier to spot.
 
 ### Contributors
 
+- **hZsFN** — project direction, requirements, live-network testing and acceptance
 - **大肥鱼** &lt;tanpan9926@mails.jlu.edu.cn&gt; — Python/Flet implementation
 - **code4lala** — original Qt client and protocol reference
 

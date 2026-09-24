@@ -27,12 +27,12 @@ from drcom import __version__  # noqa: E402
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="drcom-jlu",
+        prog="jlu-drcom-ng",
         description="吉林大学 Dr.COM 校园网认证客户端（Python + Flet）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="无界面模式请用 --cli，例如：python main.py --cli diag",
     )
-    parser.add_argument("--version", action="version", version=f"drcom-jlu {__version__}")
+    parser.add_argument("--version", action="version", version=f"jlu-drcom-ng {__version__}")
     parser.add_argument("--data-dir", type=Path, help="配置文件与日志目录")
     parser.add_argument("--log-level", default=None, help="DEBUG / INFO / WARNING / ERROR")
     parser.add_argument("--minimized", action="store_true", help="启动后最小化到托盘/任务栏")

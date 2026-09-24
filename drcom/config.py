@@ -8,7 +8,7 @@ Location resolution order:
 
 1. ``--data-dir`` on the command line
 2. ``<exe dir>/portable.txt`` marker present → keep everything next to the exe
-3. ``%APPDATA%/DrCOM-JLU`` on Windows, ``~/.config/drcom-jlu`` elsewhere
+3. ``%APPDATA%/JLU-DrCOM-NG`` on Windows, ``~/.config/jlu-drcom-ng`` elsewhere
 """
 
 from __future__ import annotations
@@ -25,7 +25,12 @@ from .secrets_store import ProtectError, protect, unprotect
 
 __all__ = ["Account", "AppConfig", "ConfigStore", "default_data_dir"]
 
-APP_NAME = "DrCOM-JLU"
+APP_NAME = "JLU-DrCOM-NG"
+#: Lower-case form for POSIX config directories, where capitals are unusual.
+APP_SLUG = "jlu-drcom-ng"
+#: Data directory used before the project was renamed.  Migrated on first run
+#: so an existing install keeps its saved credentials.
+LEGACY_APP_NAME = "DrCOM-JLU"
 CONFIG_FILENAME = "config.json"
 KEY_FILENAME = "key.bin"
 
@@ -41,7 +46,51 @@ def default_data_dir() -> Path:
     if sys.platform == "win32":
         base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
         return Path(base) / APP_NAME
-    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_NAME
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_SLUG
+
+
+def legacy_data_dirs(primary: Path) -> list[Path]:
+    """Data directories this project used before it was renamed."""
+    candidates = [primary.parent / LEGACY_APP_NAME]
+    if sys.platform != "win32":
+        candidates.append(primary.parent / LEGACY_APP_NAME.lower())
+    seen: list[Path] = []
+    for candidate in candidates:
+        if candidate != primary and candidate not in seen:
+            seen.append(candidate)
+    return seen
+
+
+def migrate_legacy_data_dir(primary: Path) -> str:
+    """Move a pre-rename data directory into place, once.
+
+    Returns a human-readable note when something moved, otherwise an empty
+    string.  Best-effort by design: failing to migrate must never stop the app
+    from starting, it just means the user re-enters their password.
+    """
+    if primary.exists() and any(primary.iterdir()):
+        return ""
+    for legacy in legacy_data_dirs(primary):
+        if not legacy.exists():
+            continue
+        try:
+            primary.parent.mkdir(parents=True, exist_ok=True)
+            if primary.exists():
+                primary.rmdir()  # empty, created a moment ago
+            legacy.rename(primary)
+        except OSError:
+            # Different volume, or a locked file: copy instead of moving.
+            try:
+                import shutil
+
+                shutil.copytree(legacy, primary, dirs_exist_ok=True)
+            except OSError:
+                return ""
+        return (
+            f"已把旧数据目录 {legacy.name} 迁移为 {primary.name}，"
+            "原有账号与加密密码继续可用。"
+        )
+    return ""
 
 
 # --------------------------------------------------------------------------

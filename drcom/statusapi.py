@@ -82,7 +82,7 @@ def build_status_payload(controller) -> dict:
             uptime = 0.0
 
     payload = {
-        "app": "DrCOM-JLU",
+        "app": "JLU-DrCOM-NG",
         "version": controller.version,
         "state": getattr(state, "value", "idle"),
         "online": bool(engine is not None and getattr(engine, "is_online", False)),
@@ -227,7 +227,7 @@ class StatusServer:
             pass
 
         class Handler(BaseHTTPRequestHandler):
-            server_version = "DrCOM-JLU"
+            server_version = "JLU-DrCOM-NG"
             protocol_version = "HTTP/1.1"
 
             def log_message(self, fmt, *args):  # noqa: A003 - silence default stderr spam

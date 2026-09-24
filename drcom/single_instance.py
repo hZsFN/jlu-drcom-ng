@@ -24,10 +24,10 @@ __all__ = [
 
 IS_WINDOWS = sys.platform == "win32"
 
-_MUTEX_NAME = "Global\\DrCOM-JLU-Py-SingleInstance"
+_MUTEX_NAME = "Global\\JLU-DrCOM-NG-SingleInstance"
 _RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-_RUN_VALUE = "DrCOM-JLU"
-_DESKTOP_FILE = "drcom-jlu.desktop"
+_RUN_VALUE = "JLU-DrCOM-NG"
+_DESKTOP_FILE = "jlu-drcom-ng.desktop"
 
 
 class SingleInstance:
@@ -68,7 +68,7 @@ class SingleInstance:
         return not self.already_running
 
     def _acquire_posix(self) -> bool:
-        path = Path(tempfile.gettempdir()) / "drcom-jlu.lock"
+        path = Path(tempfile.gettempdir()) / "jlu-drcom-ng.lock"
         self._lock_path = path
         if path.exists():
             try:
@@ -170,7 +170,7 @@ def enable_autostart(*, minimized: bool = True) -> tuple[bool, str]:
         path.write_text(
             "[Desktop Entry]\n"
             "Type=Application\n"
-            "Name=DrCOM JLU\n"
+            "Name=JLU DrCOM NG\n"
             "Comment=吉林大学校园网认证客户端\n"
             f"Exec={command}\n"
             "X-GNOME-Autostart-enabled=true\n"

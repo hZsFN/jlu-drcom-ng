@@ -73,7 +73,7 @@ class TrayIcon:
     def __init__(
         self,
         *,
-        tooltip: str = "DrCOM JLU",
+        tooltip: str = "JLU DrCOM NG",
         on_show: Callable[[], None] | None = None,
         on_toggle: Callable[[], None] | None = None,
         on_reconnect: Callable[[], None] | None = None,
@@ -119,7 +119,7 @@ class TrayIcon:
 
         try:
             self._icon = pystray.Icon(
-                "drcom-jlu",
+                "jlu-drcom-ng",
                 icon=_make_icon_image(),
                 title=self.tooltip,
                 menu=_menu(),
@@ -163,7 +163,7 @@ class TrayIcon:
                 pass
         del online
 
-    def notify(self, message: str, title: str = "DrCOM JLU") -> None:
+    def notify(self, message: str, title: str = "JLU DrCOM NG") -> None:
         """Show a balloon/toast via the tray, when the backend supports it."""
         if self._icon is None:
             return

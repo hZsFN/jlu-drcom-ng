@@ -251,7 +251,7 @@ class DrcomApp:
         self.page = page
         cfg = self.controller.config
 
-        page.title = "DrCOM · 吉林大学校园网认证"
+        page.title = "JLU DrCOM NG · 吉林大学校园网认证"
         page.bgcolor = self.palette.bg
         page.padding = 0
         page.spacing = 0
@@ -366,7 +366,7 @@ class DrcomApp:
                 [
                     ft.Container(width=4, height=26, bgcolor=self.palette.green),
                     self._text(
-                        "DrCOM · JLU",
+                        "JLU · DRCOM NG",
                         color=self.palette.green,
                         size=self.hud.size_title + 3,
                         mono=True,
@@ -1288,7 +1288,7 @@ class DrcomApp:
             )
             return
         self._tray = TrayIcon(
-            tooltip="DrCOM JLU · 待机",
+            tooltip="JLU DrCOM NG · 待机",
             on_show=lambda: self.events.put(ControllerEvent(kind="tray_show")),
             on_toggle=lambda: self.events.put(ControllerEvent(kind="tray_toggle")),
             on_reconnect=lambda: self.events.put(ControllerEvent(kind="tray_reconnect")),
@@ -1614,10 +1614,10 @@ class DrcomApp:
         if self._tray is None:
             return
         if telemetry.online:
-            text = f"DrCOM JLU · 在线 {telemetry.ip} · {_format_uptime(telemetry.uptime)}"
+            text = f"JLU DrCOM NG · 在线 {telemetry.ip} · {_format_uptime(telemetry.uptime)}"
             color = self.palette.online
         else:
-            text = f"DrCOM JLU · {telemetry.state_label}"
+            text = f"JLU DrCOM NG · {telemetry.state_label}"
             color = self.palette.offline
         if text != self._last_tooltip:
             self._last_tooltip = text

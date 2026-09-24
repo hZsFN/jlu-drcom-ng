@@ -178,8 +178,8 @@ python build.py --onefile       # 单文件 exe
 
 ### 贡献者
 
-- **hZsFN** —— 项目发起与需求定义、真机联调与验收
-- **大肥鱼** &lt;tanpan9926@mails.jlu.edu.cn&gt; —— Python / Flet 实现
+- **[@hZsFN](https://github.com/hZsFN)** —— 项目发起与需求定义、真机联调与验收
+- **[@Dafeiyu111](https://github.com/Dafeiyu111)**（大肥鱼）&lt;tanpan9926@mails.jlu.edu.cn&gt; —— Python / Flet 实现
 - **code4lala** —— 原版 Qt 客户端与协议参考
 
 ---

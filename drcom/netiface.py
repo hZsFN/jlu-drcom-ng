@@ -285,23 +285,35 @@ def _score_interface(iface: InterfaceInfo, route_ip: str, addrs: dict[int, list[
     """
     score = 0
     haystack = f"{iface.name} {iface.description}".lower()
+    has_mac = bool(iface.mac)
+    is_tunnel = iface.if_type == _IF_TYPE_TUNNEL
 
-    if route_ip and route_ip in addrs.get(iface.index, ()):
-        score += 1000
-    elif route_ip and route_ip in (iface.name, iface.description):
-        score += 500
+    matches_route = bool(route_ip) and (
+        route_ip in addrs.get(iface.index, ()) or route_ip in (iface.name, iface.description)
+    )
+    if matches_route:
+        # The route is the strongest signal *only when it points at a real
+        # adapter*.  With a VPN in TUN mode the default route runs through a
+        # virtual interface that has no hardware address, and that is not where
+        # the campus network lives -- awarding it the full bonus made
+        # "detect MAC" select the tunnel and then report "no adapter found" on a
+        # machine that plainly has a NIC.
+        score += 1000 if (has_mac and not is_tunnel) else 50
 
     if iface.if_type == _IF_TYPE_ETHERNET_CSMACD:
         score += 60
     elif iface.if_type == _IF_TYPE_IEEE80211:
         score += 50
-    elif iface.if_type == _IF_TYPE_TUNNEL:
+    elif is_tunnel:
         score -= 200
     elif iface.if_type == _IF_TYPE_SOFTWARE_LOOPBACK:
         score -= 500
 
-    if iface.mac:
+    if has_mac:
         score += 20
+    else:
+        # No hardware address: it cannot be the NIC a campus account is bound to.
+        score -= 150
     if iface.is_up:
         score += 10
     # Interfaces that have actually carried traffic are the real thing.

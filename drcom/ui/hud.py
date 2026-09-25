@@ -157,6 +157,41 @@ class _TapeScale:
         return self.step
 
 
+#: Text advance as a fraction of the font size.  Measured off a real render:
+#: a CJK glyph fills its em (1.00), a Latin glyph or digit takes about 0.60.
+#: A single ratio for both is what made the "账号" label sit on top of the value
+#: beside it -- "账号" is 24 px at size 12, not the 14.9 px a flat 0.62
+#: predicted, so a right-aligned label reached ~9 px further than intended.
+_WIDE_ADVANCE = 1.00
+_NARROW_ADVANCE = 0.60
+
+#: Gap between a readout's label and its value.
+_LABEL_GAP = 8.0
+
+
+def _is_wide(char: str) -> bool:
+    """Whether *char* occupies a full em (CJK and friends)."""
+    code = ord(char)
+    return (
+        0x1100 <= code <= 0x115F        # Hangul Jamo
+        or 0x2E80 <= code <= 0xA4CF     # CJK radicals through Yi
+        or 0xAC00 <= code <= 0xD7A3     # Hangul syllables
+        or 0xF900 <= code <= 0xFAFF     # CJK compatibility ideographs
+        or 0xFE30 <= code <= 0xFE6F     # CJK compatibility forms
+        or 0xFF00 <= code <= 0xFF60     # Fullwidth forms
+        or 0xFFE0 <= code <= 0xFFE6
+        or 0x20000 <= code <= 0x3FFFD   # CJK extensions B and beyond
+    )
+
+
+def _advance(text: str, size: float) -> float:
+    """Estimated width of *text* at *size*, in pixels."""
+    total = 0.0
+    for char in text or "":
+        total += size * (_WIDE_ADVANCE if _is_wide(char) else _NARROW_ADVANCE)
+    return total
+
+
 class HudPainter:
     """Builds the shape list for one frame."""
 
@@ -205,7 +240,7 @@ class HudPainter:
 
     def label(self, x, y, text, color, *, size=None, align="left", bold=False) -> None:
         size = size if size is not None else self.hud.size_micro
-        approx_width = len(text) * size * 0.62
+        approx_width = _advance(text, size)
         if align == "center":
             x -= approx_width / 2
         elif align == "right":
@@ -458,16 +493,35 @@ class HudPainter:
                    size=self.hud.size_micro + 1, align="center", bold=True)
 
     def corner_readout(self, corner: str, lines: list[tuple[str, str]]) -> None:
-        """Labelled readouts in the corners, each on its own scrim."""
+        """Labelled readouts in the corners, each on its own scrim.
+
+        The label column is derived from the widest value instead of being a
+        fixed offset.  It used to right-align the value at the box edge and the
+        label 92 px to its left, which silently assumed every value was
+        narrower than 92 px -- "172.18.123.63" is about 109 px at this size, so
+        the address was drawn straight through its own label.
+        """
         line_height = 20.0
         right = corner in ("tr", "br")
         bottom = corner in ("bl", "br")
+
+        size_value = self.hud.size_body
+        size_key = self.hud.size_micro + 1
+
+        widest_value = max((_advance(v, size_value) for _, v in lines), default=0.0)
+        widest_key = max((_advance(k, size_key) for k, _ in lines), default=0.0)
 
         total = len(lines) * line_height
         base_y = (self.h - 16.0 - total) if bottom else 12.0
         base_x = (self.w - 18.0) if right else 18.0
 
-        box_w, box_h = 190.0, total + 8.0
+        # Left corners keep their original breathing room; the offset only grows
+        # if a label would otherwise run into its own value.
+        key_offset = max(62.0, widest_key + _LABEL_GAP)
+        content_w = widest_value + _LABEL_GAP + widest_key
+
+        box_w = max(190.0, content_w + 26.0)
+        box_h = total + 8.0
         box_x = base_x - box_w + 8.0 if right else base_x - 8.0
         self.filled_rect(box_x, base_y - 4.0, box_w, box_h, self.hud.palette.panel_sunk)
         self.outline_rect(box_x, base_y - 4.0, box_w, box_h, self.hud.palette.border, width=1.0)
@@ -476,14 +530,15 @@ class HudPainter:
             y = base_y + index * line_height
             if right:
                 self.label(base_x, y, value, self.hud.palette.text,
-                           size=self.hud.size_body, align="right", bold=True)
-                self.label(base_x - 92, y, key, self.hud.palette.text_muted,
-                           size=self.hud.size_micro + 1, align="right")
+                           size=size_value, align="right", bold=True)
+                # Sit the label immediately left of the widest value on this
+                # corner, so no line can reach across it.
+                self.label(base_x - widest_value - _LABEL_GAP, y, key,
+                           self.hud.palette.text_muted, size=size_key, align="right")
             else:
-                self.label(base_x, y, key, self.hud.palette.text_muted,
-                           size=self.hud.size_micro + 1)
-                self.label(base_x + 62, y, value, self.hud.palette.text,
-                           size=self.hud.size_body, bold=True)
+                self.label(base_x, y, key, self.hud.palette.text_muted, size=size_key)
+                self.label(base_x + key_offset, y, value, self.hud.palette.text,
+                           size=size_value, bold=True)
 
     def mode_bar(self, telemetry: HudTelemetry) -> None:
         """Bottom mode strip, centred so it clears the corner blocks."""

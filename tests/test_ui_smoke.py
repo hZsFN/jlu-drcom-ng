@@ -482,3 +482,115 @@ def test_hud_height_leaves_room_for_the_panels_below(app) -> None:
     height = app._initial_canvas_height()
     assert app.HUD_MIN_HEIGHT <= height <= app.HUD_MAX_HEIGHT
     assert height <= app.page.window.height * 0.6
+# --------------------------------------------------------------------------
+# the HUD corner readout -- the other half of "the numbers on screen are wrong"
+# (they were unreadable, not merely unrepresentative)
+# --------------------------------------------------------------------------
+def _hud():
+    from drcom.ui.hud import HUD
+    from drcom.ui.theme import Palette
+
+    return HUD(palette=Palette())
+
+
+def _corner_shapes(lines, *, width: float = 1022.0, height: float = 406.0):
+    from drcom.ui.hud import HudPainter
+
+    painter = HudPainter(_hud(), width=width, height=height)
+    painter.shapes = []
+    painter.corner_readout("br", list(lines))
+    return painter.shapes
+
+
+def _texts(shapes):
+    import flet.canvas as cv
+
+    return [(s.x, s.value, s.style.size) for s in shapes if isinstance(s, cv.Text)]
+
+
+def test_corner_readout_label_never_collides_with_its_value() -> None:
+    """The reported bug: 172.18.123.63 was drawn through the word "IP".
+
+    A fixed 92 px label offset assumed every value was narrower than that; the
+    address is about 109 px at 14 px type.
+    """
+    from drcom.ui.hud import _advance
+
+    entries = _texts(_corner_shapes([("账号", "ta******26"), ("IP", "172.18.123.63")]))
+    assert len(entries) == 4, entries
+
+    values = sorted([e for e in entries if e[1] in ("ta******26", "172.18.123.63")], key=lambda e: e[0])
+    labels = sorted([e for e in entries if e[1] in ("账号", "IP")], key=lambda e: e[0])
+    assert len(values) == 2 and len(labels) == 2
+
+    for vx, vtext, _ in values:
+        for lx, ltext, lsize in labels:
+            label_right = lx + _advance(ltext, lsize)
+            assert label_right <= vx + 0.01, (
+                f"label {ltext!r} (right edge {label_right:.1f}) overlaps "
+                f"value {vtext!r} (left edge {vx:.1f})"
+            )
+
+
+def test_corner_readout_box_grows_for_a_long_value() -> None:
+    """A wide value must widen the scrim, not spill out of it."""
+    import flet.canvas as cv
+
+    from drcom.ui.hud import _advance
+
+    long_value = "255.255.255.255"
+    rects = [s for s in _corner_shapes([("IP", long_value)]) if isinstance(s, cv.Rect)]
+    assert rects, "the scrim was not drawn"
+
+    widest = max((getattr(r, "width", 0) or 0) for r in rects)
+    needed = _advance(long_value, _hud().size_body) + 18.0
+    assert widest >= needed, f"scrim {widest:.1f} px is narrower than its content"
+
+
+def test_corner_readout_keeps_left_corners_tidy() -> None:
+    """Short labels must not push the value column around."""
+    values = [e for e in _texts(_corner_shapes([("接收", "22.1K"), ("发送", "15.2K")])) if e[1].endswith("K")]
+    assert len(values) == 2
+    assert values[0][0] == values[1][0], "the two values should share a column"
+
+
+# --------------------------------------------------------------------------
+# text metrics and the corner readouts
+#
+# These live here rather than with the probe: the bug they pin was a *layout*
+# one -- the label "账号" was drawn through the value beside it.
+# --------------------------------------------------------------------------
+def test_text_advance_matches_a_real_render() -> None:
+    """Calibrated against measured pixels, not guessed.
+
+    A render showed "延迟" occupying exactly 24 px at size 12, i.e. one em per
+    CJK glyph, while "170ms" took about 0.6 em per Latin glyph.  A single flat
+    ratio for both is what put the label on top of its value.
+    """
+    from drcom.ui.hud import _advance
+
+    assert _advance("延迟", 12) == pytest.approx(24.0, abs=0.5)
+    assert _advance("账号", 12) == pytest.approx(24.0, abs=0.5)
+    # Five Latin glyphs at 0.6 em each.
+    assert _advance("170ms", 14) == pytest.approx(42.0, abs=1.0)
+
+
+def test_wide_characters_are_wider_than_narrow_ones() -> None:
+    from drcom.ui.hud import _advance
+
+    assert _advance("账", 12) > _advance("A", 12), "CJK must be modelled as full-width"
+    assert _advance("账", 12) == pytest.approx(12.0, abs=0.1)
+    assert _advance("", 12) == 0.0
+    assert _advance(None, 12) == 0.0
+
+
+def test_every_style_of_wide_character_is_covered() -> None:
+    from drcom.ui.hud import _is_wide
+
+    for char in "账延迟抖动中文号":          # CJK
+        assert _is_wide(char), f"{char!r} should count as full-width"
+    for char in "＃＠％":                     # fullwidth forms
+        assert _is_wide(char), f"{char!r} should count as full-width"
+    for char in "A1.:-/ IPv6":
+        assert not _is_wide(char), f"{char!r} should not count as full-width"
+

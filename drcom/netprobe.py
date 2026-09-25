@@ -1,8 +1,19 @@
-"""Network quality probing: latency and packet loss (P2).
+"""Network quality probing: latency, jitter and packet loss (P2).
 
-Uses the platform ``ping`` binary rather than raw sockets: raw ICMP needs
-administrator privileges on Windows, and shelling out keeps the app
-unprivileged.  Output parsing covers both the Windows and the iputils formats.
+Two probe kinds, because one of them is not enough on a real machine:
+
+**ICMP** (via the platform ``ping`` binary) is the honest measure of a plain
+link, and it is what we use for the campus gateway.  Raw ICMP needs
+administrator privileges on Windows, so shelling out keeps the app
+unprivileged; output parsing covers the Windows and the iputils formats.
+
+**HTTP** (time to first response byte from a real website) is what we use for
+the internet, because on a machine running a VPN in TUN mode ICMP is simply not
+usable: the tunnel does not carry it, so public addresses look 100% lost while
+the connection is perfectly fine.  TCP connect is no better -- the proxy client
+completes the handshake locally, so a connect takes ~1 ms and measures the
+proxy, not the network.  An actual HTTP request is the first thing that has to
+travel end to end, so that is what we time.
 
 The probe deliberately runs *while offline as well as online*, so the UI can
 show the "before vs after authentication" comparison the brief asks for.
@@ -17,7 +28,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-__all__ = ["PingResult", "ProbeHistory", "NetworkProbe"]
+__all__ = ["PingResult", "ProbeHistory", "NetworkProbe", "probe_once", "is_http_target"]
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -36,6 +47,10 @@ class PingResult:
     received: int
     rtt_ms: float | None
     timestamp: float = field(default_factory=time.time)
+    #: The individual round trips, not just their mean.  Jitter computed from a
+    #: series of means is not jitter -- averaging three pings first hides
+    #: exactly the variation we are trying to report.
+    rtts: tuple[float, ...] = ()
 
     @property
     def loss_percent(self) -> float:
@@ -52,10 +67,66 @@ class PingResult:
 #: ping as an option (e.g. "-f" = flood), turning a config typo into a flood.
 _SAFE_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]{0,253}$")
 
+#: URLs we are willing to fetch.  Same reasoning as _SAFE_TARGET, plus: no
+#: credentials in the URL, and no scheme other than http(s).
+_SAFE_URL = re.compile(r"^https?://[A-Za-z0-9][A-Za-z0-9._:\-]{0,253}(?:/[^\s]*)?$", re.IGNORECASE)
+
+
+def is_http_target(target: str) -> bool:
+    """Whether *target* is a URL (probed over HTTP) rather than a host (ICMP)."""
+    return bool(target) and target.lower().startswith(("http://", "https://"))
+
 
 def is_safe_target(target: str) -> bool:
-    """Whether *target* is safe to hand to ``ping`` as a positional argument."""
+    """Whether *target* is safe to probe."""
+    if is_http_target(target):
+        return bool(_SAFE_URL.match(target))
     return bool(_SAFE_TARGET.match(target or "")) and not target.startswith("-")
+
+
+def http_once(url: str, *, timeout_ms: int = 1500) -> PingResult:
+    """Time a real request to *url*, up to the first response byte.
+
+    We stop at the headers: this is a latency measurement, not a download, and
+    reading the body would fold the site's payload size into the number.
+    """
+    import urllib.error
+    import urllib.request
+
+    if not is_safe_target(url):
+        return PingResult(url, 1, 0, None)
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            # Some sites stall or reject the default Python agent outright.
+            "User-Agent": "Mozilla/5.0 (compatible; JLU-DrCOM-NG)",
+            "Accept": "*/*",
+            "Connection": "close",
+        },
+        method="GET",
+    )
+    started = time.perf_counter()
+    try:
+        with urllib.request.urlopen(request, timeout=max(0.05, timeout_ms / 1000)) as response:
+            response.read(1)  # first byte, so DNS+connect+TLS+server are all counted
+        elapsed = (time.perf_counter() - started) * 1000.0
+    except (urllib.error.URLError, OSError, ValueError):
+        return PingResult(url, 1, 0, None)
+    return PingResult(url, 1, 1, elapsed, rtts=(elapsed,))
+
+
+def probe_once(
+    target: str,
+    *,
+    count: int = 3,
+    timeout_ms: int = 1500,
+    source: str = "",
+) -> PingResult:
+    """Probe *target* with whichever method suits it."""
+    if is_http_target(target):
+        return http_once(target, timeout_ms=timeout_ms)
+    return ping_once(target, count=count, timeout_ms=timeout_ms, source=source)
 
 
 def ping_once(
@@ -109,44 +180,133 @@ def ping_once(
         percent = float(loss_match.group(1))
         received = max(received, round(count * (1 - percent / 100.0)))
     rtt = sum(times) / len(times) if times else None
-    return PingResult(target, count, min(received, count), rtt)
+    return PingResult(target, count, min(received, count), rtt, rtts=tuple(times))
 
 
 class ProbeHistory:
-    """Rolling window of results per target."""
+    """Rolling window of results per target.
 
-    def __init__(self, window: int = 40) -> None:
+    Jitter is the mean absolute difference between *consecutive individual*
+    round trips -- the RFC 3550 definition, and the one that actually says
+    something about a link.  Differencing per-round averages instead (as this
+    used to) reports a fraction of the real figure, because averaging three
+    pings is itself a smoothing filter.
+    """
+
+    def __init__(self, window: int = 40, sample_window: int = 180) -> None:
         self.window = window
+        #: How many individual round trips to keep per target.  A round of ICMP
+        #: contributes `count` samples, an HTTP probe one.
+        self.sample_window = sample_window
         self.results: dict[str, list[PingResult]] = {}
+        self._samples: dict[str, list[float]] = {}
+        self._order: list[str] = []
 
     def add(self, result: PingResult) -> None:
+        if result.target not in self._order:
+            self._order.append(result.target)
         bucket = self.results.setdefault(result.target, [])
         bucket.append(result)
         del bucket[: max(0, len(bucket) - self.window)]
 
+        samples = self._samples.setdefault(result.target, [])
+        samples.extend(result.rtts)
+        del samples[: max(0, len(samples) - self.sample_window)]
+
+    def targets(self) -> list[str]:
+        return list(self._order)
+
     def summary(self, target: str) -> dict:
         bucket = self.results.get(target, [])
+        samples = self._samples.get(target, [])
+        # The method is determined by the target, so it is derived rather than
+        # stored: a recorded copy can drift out of step with the thing it
+        # describes (and did, the first time this was written).
+        kind = "http" if is_http_target(target) else "icmp"
         if not bucket:
-            return {"target": target, "samples": 0, "rtt_ms": None, "loss_percent": None, "jitter_ms": None}
-        rtts = [r.rtt_ms for r in bucket if r.rtt_ms is not None]
-        loss = sum(r.loss_percent for r in bucket) / len(bucket)
+            return {
+                "target": target,
+                "kind": kind,
+                "samples": 0,
+                "pings": 0,
+                "rtt_ms": None,
+                "loss_percent": None,
+                "jitter_ms": None,
+            }
+
+        sent = sum(r.sent for r in bucket)
+        received = sum(r.received for r in bucket)
+        loss = (sent - received) / sent * 100.0 if sent else 0.0
+
         jitter = None
-        if len(rtts) >= 2:
-            diffs = [abs(rtts[i] - rtts[i - 1]) for i in range(1, len(rtts))]
+        if len(samples) >= 2:
+            diffs = [abs(samples[i] - samples[i - 1]) for i in range(1, len(samples))]
             jitter = sum(diffs) / len(diffs)
+
         return {
             "target": target,
+            "kind": kind,
             "samples": len(bucket),
-            "rtt_ms": round(sum(rtts) / len(rtts), 1) if rtts else None,
+            "pings": len(samples),
+            "rtt_ms": round(sum(samples) / len(samples), 1) if samples else None,
             "loss_percent": round(loss, 1),
             "jitter_ms": round(jitter, 1) if jitter is not None else None,
         }
 
     def all_summaries(self) -> list[dict]:
-        return [self.summary(target) for target in self.results]
+        return [self.summary(target) for target in self._order]
+
+    def display_summary(self) -> dict:
+        """The single figure the dashboard shows.
+
+        Internet targets win: the campus gateway answers in about a millisecond
+        and says nothing about whether a web page will load.  When there is more
+        than one internet target they are combined, so one site having a bad
+        minute does not blank the instrument.
+        """
+        if not self._order:
+            return self.summary("—")
+
+        internet = [t for t in self._order if is_http_target(t)]
+        picks = [t for t in (internet or self._order) if self.results.get(t)]
+        if not picks:
+            return self.summary(self._order[0])
+        if len(picks) == 1:
+            return self.summary(picks[0])
+
+        summaries = [self.summary(t) for t in picks]
+        live = [s for s in summaries if s["rtt_ms"] is not None]
+        if not live:
+            return summaries[0]
+
+        rtts = [s["rtt_ms"] for s in live]
+        sent = sum(s["samples"] for s in live)
+        return {
+            "target": ", ".join(_short_name(s["target"]) for s in live),
+            "kind": live[0]["kind"],
+            "samples": sum(s["samples"] for s in summaries),
+            "pings": sum(s["pings"] for s in summaries),
+            "rtt_ms": round(sum(rtts) / len(rtts), 1),
+            "loss_percent": round(
+                sum(s["loss_percent"] or 0.0 for s in summaries) / max(1, sent), 1
+            ),
+            "jitter_ms": _mean_or_none([s["jitter_ms"] for s in live]),
+        }
 
     def clear(self) -> None:
         self.results.clear()
+        self._samples.clear()
+        self._order.clear()
+
+
+def _mean_or_none(values: list[float | None]) -> float | None:
+    present = [v for v in values if v is not None]
+    return round(sum(present) / len(present), 1) if present else None
+
+
+def _short_name(target: str) -> str:
+    """``http://www.baidu.com`` -> ``www.baidu.com`` for the dashboard label."""
+    return re.sub(r"^https?://", "", target).rstrip("/") or target
 
 
 class NetworkProbe:
@@ -185,7 +345,7 @@ class NetworkProbe:
         for item in targets:
             if self._stop.is_set():
                 break
-            result = ping_once(
+            result = probe_once(
                 item, timeout_ms=self.config.timeout_ms, source=self.source_address
             )
             self.history.add(result)
@@ -197,10 +357,28 @@ class NetworkProbe:
                     pass
         return out
 
+    def warm_up(self) -> None:
+        """One throwaway probe per target, before any result is recorded.
+
+        The first request to a site pays for DNS and for opening the path
+        through whatever proxy is running; it can be several times the steady
+        figure and, recorded, it dominates a jitter average for the whole
+        window.  Warming the path first is what makes the number comparable
+        between runs.
+        """
+        for target in list(self.config.targets):
+            if self._stop.is_set():
+                return
+            probe_once(target, timeout_ms=self.config.timeout_ms, source=self.source_address)
+
     def _loop(self) -> None:
         # Stagger the first probe so it does not compete with authentication.
         if self._stop.wait(3.0):
             return
+        try:
+            self.warm_up()
+        except Exception:  # pragma: no cover - a warm-up must never kill the loop
+            pass
         while not self._stop.is_set():
             if not (self.config.only_when_offline and self._is_online()):
                 self.probe_now()

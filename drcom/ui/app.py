@@ -34,7 +34,7 @@ from pathlib import Path
 
 import flet as ft
 
-from ..config import CLOSE_ACTION_LABELS, CLOSE_ACTIONS
+from ..config import CLOSE_ACTION_LABELS, CLOSE_ACTIONS, DEFAULT_PROBE_TARGETS
 from ..controller import AppController, ControllerEvent
 from ..engine import EngineState
 from ..logbus import LogRecordView
@@ -587,16 +587,28 @@ class DrcomApp:
         )
 
     def _initial_canvas_height(self) -> float:
-        """A one-time HUD height based on the window we asked for."""
+        """A one-time HUD height based on the window we asked for.
+
+        The HUD adapts to whatever height it is handed -- its corner readouts
+        and mode bar are all positioned from the bottom edge.  So the only way
+        to get this wrong is to ask for more than the surrounding layout will
+        show, which is what used to happen: a 780 px window leaves about 327 px
+        for the canvas while the old ratio asked for 406 px, so the bottom
+        79 px -- both lower readout blocks and the mode bar -- were clipped away
+        and could not be seen at the default window size.
+        """
         try:
             window_height = float(getattr(self.page.window, "height", 0) or 0)
         except (TypeError, ValueError):
             window_height = 0.0
         if window_height <= 0:
             window_height = 780.0
+        # Still computed from the window size we asked for, and still fixed for
+        # the session: deriving it from a measurement of the container is what
+        # would turn this into a measure/relayout loop.
         return min(
             self.HUD_MAX_HEIGHT,
-            max(self.HUD_MIN_HEIGHT, window_height * self.HUD_HEIGHT_RATIO),
+            max(self.HUD_MIN_HEIGHT, window_height - self.HUD_CHROME_HEIGHT),
         )
 
     def _make_decor_canvas(self) -> cv.Canvas:
@@ -1091,7 +1103,7 @@ class DrcomApp:
 
         def save_probe(_event) -> None:
             targets = [t.strip() for t in (probe_targets.value or "").split(",") if t.strip()]
-            cfg.probe.targets = targets or ["10.100.61.3"]
+            cfg.probe.targets = targets or list(DEFAULT_PROBE_TARGETS)
             persist()
             self._flash("探测设置已保存", True)
 
@@ -1687,10 +1699,11 @@ class DrcomApp:
         state = engine.state if engine else EngineState.IDLE
         snapshot = controller.traffic.snapshot if controller.config.traffic.enabled else None
 
-        quality = {}
-        for item in controller.probe.history.all_summaries():
-            quality = item
-            break
+        # Which target the instrument points at is decided by the history, not
+        # by dictionary order: it prefers the internet targets, so the reading
+        # says something about loading a web page rather than about reaching
+        # the campus gateway in one millisecond.
+        quality = controller.probe.history.display_summary()
 
         stats = controller.stats
         today = stats.today()
@@ -1820,7 +1833,12 @@ class DrcomApp:
     #: what turned a resize into an endless measure/relayout loop.
     RESIZE_HYSTERESIS = 10.0
     #: Vertical share of the window the HUD panel gets.
-    HUD_HEIGHT_RATIO = 0.52
+    #: Everything in the window that is not the HUD: header, nav, the status
+    #: card, the log panel, the action buttons and the stats row.  Measured off
+    #: a real render -- a 780 px window (741 px client area) leaves about 327 px
+    #: for the canvas.  Erring small is harmless because the HUD lays itself out
+    #: from its own height; erring large hides the bottom of the instrument.
+    HUD_CHROME_HEIGHT = 460.0
     HUD_MIN_HEIGHT = 320.0
     HUD_MAX_HEIGHT = 560.0
 

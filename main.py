@@ -25,6 +25,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from drcom import __version__  # noqa: E402
 
 
+def _raise_priority() -> None:
+    """Ask the OS for a slightly higher scheduling class.
+
+    Deliberately ABOVE_NORMAL and not HIGH: this is a background utility, and
+    HIGH_PRIORITY_CLASS would let it starve the interactive programs it shares
+    the machine with.  What it buys is the boot case -- a dozen startup entries
+    and a cold disk -- where being scheduled promptly is most of the wait.
+
+    Child processes (the Flet client) inherit the class, so this is the only
+    place it needs doing.  Never fatal: on a platform or policy that refuses
+    it, we simply run at normal priority.
+    """
+    try:
+        import os
+
+        if os.name != "nt":
+            return
+        import ctypes
+
+        ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS)
+    except Exception:
+        pass
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jlu-drcom-ng",
@@ -188,6 +214,7 @@ def _force_utf8_console() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _raise_priority()
     _force_utf8_console()
     argv = list(sys.argv[1:] if argv is None else argv)
 
@@ -234,6 +261,9 @@ def main(argv: list[str] | None = None) -> int:
         from drcom.ui import run_gui
 
         controller = AppController(data_dir=args.data_dir, log_level=args.log_level)
+        # Authenticate before the window exists.  The GUI is the slowest part
+        # of a cold start, and there is no reason for the network to wait on it.
+        controller.begin_session()
         run_gui(
             controller,
             minimized=args.minimized or args.autostart,

@@ -67,6 +67,14 @@ class PingResult:
 #: ping as an option (e.g. "-f" = flood), turning a config typo into a flood.
 _SAFE_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]{0,253}$")
 
+#: HTTP probes get at least this long, whatever the configured timeout says.
+#: That setting was chosen for ICMP to a campus box a millisecond away; a real
+#: request through a proxy has a long tail (a site answering in 250 ms will
+#: occasionally take 2 s), and with the tighter figure those slow-but-fine
+#: replies were being counted as packet loss -- bing read 66% loss while
+#: answering every time a hand-run test asked.
+HTTP_TIMEOUT_FLOOR_MS = 3000
+
 #: URLs we are willing to fetch.  Same reasoning as _SAFE_TARGET, plus: no
 #: credentials in the URL, and no scheme other than http(s).
 _SAFE_URL = re.compile(r"^https?://[A-Za-z0-9][A-Za-z0-9._:\-]{0,253}(?:/[^\s]*)?$", re.IGNORECASE)
@@ -84,17 +92,10 @@ def is_safe_target(target: str) -> bool:
     return bool(_SAFE_TARGET.match(target or "")) and not target.startswith("-")
 
 
-def http_once(url: str, *, timeout_ms: int = 1500) -> PingResult:
-    """Time a real request to *url*, up to the first response byte.
-
-    We stop at the headers: this is a latency measurement, not a download, and
-    reading the body would fold the site's payload size into the number.
-    """
+def _http_request_once(url: str, timeout_ms: int) -> float | None:
+    """One request; returns the elapsed milliseconds, or None on failure."""
     import urllib.error
     import urllib.request
-
-    if not is_safe_target(url):
-        return PingResult(url, 1, 0, None)
 
     request = urllib.request.Request(
         url,
@@ -110,10 +111,36 @@ def http_once(url: str, *, timeout_ms: int = 1500) -> PingResult:
     try:
         with urllib.request.urlopen(request, timeout=max(0.05, timeout_ms / 1000)) as response:
             response.read(1)  # first byte, so DNS+connect+TLS+server are all counted
-        elapsed = (time.perf_counter() - started) * 1000.0
     except (urllib.error.URLError, OSError, ValueError):
-        return PingResult(url, 1, 0, None)
-    return PingResult(url, 1, 1, elapsed, rtts=(elapsed,))
+        return None
+    return (time.perf_counter() - started) * 1000.0
+
+
+def http_once(url: str, *, count: int = 3, timeout_ms: int = 1500) -> PingResult:
+    """Time *count* real requests to *url*, up to the first response byte each.
+
+    We stop at the headers: this is a latency measurement, not a download, and
+    reading the body would fold the site's payload size into the number.
+
+    Several requests per round, not one, because jitter is the variation between
+    *consecutive* round trips.  With a single request per round the two samples
+    being differenced are a whole probe interval apart, which measures how the
+    network changed over that minute rather than how steady it is -- and it read
+    about six times too high.
+    """
+    if not is_safe_target(url):
+        return PingResult(url, count, 0, None)
+
+    # The round owns the time budget, so the floor is applied here rather than
+    # buried in the single-request helper.
+    timeout_ms = max(timeout_ms, HTTP_TIMEOUT_FLOOR_MS)
+    times = [t for t in (_http_request_once(url, timeout_ms) for _ in range(max(1, count)))
+             if t is not None]
+    if not times:
+        return PingResult(url, count, 0, None)
+    return PingResult(
+        url, count, len(times), sum(times) / len(times), rtts=tuple(times)
+    )
 
 
 def probe_once(
@@ -125,7 +152,7 @@ def probe_once(
 ) -> PingResult:
     """Probe *target* with whichever method suits it."""
     if is_http_target(target):
-        return http_once(target, timeout_ms=timeout_ms)
+        return http_once(target, count=count, timeout_ms=timeout_ms)
     return ping_once(target, count=count, timeout_ms=timeout_ms, source=source)
 
 
@@ -238,10 +265,12 @@ class ProbeHistory:
         received = sum(r.received for r in bucket)
         loss = (sent - received) / sent * 100.0 if sent else 0.0
 
-        jitter = None
-        if len(samples) >= 2:
-            diffs = [abs(samples[i] - samples[i - 1]) for i in range(1, len(samples))]
-            jitter = sum(diffs) / len(diffs)
+        # Jitter is computed *within* each round and then averaged across
+        # rounds.  Differencing samples from different rounds would measure how
+        # the network drifted over the probe interval (a minute apart) rather
+        # than how steady the link is -- and it read several times too high.
+        round_jitters = [_mean_abs_delta(r.rtts) for r in bucket if len(r.rtts) >= 2]
+        jitter = sum(round_jitters) / len(round_jitters) if round_jitters else None
 
         return {
             "target": target,
@@ -299,6 +328,14 @@ class ProbeHistory:
         self._order.clear()
 
 
+
+def _mean_abs_delta(values) -> float:
+    """Mean absolute difference between consecutive values (RFC 3550 jitter)."""
+    seq = list(values)
+    if len(seq) < 2:
+        return 0.0
+    diffs = [abs(seq[i] - seq[i - 1]) for i in range(1, len(seq))]
+    return sum(diffs) / len(diffs)
 def _mean_or_none(values: list[float | None]) -> float | None:
     present = [v for v in values if v is not None]
     return round(sum(present) / len(present), 1) if present else None

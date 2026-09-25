@@ -78,7 +78,10 @@ def test_dangerous_targets_are_rejected(target) -> None:
 # --------------------------------------------------------------------------
 def test_probe_once_uses_http_for_urls(monkeypatch) -> None:
     seen: list = []
-    monkeypatch.setattr(netprobe, "http_once", lambda url, timeout_ms=0: seen.append(url) or PingResult(url, 1, 1, 1.0))
+    monkeypatch.setattr(
+        netprobe, "http_once",
+        lambda url, **kw: seen.append(url) or PingResult(url, 1, 1, 1.0),
+    )
     netprobe.probe_once("http://www.baidu.com")
     assert seen == ["http://www.baidu.com"]
 
@@ -125,8 +128,11 @@ def test_jitter_uses_individual_round_trips_not_round_averages() -> None:
     summary = history.summary("t")
     assert summary["pings"] == 6, "individual round trips were not kept"
     assert summary["rtt_ms"] == pytest.approx(30.0, abs=0.05)
-    # d: 20,10,10,20,10 -> mean 14.0
-    assert summary["jitter_ms"] == pytest.approx(14.0, abs=0.05)
+    # Each round's own consecutive deltas are 20 and 10, so each round's jitter
+    # is 15.  The round means (20 and 40) differ by 20 -- a metric built on the
+    # means would report 20 and would be describing the gap between rounds
+    # rather than the steadiness within one.
+    assert summary["jitter_ms"] == pytest.approx(15.0, abs=0.05)
 
 
 def test_jitter_is_none_with_a_single_sample() -> None:
@@ -276,3 +282,57 @@ def test_warm_up_records_nothing() -> None:
     probe = netprobe.NetworkProbe(ProbeConfig(targets=["http://127.0.0.1:9/"]), Silent())
     probe.warm_up()
     assert probe.history.all_summaries() == []
+
+
+def test_jitter_is_measured_within_a_round_not_across_rounds() -> None:
+    """Samples a probe interval apart describe drift, not jitter.
+
+    Two perfectly steady rounds, 500 ms apart.  Each round is rock solid, so the
+    jitter is ~0; differencing across rounds would report ~500.
+    """
+    history = ProbeHistory()
+    history.add(PingResult("t", 3, 3, 10.0, rtts=(10.0, 10.0, 10.0)))
+    history.add(PingResult("t", 3, 3, 510.0, rtts=(510.0, 510.0, 510.0)))
+    assert history.summary("t")["jitter_ms"] == pytest.approx(0.0, abs=0.05)
+
+
+def test_http_probe_takes_several_requests_per_round(monkeypatch) -> None:
+    """One request per round cannot produce a jitter figure."""
+    calls: list = []
+
+    def fake_request(url, timeout_ms):
+        calls.append(url)
+        return 100.0
+
+    monkeypatch.setattr(netprobe, "_http_request_once", fake_request)
+    result = netprobe.http_once("http://example.com", count=3, timeout_ms=500)
+    assert len(calls) == 3, "a single sample per round cannot yield jitter"
+    assert result.sent == 3 and result.received == 3
+    assert result.rtts == (100.0, 100.0, 100.0)
+    assert result.rtt_ms == pytest.approx(100.0, abs=0.05)
+
+
+def test_http_probe_counts_partial_failures() -> None:
+    """Two of three replies is a loss reading, not a crash."""
+    result = PingResult("http://example.com", 3, 2, 50.0, rtts=(40.0, 60.0))
+    assert result.loss_percent == pytest.approx(33.3, abs=0.1)
+
+
+def test_http_probe_timeout_has_a_floor() -> None:
+    """A LAN-era 1.5 s timeout turned slow-but-fine replies into packet loss."""
+    from drcom.netprobe import HTTP_TIMEOUT_FLOOR_MS
+
+    seen: list = []
+    import drcom.netprobe as np
+
+    def fake(url, timeout_ms):
+        seen.append(timeout_ms)
+        return 5.0
+
+    original = np._http_request_once
+    np._http_request_once = fake
+    try:
+        np.http_once("http://example.com", count=1, timeout_ms=1500)
+    finally:
+        np._http_request_once = original
+    assert seen == [HTTP_TIMEOUT_FLOOR_MS], seen

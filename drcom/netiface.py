@@ -134,6 +134,20 @@ class _MIB_IF_TABLE2(ctypes.Structure):
 _windows_api_ok: bool | None = None
 
 
+
+def _rows_from_table(rows_addr: int, count: int) -> list["_MIB_IF_ROW2"]:
+    """Copy *count* interface rows out of a raw GetIfTable2 buffer.
+
+    Copied, deliberately: indexing a ctypes structure array yields a *view*
+    into that buffer rather than a copy, and the caller frees the buffer as
+    soon as this returns.  Returning views handed every later field read a
+    dangling pointer -- usually stale numbers, occasionally an access violation
+    (0xC0000005 inside _ctypes.pyd), which is what killed the app at random.
+    """
+    row_array = (_MIB_IF_ROW2 * count).from_address(rows_addr)
+    return [_MIB_IF_ROW2.from_buffer_copy(row_array[i]) for i in range(count)]
+
+
 def _windows_if_table() -> list[_MIB_IF_ROW2]:
     """Read the interface table, or ``[]`` if the API/structure is unusable."""
     global _windows_api_ok
@@ -168,8 +182,7 @@ def _windows_if_table() -> list[_MIB_IF_ROW2]:
         # ULONG64 the compiler pads that start up to an 8-byte boundary.
         table_addr = ctypes.addressof(ctypes.cast(table_ptr, ctypes.POINTER(_MIB_IF_TABLE2)).contents)
         rows_addr = (table_addr + ctypes.sizeof(ctypes.c_ulong) + 7) & ~7
-        row_array = (_MIB_IF_ROW2 * count).from_address(rows_addr)
-        rows = [row_array[i] for i in range(count)]
+        rows = _rows_from_table(rows_addr, count)
 
         # --- sanity check the struct layout ---------------------------------
         if rows and not any(r.Alias for r in rows[: min(4, count)]):
@@ -415,21 +428,50 @@ def _interface_addresses() -> dict[int, list[str]]:
         ("Address", _SOCKET_ADDRESS),
     ]
 
+    # Set the prototype before calling.  Without argtypes ctypes guesses, and a
+    # 64-bit pointer marshalled as a 32-bit int is silently truncated -- that is
+    # how the priority bump in 1.0.4 came to do nothing at all.
+    get_addrs = iphlpapi.GetAdaptersAddresses
+    get_addrs.argtypes = [
+        ctypes.c_ulong,          # family
+        ctypes.c_ulong,          # flags
+        ctypes.c_void_p,         # reserved, must be NULL
+        ctypes.c_void_p,         # out buffer
+        ctypes.POINTER(ctypes.c_ulong),   # in/out size
+    ]
+    get_addrs.restype = ctypes.c_ulong
+
+    ERROR_BUFFER_OVERFLOW = 111
     flags = 0x0080  # GAA_FLAG_SKIP_ANYCAST | SKIP_MULTICAST | SKIP_DNS_SERVER
-    size = ctypes.c_ulong(16 * 1024)
+
+    # Ask for the size first, then allocate what it says.  The old code used a
+    # fixed 16 KiB, which on this machine fits by exactly one byte (the API
+    # reports 16383): it worked, but only until one more adapter appeared, and
+    # then the call fails outright and the traffic meter silently falls back to
+    # guessing its interface.
+    size = ctypes.c_ulong(0)
+    get_addrs(socket.AF_INET, flags, None, None, ctypes.byref(size))
+    if size.value <= 0:
+        size = ctypes.c_ulong(16 * 1024)
+    else:
+        size = ctypes.c_ulong(size.value + 4096)   # a little headroom for churn
+
     buf = ctypes.create_string_buffer(size.value)
-    ret = iphlpapi.GetAdaptersAddresses(
-        socket.AF_INET, flags, None, ctypes.byref(buf), ctypes.byref(size)
-    )
-    if ret != 0:
+    if get_addrs(socket.AF_INET, flags, None, buf, ctypes.byref(size)) != 0:
         return mapping
 
     node = ctypes.cast(buf, ctypes.POINTER(_IP_ADAPTER_ADDRESSES))
-    while node:
+    # Bounded: a malformed or half-written list must not spin forever (or walk
+    # off into memory that is not ours).
+    guard = 0
+    while node and guard < 4096:
+        guard += 1
         entry = node.contents
         addrs: list[str] = []
         unicast = ctypes.cast(entry.FirstUnicastAddress, ctypes.POINTER(_IP_ADAPTER_UNICAST_ADDRESS))
-        while unicast:
+        inner = 0
+        while unicast and inner < 4096:
+            inner += 1
             sockaddr = ctypes.cast(unicast.contents.Address.lpSockaddr, ctypes.POINTER(_SOCKADDR_IN))
             if sockaddr and sockaddr.contents.sin_family == socket.AF_INET:
                 addrs.append(".".join(str(b) for b in sockaddr.contents.sin_addr))

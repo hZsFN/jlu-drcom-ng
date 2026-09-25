@@ -183,3 +183,67 @@ def test_suspect_detection_returns_strings() -> None:
     suspects = binding.detect_conflict_suspects()
     assert isinstance(suspects, list)
     assert all(isinstance(item, str) for item in suspects)
+
+
+# --------------------------------------------------------------------------
+# interface table: the rows must survive FreeMibTable
+# --------------------------------------------------------------------------
+def test_interface_rows_are_copied_not_views() -> None:
+    """Reading a row after its buffer is freed is an access violation.
+
+    Indexing a ctypes structure array yields a view into the buffer, not a
+    copy.  ``_windows_if_table`` builds its list that way and frees the buffer
+    in a ``finally`` block, so it used to hand the caller dangling pointers:
+    reading a field afterwards returned stale numbers, and now and then took
+    the whole process down with 0xC0000005 inside _ctypes.pyd -- which is how
+    the app was dying at random, twice within seconds of start-up.
+    """
+    import ctypes
+
+    from drcom.netiface import _MIB_IF_ROW2
+
+    row = _MIB_IF_ROW2()
+    row.InterfaceIndex = 4242
+    row.Alias = "Ethernet-Probe"
+
+    buffer = ctypes.create_string_buffer(ctypes.sizeof(_MIB_IF_ROW2))
+    ctypes.memmove(buffer, ctypes.byref(row), ctypes.sizeof(_MIB_IF_ROW2))
+    array = (_MIB_IF_ROW2 * 1).from_address(ctypes.addressof(buffer))
+
+    views = [array[0]]
+    copies = [_MIB_IF_ROW2.from_buffer_copy(array[0])]
+
+    # Overwrite, then drop the buffer: the view now points at freed memory.
+    ctypes.memset(ctypes.addressof(buffer), 0xAA, ctypes.sizeof(_MIB_IF_ROW2))
+    del buffer, array
+
+    assert views[0].InterfaceIndex != 4242, "the premise changed: array[i] now copies"
+    assert copies[0].InterfaceIndex == 4242
+    assert copies[0].Alias == "Ethernet-Probe"
+
+
+def test_rows_from_table_are_copies() -> None:
+    """The deterministic version of the crash above.
+
+    Builds a table buffer we control, copies rows out of it, then scribbles
+    over and frees the buffer.  Returning views would show up here every time,
+    instead of depending on whether the allocator happens to unmap the page.
+    """
+    import ctypes
+
+    from drcom.netiface import _MIB_IF_ROW2, _rows_from_table
+
+    size = ctypes.sizeof(_MIB_IF_ROW2)
+    buffer = ctypes.create_string_buffer(size * 2)
+    for index, value in enumerate((77, 88)):
+        probe = _MIB_IF_ROW2()
+        probe.InterfaceIndex = value
+        probe.Alias = f"Adapter-{value}"
+        ctypes.memmove(ctypes.addressof(buffer) + index * size, ctypes.byref(probe), size)
+
+    rows = _rows_from_table(ctypes.addressof(buffer), 2)
+    ctypes.memset(ctypes.addressof(buffer), 0xAA, size * 2)
+    del buffer
+
+    assert [r.InterfaceIndex for r in rows] == [77, 88]
+    assert [str(r.Alias) for r in rows] == ["Adapter-77", "Adapter-88"]

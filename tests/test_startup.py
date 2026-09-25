@@ -18,6 +18,7 @@ Two reported problems, one root cause each:
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 import pytest
 
@@ -142,10 +143,50 @@ def test_priority_bump_is_best_effort() -> None:
     entry._raise_priority()  # must not raise here either
 
 
-def test_priority_class_is_above_normal_not_high() -> None:
-    """HIGH would let a background client starve the user's foreground work."""
+def test_priority_class_is_actually_applied() -> None:
+    """Ask the kernel, not the source text.
+
+    The first version of this shipped doing nothing: it called
+    SetPriorityClass without argtypes, so ctypes truncated the 64-bit process
+    handle to 32 bits, the call returned 0, and no exception was raised to
+    catch.  A test that greps the source for "0x00008000" passes happily in
+    that state -- so measure the real thing in a subprocess.
+    """
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    if os.name != "nt":
+        pytest.skip("Windows-only scheduling class")
+
+    probe = textwrap.dedent(
+        """
+        import ctypes, sys
+        sys.path.insert(0, r"%s")
+        import main
+        applied = main._raise_priority()
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.GetCurrentProcess.restype = ctypes.c_void_p
+        k.GetPriorityClass.argtypes = [ctypes.c_void_p]
+        k.GetPriorityClass.restype = ctypes.c_uint
+        print(applied, k.GetPriorityClass(k.GetCurrentProcess()))
+        """
+    ) % str(Path(__file__).resolve().parent.parent)
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    applied, actual = result.stdout.split()
+    assert applied == "True", "SetPriorityClass reported failure"
+    assert int(actual) == 0x00008000, (
+        f"priority class is 0x{int(actual):X}, expected 0x8000 (ABOVE_NORMAL)"
+    )
+
+
+def test_priority_helper_reports_failure_instead_of_lying() -> None:
+    """A refused call returns False rather than a silent no-op."""
     import main as entry
 
-    source = inspect.getsource(entry._raise_priority)
-    assert "0x00008000" in source, "ABOVE_NORMAL_PRIORITY_CLASS is 0x00008000"
-    assert "0x00000080" not in source, "that is HIGH_PRIORITY_CLASS; too aggressive"
+    assert isinstance(entry._raise_priority(), bool)

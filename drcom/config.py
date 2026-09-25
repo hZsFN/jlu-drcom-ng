@@ -244,12 +244,35 @@ class NotifyConfig:
     notify_on: list[str] = field(default_factory=lambda: ["online", "offline", "error", "login_failed"])
 
 
+#: Probe targets as shipped.  The campus gateway is measured with ICMP; the
+#: websites are measured with a real HTTP request, because on a machine running
+#: a VPN in TUN mode ICMP does not reach the internet at all, and a TCP connect
+#: only measures the local proxy (it answers in about a millisecond).
+DEFAULT_PROBE_TARGETS = [
+    "http://www.baidu.com",
+    "http://www.bing.com",
+    "10.100.61.3",
+]
+
+#: Values that only ever came from an older default.  Seeing one of these means
+#: "never customised", so upgrading it is safe; anything else is a real user
+#: choice and is left alone.
+_LEGACY_PROBE_TARGETS = (
+    ["10.100.61.3"],
+    ["10.100.61.3", "10.10.10.10"],
+)
+
+#: Schema version of the stored config.  Bump it when a stored value has to be
+#: rewritten once; _migrate() runs only while a file is older than this.
+CONFIG_VERSION = 2
+
+
 @dataclass
 class ProbeConfig:
     """Network quality probing (P2)."""
 
     enabled: bool = True
-    targets: list[str] = field(default_factory=lambda: ["10.100.61.3", "10.10.10.10"])
+    targets: list[str] = field(default_factory=lambda: list(DEFAULT_PROBE_TARGETS))
     interval: float = 30.0
     timeout_ms: int = 1500
     #: keep the game/streaming traffic untouched — probe only while offline
@@ -316,6 +339,27 @@ class AppConfig:
 # nested sections would load as defaults — so resolve the real types first.
 _TYPE_HINTS_CACHE: dict[type, dict[str, Any]] = {}
 
+
+
+def _migrate(cfg: AppConfig) -> bool:
+    """Rewrite values an older version got wrong.  Returns whether to save.
+
+    Gated on the stored schema version rather than on a value comparison: a
+    value test would fire on every launch, so a user who *deliberately* wanted
+    campus-only targets would have that choice silently undone forever.
+    """
+    if cfg.version >= CONFIG_VERSION:
+        return False
+
+    if cfg.version < 2:
+        # Up to 1.0.5 the shipped probe targets were campus addresses, so the
+        # latency the dashboard showed was the campus link's ~1 ms rather than
+        # anything to do with the internet.
+        if cfg.probe.targets in _LEGACY_PROBE_TARGETS:
+            cfg.probe.targets = list(DEFAULT_PROBE_TARGETS)
+
+    cfg.version = CONFIG_VERSION
+    return True
 
 def _resolved_types(cls: type) -> dict[str, Any]:
     """Field name → real type object, with the annotations resolved."""
@@ -419,6 +463,15 @@ class ConfigStore:
         # Always hand back something the UI can bind to.
         cfg.ensure_account()
         self.config = cfg
+
+        # Rewrite what an older version got wrong, and remember that we did.
+        if _migrate(cfg):
+            try:
+                self.save()
+            except OSError:
+                # A read-only config dir is not worth failing a launch over:
+                # the migration is already applied in memory either way.
+                pass
         return cfg
 
     def save(self) -> None:

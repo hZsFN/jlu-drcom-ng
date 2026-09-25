@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from drcom import __version__  # noqa: E402
 
 
-def _raise_priority() -> None:
+def _raise_priority() -> bool:
     """Ask the OS for a slightly higher scheduling class.
 
     Deliberately ABOVE_NORMAL and not HIGH: this is a background utility, and
@@ -36,19 +36,34 @@ def _raise_priority() -> None:
     Child processes (the Flet client) inherit the class, so this is the only
     place it needs doing.  Never fatal: on a platform or policy that refuses
     it, we simply run at normal priority.
+
+    The argtypes matter.  Without them ctypes marshals the process HANDLE as a
+    32-bit int, which truncates on 64-bit Windows, so the call is handed a
+    garbage handle -- it returns 0 and fails *silently*, with no exception to
+    catch.  That is exactly how the first version of this shipped doing
+    nothing at all.
+
+    Returns whether the class was actually applied.
     """
     try:
         import os
 
         if os.name != "nt":
-            return
+            return False
         import ctypes
 
         ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS)
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        kernel32.SetPriorityClass.restype = ctypes.c_int
+        return bool(
+            kernel32.SetPriorityClass(
+                kernel32.GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS
+            )
+        )
     except Exception:
-        pass
+        return False
 
 
 def _build_parser() -> argparse.ArgumentParser:

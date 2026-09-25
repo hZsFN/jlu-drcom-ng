@@ -33,9 +33,15 @@ def _raise_priority() -> bool:
     the machine with.  What it buys is the boot case -- a dozen startup entries
     and a cold disk -- where being scheduled promptly is most of the wait.
 
-    Child processes (the Flet client) inherit the class, so this is the only
-    place it needs doing.  Never fatal: on a platform or policy that refuses
-    it, we simply run at normal priority.
+    Child processes do NOT inherit this.  Windows only hands the creating
+    process's class to a child when that class is IDLE or BELOW_NORMAL, so an
+    ABOVE_NORMAL parent gets a NORMAL child.  Measured, not assumed: after this
+    runs, the app process reads 0x8000 while the Flet client reads 0x20.  Only
+    the Python process is raised; raising the client too would mean taking over
+    a spawn that Flet owns.
+
+    Never fatal: on a platform or policy that refuses the request, we simply
+    run at normal priority.
 
     The argtypes matter.  Without them ctypes marshals the process HANDLE as a
     32-bit int, which truncates on 64-bit Windows, so the call is handed a

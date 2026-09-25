@@ -316,18 +316,18 @@ class DrcomApp:
         if self.enable_tray:
             self._setup_tray()
 
+        # Hiding the window and authenticating are independent decisions.  They
+        # used to share an if/elif, so launching minimised -- which is exactly
+        # what the autostart entry does ("--autostart --minimized") -- took the
+        # hide branch and never reached the login branch: auto-login silently
+        # did nothing at boot, and start_background() was skipped too, leaving
+        # a tray icon with no ticker and no session.
         if self.minimized and (cfg.ui.start_minimized or cfg.ui.minimize_to_tray):
             self._hide_window()
-        elif cfg.ui.auto_login_on_launch:
-            self.controller.start_background()
-            account = cfg.active_account()
-            if account is not None and account.auto_login and account.has_password():
-                ok, message = self.controller.request_login()
-                self._flash(message if not ok else "已按「启动时自动登录」开始认证", ok)
-            else:
-                self.controller.start_background()
-        else:
-            self.controller.start_background()
+
+        # Idempotent, and normally already done by the entry point before this
+        # window existed -- see AppController.begin_session.
+        self.controller.begin_session()
 
         try:
             # Re-assert the intercept: the window may have been hidden at

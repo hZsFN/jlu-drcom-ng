@@ -123,10 +123,37 @@ class AppController:
         self._session_started_at: float | None = None
         self._last_schedule_check = ""
         self._shutdown_done = False
+        self._session_begun = False
 
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
+    def begin_session(self) -> None:
+        """Start the background ticker and, if configured, authenticate now.
+
+        Owned here rather than in the UI, and called from the entry point
+        *before* the window is created.  The Flet client takes about a second
+        to put a window on screen on a warm machine and considerably longer on
+        a cold boot, and the campus network should not have to wait for a
+        window to finish drawing.
+
+        Idempotent: once the session has begun this does nothing, so the launch
+        path and the UI can both ask without authenticating twice.
+        """
+        if self._session_begun:
+            return
+        self._session_begun = True
+        self.start_background()
+
+        account = self.config.active_account()
+        if account is None or not account.auto_login or not account.has_password():
+            return
+        ok, message = self.request_login()
+        if ok:
+            self.log.info("已按「启动时自动登录」开始认证")
+        else:
+            self.log.warning("自动登录未能开始：%s", message)
+
     def start_background(self) -> None:
         """Start the traffic/status ticker, probe and (optionally) the API."""
         if self._tick_thread and self._tick_thread.is_alive():

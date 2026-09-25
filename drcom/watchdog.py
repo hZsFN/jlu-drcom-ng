@@ -50,6 +50,10 @@ MAX_RESTART_DELAY = 120.0
 #: would keep the delay from some ancient crash loop.
 HEALTHY_UPTIME = 120.0
 
+#: How long to wait before looking again while another client holds the
+#: single-instance lock.  Something *is* running, which is what we wanted.
+ALREADY_RUNNING_RECHECK = 60.0
+
 _TH32CS_SNAPPROCESS = 0x00000002
 _PROCESS_TERMINATE = 0x0001
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
@@ -217,6 +221,28 @@ def _client_command(argv: list[str], *, data_dir: Path) -> list[str]:
     return base + args
 
 
+
+def _single_instance_free(say) -> bool:
+    """Whether no other client holds the single-instance lock.
+
+    Acquires the lock only to look, then releases it: holding it would stop the
+    child we are about to start from starting.
+    """
+    from .single_instance import SingleInstance
+
+    probe = SingleInstance()
+    try:
+        if probe.acquire():
+            return True
+        say("已有另一个客户端在运行，等它退出后再接管")
+        return False
+    finally:
+        try:
+            probe.release()
+        except Exception:
+            pass
+
+
 def run_watchdog(
     argv: list[str],
     *,
@@ -245,12 +271,26 @@ def run_watchdog(
     delay = restart_delay
     restarts = 0
     while True:
+        # Ask whether a client is already running *before* starting one.  The
+        # client answers a second instance with a message box, so spawning and
+        # letting it die would put a popup on screen every minute for as long as
+        # the user keeps their own copy open.
+        if not _single_instance_free(say):
+            time.sleep(ALREADY_RUNNING_RECHECK)
+            continue
+
         reap_leftover_windows(log=say)
         command = build_command()
         say(f"启动客户端：{' '.join(command[1:])}")
         started = time.monotonic()
         try:
-            proc = subprocess.Popen(command, cwd=str(Path(command[0]).parent))
+            # Deliberately *not* the executable's directory.  Starting a child
+            # with its cwd inside the install folder makes Windows hold a lock
+            # on that folder, and the next build then fails to replace it with
+            # "another process is using this file" -- which is exactly what
+            # happened while developing this.  The data directory is neutral and
+            # always writable.
+            proc = subprocess.Popen(command, cwd=str(data_dir))
         except OSError as exc:
             say(f"无法启动客户端：{exc!r}")
             return 1

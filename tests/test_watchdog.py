@@ -12,6 +12,7 @@ supervisor stands down when it sees a fresh one.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -80,6 +81,17 @@ def _fake_client(tmp_path: Path, *, exit_code: int, marker: bool, uptime: float 
 def _runner(script: str, tmp_path: Path):
     """Supervise a stand-in script instead of the real client."""
     return lambda: [sys.executable, script, str(tmp_path)]
+
+
+@pytest.fixture(autouse=True)
+def lock_is_free(monkeypatch):
+    """Pretend no other client holds the single-instance lock.
+
+    Without this the supervisor would probe the *real* mutex, which on a machine
+    with the client running means "busy" -- and each test would then sit in a
+    genuine 60-second wait.  That is exactly how this suite hung once.
+    """
+    monkeypatch.setattr("drcom.watchdog._single_instance_free", lambda say: True)
 
 
 def test_a_crash_is_restarted(tmp_path: Path, monkeypatch) -> None:
@@ -244,3 +256,44 @@ def test_autostart_command_can_carry_the_watchdog() -> None:
     assert "--watchdog" not in plain
     assert "--watchdog" in guarded
     assert "--autostart" in plain and "--autostart" in guarded and "--minimized" in guarded
+
+
+def test_the_supervisor_waits_while_another_client_owns_the_lock(tmp_path, monkeypatch) -> None:
+    """It must not spawn a child that would exit at once -- and put a dialog up.
+
+    The client answers a second instance with a message box, so a spawn-and-die
+    loop would pop one up every minute for as long as the user keeps their own
+    copy open.
+    """
+    spawned: list = []
+    waits: list = []
+
+    monkeypatch.setattr("drcom.watchdog.reap_leftover_windows", lambda **kw: [])
+    monkeypatch.setattr(time, "sleep", lambda s: waits.append(s))
+
+    states = iter([False, False, True])  # busy, busy, then free
+
+    def fake_free(say):
+        return next(states, True)
+
+    class QuittingClient:
+        """A client that starts, then shuts down on purpose."""
+
+        def wait(self):
+            StopMarker(tmp_path).write()
+            return 0
+
+        def terminate(self):
+            pass
+
+    def fake_popen(command, **kwargs):
+        spawned.append(command)
+        return QuittingClient()
+
+    monkeypatch.setattr("drcom.watchdog._single_instance_free", fake_free)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    code = run_watchdog([], data_dir=tmp_path)
+    assert waits == [60.0, 60.0], waits
+    assert len(spawned) == 1, f"expected exactly one start, got {len(spawned)}"
+    assert code == 0, "a deliberate quit should end the supervisor"

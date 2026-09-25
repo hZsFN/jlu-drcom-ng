@@ -55,6 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cli", metavar="COMMAND", help="以命令行模式运行（见下方命令）")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出（status/diag/probe）")
     parser.add_argument("--verbose", action="store_true", help="打印协议交互日志")
+    parser.add_argument(
+        "--watchdog-action",
+        dest="watchdog_action",
+        metavar="on|off|status",
+        help="--cli watchdog 的动作：on / off / status",
+    )
 
     # `set` subcommand options
     parser.add_argument("--account", help="学号/账号")
@@ -250,6 +256,45 @@ def _cmd_login(controller: AppController, args) -> int:
     return final["code"]
 
 
+
+def _cmd_watchdog(controller: AppController, args) -> int:
+    """Turn the crash-recovery supervisor on or off for the autostart entry."""
+    from . import single_instance
+
+    action = (getattr(args, "watchdog_action", "") or "status").lower()
+    current = single_instance.current_autostart_command()
+    on = single_instance.autostart_uses_watchdog()
+
+    if action in ("status", ""):
+        if not current:
+            print("开机自启：未启用（先设置开机自启，再加守护进程）")
+        else:
+            print(f"开机自启当前命令：{current}")
+            print(f"守护进程：{'已启用' if on else '未启用'}")
+        print()
+        print("用法：")
+        print("  jlu-drcom-ng --cli watchdog on     开机自启改为拉起守护进程")
+        print("  jlu-drcom-ng --cli watchdog off    恢复为直接拉起客户端")
+        return 0
+
+    if action not in ("on", "off"):
+        print(f"未知参数 {action!r}，可用：on / off / status")
+        return 2
+
+    want = action == "on"
+    if not current and want:
+        print("还没有开启开机自启；请先在界面的「设置」里打开，或用 --cli set-autostart")
+        return 1
+
+    ok, message = single_instance.enable_autostart(minimized=True, with_watchdog=want)
+    print(message if ok else f"失败：{message}")
+    if ok:
+        print()
+        print("下次开机生效。想现在就试：")
+        print("  JLU-DrCOM-NG.exe --watchdog --minimized")
+    return 0 if ok else 1
+
+
 _COMMANDS = {
     "login": _cmd_login,
     "status": _cmd_status,
@@ -257,6 +302,7 @@ _COMMANDS = {
     "probe": _cmd_probe,
     "set": _cmd_set,
     "export-logs": _cmd_export_logs,
+    "watchdog": _cmd_watchdog,
 }
 
 
@@ -317,7 +363,28 @@ def _human(seconds: float) -> str:
 
 def run_cli(argv: list[str]) -> int:
     """Entry point for ``--cli``; returns a process exit code."""
-    args = build_parser().parse_args(argv)
+    # A sub-command may take one bare word after it ("--cli watchdog on").
+    # argparse would reject that as a stray positional, so lift it out first.
+    action = ""
+    known = {"--cli": True}
+    stripped: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--cli" and index + 2 < len(argv):
+            command_name, following = argv[index + 1], argv[index + 2]
+            if command_name == "watchdog" and following in ("on", "off", "status"):
+                action = following
+                stripped.append("--cli")
+                stripped.append("watchdog")
+                index += 3
+                continue
+        stripped.append(token)
+        index += 1
+
+    args = build_parser().parse_args(stripped)
+    if action:
+        args.watchdog_action = action
     command = args.cli
     if command not in _COMMANDS:
         print(f"未知命令：{command!r}，可用：{', '.join(_COMMANDS)}", file=sys.stderr)

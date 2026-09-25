@@ -44,6 +44,12 @@ bound to each concrete local address until one works.
 
 - **Tray icon** and close-to-tray (needs `pystray`; without it, "close"
   minimises instead of hiding, so the window can never get lost)
+- **Watchdog** (`--watchdog`): a supervisor outside the client that restarts it
+  after a crash -- a fault inside a native library leaves no traceback and no
+  log line -- and clears the orphaned window such a crash leaves behind. The
+  client writes a stop marker when it is asked to quit, so a deliberate exit
+  ends the supervisor too instead of being undone. Toggle with
+  `--cli watchdog on|off|status`
 - **Log panel** with byte-level protocol dumps, one-click export, masked accounts
 - **Statistics** — today / this week / all-time uptime, disconnect count
 - **Network probe** — latency, loss, jitter, against real websites

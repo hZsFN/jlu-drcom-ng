@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 # Make `python main.py` work from any working directory.
@@ -90,6 +91,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-single-instance", action="store_true", help="允许多开（仅供调试）")
     parser.add_argument("--selftest", action="store_true", help="运行协议自检并退出（不联网）")
     parser.add_argument("--doctor", action="store_true", help="打印环境与端口诊断后退出")
+    parser.add_argument(
+        "--watchdog",
+        action="store_true",
+        help="作为守护进程运行：拉起客户端，崩溃后自动重启（正常退出则一起结束）",
+    )
     return parser
 
 
@@ -234,6 +240,43 @@ def _force_utf8_console() -> None:
             pass
 
 
+
+def _watchdog_logger(data_dir: Path):
+    """A line logger for the supervisor: to the console and to its own file."""
+    log_path = Path(data_dir) / "logs" / f"watchdog-{time.strftime('%Y%m%d')}.log"
+
+    def log(message: str) -> None:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{stamp} {message}"
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(line + chr(10))
+        except OSError:
+            pass
+        try:
+            print(line, flush=True)
+        except Exception:
+            pass
+
+    return log
+
+
+def _run_watchdog(argv: list[str], args) -> int:
+    """Run the supervisor in the foreground (usually from the autostart entry)."""
+    from drcom.config import default_data_dir
+    from drcom.watchdog import run_watchdog
+
+    data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
+    log = _watchdog_logger(data_dir)
+    log("守护进程启动")
+    try:
+        return run_watchdog(argv, data_dir=data_dir, log=log)
+    except KeyboardInterrupt:
+        log("守护进程被中断")
+        return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _raise_priority()
     _force_utf8_console()
@@ -251,6 +294,10 @@ def main(argv: list[str] | None = None) -> int:
         return _selftest()
     if args.doctor:
         return _doctor(args.data_dir)
+
+    # --- watchdog --------------------------------------------------------
+    if args.watchdog:
+        return _run_watchdog(argv, args)
 
     # --- single instance -------------------------------------------------
     guard = None

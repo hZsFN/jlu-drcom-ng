@@ -125,18 +125,54 @@ def _pid_alive(pid: int) -> bool:
 # --------------------------------------------------------------------------
 # Autostart
 # --------------------------------------------------------------------------
-def _launch_command(*, minimized: bool = True) -> str:
-    """The command line to register for autostart."""
+def _launch_command(*, minimized: bool = True, with_watchdog: bool = False) -> str:
+    """The command line to register for autostart.
+
+    With *with_watchdog* the entry starts the supervisor instead of the client,
+    so a crash at boot is recovered from as well.
+    """
     if getattr(sys, "frozen", False):
         exe = f'"{Path(sys.executable).resolve()}"'
     else:
         entry = Path(__file__).resolve().parent.parent / "main.py"
         exe = f'"{Path(sys.executable).resolve()}" "{entry}"'
-    return f"{exe} --autostart" + (" --minimized" if minimized else "")
+    parts = [exe]
+    if with_watchdog:
+        parts.append("--watchdog")
+    parts.append("--autostart")
+    if minimized:
+        parts.append("--minimized")
+    return " ".join(parts)
 
 
-def autostart_command(*, minimized: bool = True) -> str:
-    return _launch_command(minimized=minimized)
+def autostart_command(*, minimized: bool = True, with_watchdog: bool = False) -> str:
+    return _launch_command(minimized=minimized, with_watchdog=with_watchdog)
+
+
+def autostart_uses_watchdog() -> bool:
+    """Whether the registered autostart entry starts the supervisor."""
+    command = current_autostart_command()
+    return "--watchdog" in command
+
+
+def current_autostart_command() -> str:
+    """The registered autostart command line, or "" if there is none."""
+    if IS_WINDOWS:
+        import winreg
+
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as key:
+                return str(winreg.QueryValueEx(key, _RUN_VALUE)[0])
+        except OSError:
+            return ""
+    path = Path.home() / ".config" / "autostart" / _DESKTOP_FILE
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("Exec="):
+                return line[5:].strip()
+    except OSError:
+        pass
+    return ""
 
 
 def is_autostart_enabled() -> bool:
@@ -152,8 +188,10 @@ def is_autostart_enabled() -> bool:
     return (Path.home() / ".config" / "autostart" / _DESKTOP_FILE).exists()
 
 
-def enable_autostart(*, minimized: bool = True) -> tuple[bool, str]:
-    command = _launch_command(minimized=minimized)
+def enable_autostart(
+    *, minimized: bool = True, with_watchdog: bool = False
+) -> tuple[bool, str]:
+    command = _launch_command(minimized=minimized, with_watchdog=with_watchdog)
     if IS_WINDOWS:
         import winreg
 

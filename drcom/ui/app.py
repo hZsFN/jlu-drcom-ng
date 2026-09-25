@@ -1917,6 +1917,16 @@ class DrcomApp:
             pass
 
     def _quit(self) -> None:
+        # Tell the watchdog this exit was asked for.  Without it, "退出" in the
+        # tray menu would be answered by the supervisor starting the app right
+        # back up -- a fight the user cannot win.
+        try:
+            from ..watchdog import StopMarker
+
+            StopMarker(self.controller.data_dir).write()
+        except Exception:
+            pass
+
         if self._tray is not None:
             self._tray.stop()
             self._tray = None

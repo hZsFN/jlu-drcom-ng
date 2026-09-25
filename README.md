@@ -46,7 +46,12 @@ bound to each concrete local address until one works.
   minimises instead of hiding, so the window can never get lost)
 - **Log panel** with byte-level protocol dumps, one-click export, masked accounts
 - **Statistics** — today / this week / all-time uptime, disconnect count
-- **Network probe** — latency, loss, jitter
+- **Network probe** — latency, loss, jitter, against real websites
+  (`www.baidu.com`, `www.bing.com` by default) and timed as an actual HTTP
+  request rather than a ping: with a VPN in TUN mode ICMP never leaves the
+  machine and a TCP connect is answered locally by the proxy, so only a real
+  request measures anything. Jitter follows RFC 3550 over consecutive round
+  trips within one round. Targets are configurable in Settings
 - **Multiple accounts**, autostart, auto-login
 - **Headless CLI** and a **local HTTP status API** for scripts and widgets
 - **Traffic counters**, dark HUD theme, high-contrast mode, reduce-motion

@@ -228,7 +228,7 @@ def test_watchdog_action_is_lifted_out_of_the_command_line(monkeypatch) -> None:
     seen: dict = {}
 
     def fake_command(controller, args):
-        seen["action"] = getattr(args, "watchdog_action", None)
+        seen["action"] = getattr(args, "command_action", None)
         return 0
 
     monkeypatch.setattr(cli, "_COMMANDS", {**cli._COMMANDS, "watchdog": fake_command})
@@ -242,7 +242,7 @@ def test_watchdog_status_needs_no_action(monkeypatch) -> None:
     seen: dict = {}
     monkeypatch.setattr(
         cli, "_COMMANDS",
-        {**cli._COMMANDS, "watchdog": lambda c, a: seen.setdefault("action", getattr(a, "watchdog_action", "")) or 0},
+        {**cli._COMMANDS, "watchdog": lambda c, a: seen.setdefault("action", getattr(a, "command_action", "")) or 0},
     )
     cli.run_cli(["--cli", "watchdog"])
     assert seen["action"] in ("", None)

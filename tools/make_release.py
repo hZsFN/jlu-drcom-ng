@@ -83,13 +83,20 @@ def build_bundle_zip(version: str) -> pathlib.Path:
     return target
 
 
-def write_checksums(paths: list[pathlib.Path]) -> pathlib.Path:
+def write_checksums(paths: list[pathlib.Path], *, tag: str = "") -> pathlib.Path:
+    """Digests of what we upload, plus a pointer to the source GitHub adds."""
     target = RELEASE_DIR / "SHA256SUMS.txt"
     lines = []
     for path in paths:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         lines.append(f"{digest}  {path.name}")
-    target.write_text("\n".join(lines) + "\n", encoding="ascii")
+    if tag:
+        lines.append("")
+        lines.append(
+            "# 源码不用单独下载：release 页面 Assets 里 GitHub 自动生成的 "
+            f"Source code (zip) / (tar.gz) 就是 {tag} 这个 tag 的源码。"
+        )
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"  hashes  {target.name}")
     for line in lines:
         print(f"            {line}")

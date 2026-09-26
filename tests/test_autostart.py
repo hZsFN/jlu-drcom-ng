@@ -20,10 +20,10 @@ from drcom.autostart import TASK_NAME, build_task_xml
 
 def _task(**overrides) -> str:
     kwargs = dict(
-        command=r"C:\Apps\JLU-DrCOM-NG\JLU-DrCOM-NG.exe",
+        command=r"C:\Program Files\JLU-DrCOM-NG\JLU-DrCOM-NG.exe",
         arguments="--watchdog --autostart --minimized",
         user_id="PC\\user",
-        working_dir=r"C:\Apps\JLU-DrCOM-NG",
+        working_dir=r"C:\Program Files\JLU-DrCOM-NG",
     )
     kwargs.update(overrides)
     return build_task_xml(**kwargs)

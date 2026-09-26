@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """Build the release artefacts for JLU DrCOM NG.
 
-Keeps the naming in one place.  The three artefacts drifted twice during the
-first release (source-only, then a missing executable, then a renamed source
+Keeps the naming in one place.  The artefacts drifted twice during the first
+release (source-only, then a missing executable, then a renamed source
 archive), which is what this exists to prevent.
 
-    python tools/make_release.py                 # source zip + checksums
+    python tools/make_release.py                 # checksums only
     python tools/make_release.py --with-bundle   # + the Windows bundle (needs dist/)
     python tools/make_release.py --upload        # build, then hand over to gh
 
-Artefact names (keep the two archives parallel):
+Artefacts:
 
-    JLU-DrCOM-NG-<version>-source-code.zip     git archive of the tag
     JLU-DrCOM-NG-<version>-windows-x64.zip     dist/ bundle, Python + Flet inside
-    SHA256SUMS.txt                             digests of both
+    SHA256SUMS.txt                             digest of it
+
+No source archive: GitHub generates "Source code (zip)" and "(tar.gz)" for every
+tag automatically, from the same ``git archive`` this used to run, so shipping
+our own copy only duplicated an asset and the checksum line that goes with it.
 
 Uploading is deliberately *not* automatic unless ``--upload`` is passed: this
 writes files and prints the exact command, so a human sees what is going out.
@@ -55,20 +58,6 @@ def ensure_clean() -> None:
         print("\ncommit or stash first — the source archive is built from the tag,"
               " but a dirty tree usually means the tag is behind.", file=sys.stderr)
         raise SystemExit(1)
-
-
-def build_source_zip(version: str) -> pathlib.Path:
-    """Source archive, laid out the way GitHub's "Download ZIP" is."""
-    tag = f"v{version}"
-    prefix = f"jlu-drcom-ng-{version}/"          # lowercase, matching the repo name
-    target = RELEASE_DIR / f"{PACKAGE_NAME}-{version}-source-code.zip"
-    RELEASE_DIR.mkdir(parents=True, exist_ok=True)
-    target.unlink(missing_ok=True)
-    run(["git", "archive", "--format=zip", f"--prefix={prefix}", "-o", str(target), tag])
-    with zipfile.ZipFile(target) as archive:
-        count = len([n for n in archive.namelist() if not n.endswith("/")])
-    print(f"  source  {target.name}  ({count} files, {target.stat().st_size / 1024:.0f} KB)")
-    return target
 
 
 def build_bundle_zip(version: str) -> pathlib.Path:
@@ -124,10 +113,12 @@ def main() -> int:
     if not options.skip_clean_check:
         ensure_clean()
 
-    artefacts = [build_source_zip(version)]
+    artefacts: list[pathlib.Path] = []
     if options.with_bundle:
         artefacts.append(build_bundle_zip(version))
-    write_checksums(artefacts)
+    else:
+        print("  (没有 --with-bundle，只写校验文件)")
+    write_checksums(artefacts, tag=tag)
 
     print()
     if options.upload:

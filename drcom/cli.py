@@ -261,7 +261,7 @@ def _cmd_watchdog(controller: AppController, args) -> int:
     """Turn the crash-recovery supervisor on or off for the autostart entry."""
     from . import single_instance
 
-    action = (getattr(args, "watchdog_action", "") or "status").lower()
+    action = (getattr(args, "command_action", "") or "status").lower()
     current = single_instance.current_autostart_command()
     on = single_instance.autostart_uses_watchdog()
 
@@ -295,6 +295,71 @@ def _cmd_watchdog(controller: AppController, args) -> int:
     return 0 if ok else 1
 
 
+#: Sub-commands that accept one bare word after them ("--cli watchdog on").
+
+def _cmd_autostart(controller: AppController, args) -> int:
+    """Choose how the app starts at boot: scheduled task, Run key, or nothing."""
+    from . import single_instance
+    from . import autostart as task_autostart
+
+    action = (getattr(args, "command_action", "") or "status").lower()
+    run_key = single_instance.current_autostart_command()
+    has_task = task_autostart.task_exists()
+
+    if action in ("status", ""):
+        print(f"计划任务「{task_autostart.TASK_NAME}」：{'已注册' if has_task else '无'}")
+        if has_task:
+            print(f"    {task_autostart.task_command()}")
+        print(f"注册表自启项：{run_key or '无'}")
+        print()
+        print("计划任务由任务计划服务在登录瞬间并行拉起，比 Run 键早；Run 键要等")
+        print("Explorer 起来之后才逐条执行，还要和其它启动项排队。")
+        print()
+        print("用法：")
+        print("  jlu-drcom-ng --cli autostart task     改用计划任务（推荐，最快）")
+        print("  jlu-drcom-ng --cli autostart runkey   改回注册表 Run 键")
+        print("  jlu-drcom-ng --cli autostart off      两者都取消")
+        return 0
+
+    exe = str(Path(sys.executable).resolve())
+    if not getattr(sys, "frozen", False):
+        exe = f'"{sys.executable}" "{Path(__file__).resolve().parent.parent / "main.py"}"'
+
+    if action == "off":
+        ok_task, msg_task = task_autostart.remove_task()
+        ok_key, msg_key = single_instance.disable_autostart()
+        print(msg_task if ok_task else f"失败：{msg_task}")
+        print(msg_key if ok_key else f"失败：{msg_key}")
+        return 0 if (ok_task and ok_key) else 1
+
+    if action == "task":
+        # Both would start the program twice; the task wins.
+        single_instance.disable_autostart()
+        ok, message = task_autostart.install_task(
+            exe, "--watchdog --autostart --minimized", working_dir=str(Path(sys.executable).parent)
+        )
+        print(message if ok else f"失败：{message}")
+        if ok:
+            print()
+            print("下次登录生效（比 Run 键早）。想立刻确认任务是否正常：")
+            print(f'  schtasks /Run /TN "{task_autostart.TASK_NAME}"')
+        return 0 if ok else 1
+
+    if action == "runkey":
+        task_autostart.remove_task()
+        ok, message = single_instance.enable_autostart(minimized=True, with_watchdog=True)
+        print(message if ok else f"失败：{message}")
+        return 0 if ok else 1
+
+    print(f"未知参数 {action!r}，可用：task / runkey / off / status")
+    return 2
+
+
+_COMMAND_ACTIONS = {
+    "watchdog": ("on", "off", "status"),
+    "autostart": ("task", "runkey", "off", "status"),
+}
+
 _COMMANDS = {
     "login": _cmd_login,
     "status": _cmd_status,
@@ -303,6 +368,7 @@ _COMMANDS = {
     "set": _cmd_set,
     "export-logs": _cmd_export_logs,
     "watchdog": _cmd_watchdog,
+    "autostart": _cmd_autostart,
 }
 
 
@@ -366,17 +432,16 @@ def run_cli(argv: list[str]) -> int:
     # A sub-command may take one bare word after it ("--cli watchdog on").
     # argparse would reject that as a stray positional, so lift it out first.
     action = ""
-    known = {"--cli": True}
     stripped: list[str] = []
     index = 0
     while index < len(argv):
         token = argv[index]
         if token == "--cli" and index + 2 < len(argv):
             command_name, following = argv[index + 1], argv[index + 2]
-            if command_name == "watchdog" and following in ("on", "off", "status"):
+            if following in _COMMAND_ACTIONS.get(command_name, ()):
                 action = following
                 stripped.append("--cli")
-                stripped.append("watchdog")
+                stripped.append(command_name)
                 index += 3
                 continue
         stripped.append(token)
@@ -384,7 +449,7 @@ def run_cli(argv: list[str]) -> int:
 
     args = build_parser().parse_args(stripped)
     if action:
-        args.watchdog_action = action
+        args.command_action = action
     command = args.cli
     if command not in _COMMANDS:
         print(f"未知命令：{command!r}，可用：{', '.join(_COMMANDS)}", file=sys.stderr)

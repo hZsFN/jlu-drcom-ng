@@ -8,6 +8,13 @@ but with an interface you can read, explanations instead of "unknown error", and
 self-healing when the port is taken.
 
 > 中文文档：[README_CN.md](README_CN.md)
+>
+> **Android port**: the same authentication core, running on a phone —
+> [jlu-drcom-android](https://github.com/hZsFN/jlu-drcom-android).
+> The protocol, the state machine and the packet building are reused verbatim;
+> only the three platform modules (interface enumeration, port binding, secret
+> storage) are replaced, and the host becomes Kotlin + Compose with Chaquopy
+> embedding the Python core into the APK.
 
 | Offline | Online |
 |---|---|

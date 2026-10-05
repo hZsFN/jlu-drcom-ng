@@ -6,6 +6,10 @@
 端口被占了自己会想办法。
 
 > English documentation: [README.md](README.md)
+>
+> **Android 版**：把同一套认证内核搬上手机的移植版在 [jlu-drcom-android](https://github.com/hZsFN/jlu-drcom-android)。
+> 协议、状态机、报文构造逐字复用，只换掉网卡枚举 / 端口绑定 / 密码存储这三个平台模块，
+> 宿主换成 Kotlin + Compose，用 Chaquopy 把 Python 内核打进 APK。
 
 | 离线 | 在线 |
 |---|---|

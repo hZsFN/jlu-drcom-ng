@@ -197,3 +197,5 @@ python build.py --onefile       # 单文件 exe
 ## 许可证
 
 GPL-3.0，与所参考的项目保持一致。见 [LICENSE](LICENSE)。
+
+[![](https://img.shields.io/badge/powered_by-dafeiyu-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/Dafeiyu111)

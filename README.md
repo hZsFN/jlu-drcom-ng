@@ -227,3 +227,5 @@ Dr.COM variants made the JLU-specific quirks much easier to spot.
 
 GPL-3.0, the same license as the project this is derived from. See
 [LICENSE](LICENSE).
+
+[![](https://img.shields.io/badge/powered_by-dafeiyu-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/Dafeiyu111)

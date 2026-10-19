@@ -191,7 +191,7 @@ def build(*, onefile: bool = False, name: str = "JLU-DrCOM-NG", console: bool = 
     if icon.exists():
         arguments += ["--icon", str(icon)]
 
-    for extra in ("README.md", "README_CN.md"):
+    for extra in ("README.md", "README_EN.md"):
         path = ROOT / extra
         if path.exists():
             arguments += ["--add-data", f"{path}{';' if sys.platform == 'win32' else ':'}."]

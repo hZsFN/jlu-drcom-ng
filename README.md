@@ -1,231 +1,201 @@
 # JLU DrCOM NG
 
-A campus-network authentication client for Jilin University, rewritten in
-Python with a **HUD-styled** (heads-up display) interface built on Flet.
+吉林大学校园网认证客户端，用 Python 重写，界面是基于 Flet 的 **HUD（平视显示器）风格**面板。
 
-It does the same job as the official Qt client — challenge, login, keepalive —
-but with an interface you can read, explanations instead of "unknown error", and
-self-healing when the port is taken.
+干的活和原版 Qt 客户端一样 —— 挑战、登录、保活 —— 但界面看得清、失败说得出原因、
+端口被占了自己会想办法。
 
-> 中文文档：[README_CN.md](README_CN.md)
+> English documentation: [README_EN.md](README_EN.md)
 >
-> **Android port**: the same authentication core, running on a phone —
-> [jlu-drcom-android](https://github.com/hZsFN/jlu-drcom-android).
-> The protocol, the state machine and the packet building are reused verbatim;
-> only the three platform modules (interface enumeration, port binding, secret
-> storage) are replaced, and the host becomes Kotlin + Compose with Chaquopy
-> embedding the Python core into the APK.
+> **Android 版**：把同一套认证内核搬上手机的移植版在 [jlu-drcom-android](https://github.com/hZsFN/jlu-drcom-android)。
+> 协议、状态机、报文构造逐字复用，只换掉网卡枚举 / 端口绑定 / 密码存储这三个平台模块，
+> 宿主换成 Kotlin + Compose，用 Chaquopy 把 Python 内核打进 APK。
 
-| Offline | Online |
+| 离线 | 在线 |
 |---|---|
-| ![idle](docs/screenshot-idle.png) | ![online](docs/screenshot-online.png) |
+| ![待机](docs/screenshot-idle.png) | ![在线](docs/screenshot-online.png) |
 
 ---
 
-## What it does
+## 它做什么
 
-**Authenticates** — the full Dr.COM flow (challenge → login → keepalive1 →
-keepalive2, looping every 20 s), with automatic reconnect and exponential
-backoff instead of hammering the server.
+**完成认证** —— 完整的 Dr.COM 流程（挑战 → 登录 → keepalive1 → keepalive2，
+每 20 秒一轮），掉线自动重连，用指数退避而不是疯狂重试刷爆服务器。
 
-**Tells you what went wrong** — every login failure code is mapped to plain
-language plus a next step. "Wrong password", not "error 0x03". "MAC not bound —
-you may need to unbind in the self-service portal", not "error 0x0B".
+**把失败原因说清楚** —— 每个登录错误码都映射成人话加一句「下一步怎么办」。
+显示「密码错误」而不是「错误码 0x03」；显示「MAC 未绑定，可能需要先去自助服务解绑」
+而不是「错误码 0x0B」。
 
-**Fixes the port problem** — the client must bind UDP 61440, which is
-frequently occupied. A bare `bind failed. Error code: 10013` is nearly useless,
-because on Windows **10013 means two different things** and the code alone
-cannot tell them apart: a system-reserved range (TUN/VPN adapters grab those) or
-another program holding the port exclusively. So the client *measures* instead
-of guessing — it scans neighbouring ports to find the blocked range, identifies
-the process holding it, and gives advice that matches the actual cause.
+**解决端口被占** —— 客户端必须绑 UDP 61440，这个端口经常被占。一句
+`bind failed. Error code: 10013` 几乎没用，因为在 Windows 上 **10013 有两种完全不同的
+成因**，光看错误码分不出来：要么是落在系统保留区间里（TUN/VPN 类软件会圈占），
+要么是别的程序以独占方式绑着它。所以本程序不猜，而是**实测**：扫描邻近端口找出被阻断的
+区间、查出是哪个进程占着，再给出和实际成因对得上的处置建议。
 
-**Survives a network that changes under it** — with Wi-Fi and Ethernet both up,
-binding `0.0.0.0` succeeds but the kernel routes by metric, so the packet can
-leave through the wrong adapter and the server never answers. The client retries
-bound to each concrete local address until one works.
+**网络环境变了也能自己缓过来** —— 无线和有线同时在线时，绑 `0.0.0.0` 是能成功的，
+但内核按路由 metric 选路，报文可能从错的网卡出去，服务器就永远不回话。
+本程序会依次改用本机每个具体地址重试，直到摸对。
 
-**Never stores your password in clear** — Windows DPAPI, bound to your account.
+**密码绝不明文落盘** —— Windows DPAPI，绑定当前 Windows 账号。
 
-### Also included
+### 还有这些
 
-- **Tray icon** and close-to-tray (needs `pystray`; without it, "close"
-  minimises instead of hiding, so the window can never get lost)
-- **Watchdog** (`--watchdog`): a supervisor outside the client that restarts it
-  after a crash -- a fault inside a native library leaves no traceback and no
-  log line -- and clears the orphaned window such a crash leaves behind. The
-  client writes a stop marker when it is asked to quit, so a deliberate exit
-  ends the supervisor too instead of being undone. Toggle with
-  `--cli watchdog on|off|status`
-- **Log panel** with byte-level protocol dumps, one-click export, masked accounts
-- **Statistics** — today / this week / all-time uptime, disconnect count
-- **Network probe** — latency, loss, jitter, against real websites
-  (`www.baidu.com`, `www.bing.com` by default) and timed as an actual HTTP
-  request rather than a ping: with a VPN in TUN mode ICMP never leaves the
-  machine and a TCP connect is answered locally by the proxy, so only a real
-  request measures anything. Jitter follows RFC 3550 over consecutive round
-  trips within one round. Targets are configurable in Settings
-- **Multiple accounts**, autostart, auto-login
-- **Headless CLI** and a **local HTTP status API** for scripts and widgets
-- **Traffic counters**, dark HUD theme, high-contrast mode, reduce-motion
+- **系统托盘**与关闭不退出（依赖 `pystray`；没有它时「关闭」是**最小化**而不是隐藏，
+  保证窗口绝不会找不回来）
+- **守护进程**（`--watchdog`）：在客户端之外再起一层监督，进程崩溃就自动拉起，并
+  顺手清掉崩溃留下的孤儿窗口。客户端主动退出时会留标记，守护进程看到就一起结束，
+  所以「退出」不会变成关不掉的拉锯战。开关：`--cli watchdog on|off|status`
+- **日志面板**：逐字节协议转储、一键导出、账号自动脱敏
+- **统计**：今日 / 本周 / 累计在线时长、掉线次数
+- **网络质量探测**：延迟、丢包、抖动。目标是真实网站（默认 `www.baidu.com`、
+  `www.bing.com`），用**真实 HTTP 请求**计时而不是 ping —— 开着 TUN 模式的代理时
+  ICMP 不出网、TCP 连接又被代理在本地应答，只有真跑一趟请求才量得到东西。
+  抖动按 RFC 3550 在同一轮的连续往返之间计算，探测目标可在「设置」里改
+- **多账号**管理、开机自启、启动自动登录
+- **无界面 CLI** 与**本地 HTTP 状态接口**，方便脚本和桌面小部件调用
+- **流量统计**、深色 HUD 主题、高对比度模式、减少动态效果
 
 ---
 
-## Getting started
+## 使用指导
 
-### 1. Install
+### 1. 安装
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Windows is the primary target. Python 3.10 or newer.
+主要面向 Windows，Python 3.10 及以上。
 
-### 2. Check the protocol implementation offline first
+### 2. 先离线自检
 
 ```bash
-python main.py --selftest     # MD4 vectors, packet sizes, crypto backends
-python main.py --doctor       # is port 61440 usable? if not, why?
+python main.py --selftest     # MD4 向量、各长度报文、加密后端
+python main.py --doctor       # 61440 能不能绑？不能的话，为什么？
 ```
 
-Both are offline and safe. If `--doctor` reports a port problem it prints the
-actual cause and what to do about it.
+两条都不联网、无副作用。`--doctor` 如果发现端口有问题，会直接打印真实成因和处置办法。
 
-### 3. Configure
+### 3. 填账号
 
 ```bash
 python main.py
 ```
 
-On the **Account** page:
+在**账号**页：
 
-1. Enter your student ID
-2. Click **Detect MAC** (or type it as `AA:BB:CC:DD:EE:FF`)
-3. Enter your password
-4. Save
+1. 填学号
+2. 点「自动识别 MAC」（或手填 `AA:BB:CC:DD:EE:FF`）
+3. 填密码
+4. 保存
 
-The password is encrypted immediately and never lands on disk in clear text.
+密码保存时立即加密，不会以明文形式写到磁盘上。
 
-### 4. Connect
+### 4. 联网
 
-Back on the **Status** page, click **Log in**. The HUD shows the state, the
-assigned IP, and how long you have been online. **Log out** stops the session.
+回到**状态**页点「登录」。HUD 上会显示当前状态、分配到的 IP、已经在线多久。
+「注销」用于停止会话。
 
 ---
 
-## Command line
+## 命令行
 
 ```bash
-python main.py                          # graphical interface
-python main.py --minimized              # start minimised (for autostart)
-python main.py --cli login              # authenticate, stay in the foreground
-python main.py --cli status --json      # query state (exit 0 = online, 1 = offline)
-python main.py --cli diag               # who is holding port 61440?
-python main.py --cli probe              # latency / packet loss
-python main.py --cli export-logs        # dump the log buffer
+python main.py                          # 图形界面
+python main.py --minimized              # 最小化启动（配合开机自启）
+python main.py --cli login              # 前台认证并保持在线
+python main.py --cli status --json      # 查询状态（退出码 0=在线 1=离线）
+python main.py --cli diag               # 61440 被谁占了？
+python main.py --cli probe              # 延迟 / 丢包
+python main.py --cli export-logs        # 导出日志
 python main.py --cli set --account 2023xxxxxxxx --mac AA:BB:CC:DD:EE:FF --password '***'
 ```
 
-### Local status API
+### 本地状态接口
 
-Off by default; enable it under *Settings → Local status API*.
+默认关闭，在「设置 → 本地状态接口」里打开。
 
 ```
 GET  /status   /health   /metrics   /stats   /logs   /diag
-POST /login    /logout   /reconnect /probe        (needs a token)
+POST /login    /logout   /reconnect /probe        （需要令牌）
 ```
 
-Read endpoints are open; the four control endpoints require a per-run token in
-the `X-DrCOM-Token` header. The token is generated at startup, written to
-`api-token.txt` in the data directory, and also shown on the *About* page:
+读接口开放；四个控制接口要求在 `X-DrCOM-Token` 头里带上令牌。
+令牌每次启动随机生成，写在数据目录的 `api-token.txt`，「关于」页也会显示：
 
 ```bash
-TOKEN=$(cat ~/AppData/Roaming/JLU-DrCOM-NG/api-token.txt)
+TOKEN=$(cat "$APPDATA/JLU-DrCOM-NG/api-token.txt")
 curl -X POST -H "X-DrCOM-Token: $TOKEN" http://127.0.0.1:8848/reconnect
 ```
 
-Why a token and not just "localhost only": the request comes *from* 127.0.0.1
-even when it is a web page in your browser that made it, so an address check
-alone lets any site you visit POST to the API (cross-site request forgery).
-Requiring a custom header forces a CORS preflight, which the server never
-grants. `Origin` and `Host` are validated too, which also blocks DNS rebinding.
+为什么不能只靠「仅本机」：**即使是浏览器里的网页发起的请求，来源地址也是 127.0.0.1**，
+只校验地址的话，你访问的任何网站都能 POST 这个接口（CSRF）。
+要求自定义头会强制浏览器先发 CORS 预检，而服务器从不放行预检，请求就发不出来。
+同时校验 `Origin` 与 `Host`，DNS rebinding 也一并挡住。
 
-It binds to `127.0.0.1` by default. `/metrics` is Prometheus text format, so it
-drops straight into a dashboard. A JSON status file is written alongside it.
+默认只监听 `127.0.0.1`。`/metrics` 是 Prometheus 文本格式，可以直接接进监控面板；
+同时会写一份 JSON 状态文件。
 
 ---
 
-## Building a standalone bundle
+## 打包成自带依赖的程序
 
 ```bash
 pip install pyinstaller
-python build.py                 # folder build, all dependencies included
-python build.py --onefile       # single .exe
+python build.py                 # 目录版，依赖全部自带
+python build.py --onefile       # 单文件 exe
 ```
 
-The default output in `dist/` is self-contained: it runs on a machine with no
-Python and no network, because the Flet desktop runtime is bundled inside it.
-`python build.py --fetch-runtime` downloads that runtime first if you do not
-already have it.
+默认产物在 `dist/`，**完全自带**：目标机器不用装 Python、不用联网也能跑，
+因为 Flet 的桌面运行时已经一起打进去了。如果本机还没有那个运行时，
+先执行 `python build.py --fetch-runtime` 下载一次。
 
 ---
 
-## Implementation notes
+## 实现说明
 
-The wire protocol is a reimplementation of the one used by the original client,
-and the packet layout was verified **byte for byte** against a recorded
-successful login — all 373 bytes, plus `MD5A`, `MD5B`, `checksum1`, `checksum2`
-and the MAC-XOR field.
+协议是对原版客户端所用协议的重写，报文布局与**一次真实成功登录的抓包逐字节比对过** ——
+整整 373 字节，`MD5A`、`MD5B`、`checksum1`、`checksum2` 和 MAC 异或值全部对得上。
 
-Two details are worth flagging, because the widely-circulated notes about this
-protocol get them wrong:
+有两处细节值得单独说明，因为网上流传的这份协议笔记是错的：
 
-- `MD5B` hashes `0x01 + password + seed + 4 zero bytes`, not `0x01 + password +
-  seed`.
-- In `checksum2` the MAC sits at offset `counter+8`, after a 6-byte temp field.
+- `MD5B` 的输入是 `0x01 + 密码 + seed + 4 个 0x00`，不是 `0x01 + 密码 + seed`。
+- `checksum2` 里 MAC 写在 `counter+8`，前面还有 6 字节临时字段。
 
-More notes live in the module docstrings, and
-`tools/verify_against_log.py` can re-run the byte comparison against your own
-capture.
+更多细节写在各模块的 docstring 里；`tools/verify_against_log.py` 可以拿你自己的抓包
+重跑一遍逐字节比对。
 
-### Known limitations
+### 已知限制
 
-- "Log out" is not a real logout packet — this Dr.COM variant has none. It stops
-  the keepalives and closes the socket; the server releases the session on
-  timeout. The UI says so rather than pretending otherwise.
-- The tray needs `pystray`. Flet has no tray control, so without it the app
-  minimises rather than hiding.
-- The interface is dark-only, which is what a HUD needs. A high-contrast variant
-  is available.
-- Built and tested on Windows. The socket handling has POSIX paths, but they are
-  less exercised.
+- 「注销」不是真正的注销报文 —— 这个 Dr.COM 变体没有客户端注销包。
+  它做的是停止保活并关闭套接字，服务端超时后释放会话。界面上是这么写的，不装。
+- 托盘依赖 `pystray`。Flet 没有托盘控件，所以没有它时程序是最小化而不是隐藏。
+- 界面只有深色主题（HUD 风格需要暗底），另提供高对比度模式。
+- 主要在 Windows 上开发测试；套接字层有 POSIX 分支但跑得少。
 
 ---
 
-## Credits
+## 致谢
 
-This project would not exist without
-**[drcom-jlu-qt](https://github.com/code4lala/drcom-jlu-qt)** by
-[code4lala](https://github.com/code4lala) — the Qt/C++ client that has been
-authenticating JLU's campus network. It is the reference for the protocol: the
-packet layout here was written by reading its source and diffing against the
-captures it produces, and every field offset traces back to it.
+没有 **[drcom-jlu-qt](https://github.com/code4lala/drcom-jlu-qt)**（作者
+[code4lala](https://github.com/code4lala)）就不会有这个项目 —— 那个 Qt/C++ 客户端
+一直在给吉大校园网做认证。它就是本项目的协议参考：这里每一个字段偏移，
+都是读它的源码、再和它产生的抓包做 diff 得出的。
 
-Thanks also to [drcom-generic](https://github.com/drcoms/drcom-generic) and
-[mchome/dogcom](https://github.com/mchome/dogcom), whose documentation of other
-Dr.COM variants made the JLU-specific quirks much easier to spot.
+也感谢 [drcom-generic](https://github.com/drcoms/drcom-generic) 和
+[mchome/dogcom](https://github.com/mchome/dogcom)：它们对 Dr.COM 其它变体的整理，
+让吉大这一版的特殊性容易辨认了很多。
 
-### Contributors
+### 贡献者
 
-- **[@hZsFN](https://github.com/hZsFN)** — project direction, requirements, live-network testing and acceptance
-- **[@Dafeiyu111](https://github.com/Dafeiyu111)** (大肥鱼) &lt;tanpan9926@mails.jlu.edu.cn&gt; — Python/Flet implementation
-- **code4lala** — original Qt client and protocol reference
+- **[@hZsFN](https://github.com/hZsFN)** —— 项目发起与需求定义、真机联调与验收
+- **[@Dafeiyu111](https://github.com/Dafeiyu111)**（大肥鱼）&lt;tanpan9926@mails.jlu.edu.cn&gt; —— Python / Flet 实现
+- **code4lala** —— 原版 Qt 客户端与协议参考
 
 ---
 
-## License
+## 许可证
 
-GPL-3.0, the same license as the project this is derived from. See
-[LICENSE](LICENSE).
+GPL-3.0，与所参考的项目保持一致。见 [LICENSE](LICENSE)。
 
 [![](https://img.shields.io/badge/powered_by-dafeiyu-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/Dafeiyu111)

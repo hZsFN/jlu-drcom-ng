@@ -12,6 +12,11 @@
 > 用户机器上不需要 Python）。两版读写同一个 `%APPDATA%\JLU-DrCOM-NG\config.json`，
 > 密码格式也兼容，随时可以互换。见 [drcom_dart/README.md](drcom_dart/README.md)
 > 与 [desktop/README.md](desktop/README.md)。
+>
+> **2.0 版（Dart）现在已经补齐**：多账号管理、设置页、日志查看/复制/清空、开机自启、
+> 启动后自动连接。认证、保活、断线重连的行为与 Python 版一致。
+> **还差**：无界面 CLI、本地 HTTP 状态接口、流量统计、高对比度/减少动态效果这几项
+> 尚未移植。
 
 > English documentation: [README_EN.md](README_EN.md)
 >

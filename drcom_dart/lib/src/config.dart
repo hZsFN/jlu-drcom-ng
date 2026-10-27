@@ -218,6 +218,7 @@ class AppConfig {
     AuthConfig? auth,
     ReconnectConfig? reconnect,
     UiConfig? ui,
+    this.activeAccountId,
     Map<String, dynamic>? raw,
   })  : accounts = accounts ?? <Account>[],
         auth = auth ?? AuthConfig(),
@@ -231,12 +232,27 @@ class AppConfig {
   ReconnectConfig reconnect;
   UiConfig ui;
 
+  /// 用户手动选中的账号 id。为空时退回 `auto_account` 的启发式。
+  ///
+  /// Python 版没有这个键，所以写回去时要保留它可能出现的同名键（`_raw` 已兜住），
+  /// 读的时候也容忍缺失。
+  String? activeAccountId;
+
   Map<String, dynamic> _raw;
 
-  /// 优先返回 `auto_login` 的账号，否则第一个。
+  /// 优先按 [activeAccountId] 找；没设或已经删了，再退回
+  /// 「`auto_login` 且有密码」→「有密码」→「第一个」。
   Account? activeAccount() {
     if (accounts.isEmpty) {
       return null;
+    }
+    final wanted = activeAccountId;
+    if (wanted != null && wanted.isNotEmpty) {
+      for (final item in accounts) {
+        if (item.id == wanted) {
+          return item;
+        }
+      }
     }
     for (final item in accounts) {
       if (item.autoLogin && item.hasPassword) {
@@ -249,6 +265,38 @@ class AppConfig {
       }
     }
     return accounts.first;
+  }
+
+  /// 切换当前账号。顺手把 `auto_login` 标记同步过去 ——
+  /// 这样即使别的实现（Python 版）读同一份配置，选中的也是同一个。
+  void setActiveAccount(String id) {
+    if (!accounts.any((item) => item.id == id)) {
+      throw ConfigError('没有 id 为 $id 的账号');
+    }
+    activeAccountId = id;
+    for (final item in accounts) {
+      item.autoLogin = item.id == id;
+    }
+  }
+
+  /// 加一个账号并设为当前。返回新账号。
+  Account addAccount({
+    String account = '',
+    String mac = Account.defaultMacPlaceholder,
+    String label = '',
+  }) {
+    final created = Account(account: account, mac: mac, label: label);
+    accounts.add(created);
+    setActiveAccount(created.id);
+    return created;
+  }
+
+  /// 删一个账号。删的是当前账号时，把当前标记清掉让启发式重新挑。
+  void removeAccount(String id) {
+    accounts.removeWhere((item) => item.id == id);
+    if (activeAccountId == id) {
+      activeAccountId = null;
+    }
   }
 
   factory AppConfig.fromJson(Map<String, dynamic> json) {
@@ -267,6 +315,7 @@ class AppConfig {
       auth: AuthConfig.fromJson(_section(json['auth'])),
       reconnect: ReconnectConfig.fromJson(_section(json['reconnect'])),
       ui: UiConfig.fromJson(_section(json['ui'])),
+      activeAccountId: json['active_account_id']?.toString(),
       raw: Map<String, dynamic>.from(json),
     );
   }
@@ -275,6 +324,12 @@ class AppConfig {
     final result = Map<String, dynamic>.from(_raw);
     result['version'] = version;
     result['accounts'] = accounts.map((account) => account.toJson()).toList();
+    final active = activeAccountId;
+    if (active != null && active.isNotEmpty) {
+      result['active_account_id'] = active;
+    } else {
+      result.remove('active_account_id');
+    }
     // 各段也做合并，别把 Dart 版不认识的键吃掉。
     result['auth'] = <String, dynamic>{
       ..._section(_raw['auth']),

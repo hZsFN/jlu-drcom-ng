@@ -260,6 +260,9 @@ class DrcomApp {
     };
   }
 
+  /// 状态文件写不进去时只提醒一次，别每秒刷屏（权限不对会一直失败）。
+  bool _statusWriteWarned = false;
+
   void _writeStatus() {
     if (_stopping && _engine == null) {
       return;
@@ -276,9 +279,13 @@ class DrcomApp {
         flush: true,
       );
       temporary.renameSync(file.path);
+      _statusWriteWarned = false;
     } on FileSystemException catch (error) {
-      // 状态文件写不进去不该搞挂认证——只记一条。
-      _log('状态文件写入失败：${error.message}');
+      // 状态文件写不进去不该搞挂认证，也不能刷屏。
+      if (!_statusWriteWarned) {
+        _statusWriteWarned = true;
+        _log('状态文件写入失败：${error.message}（后续不再重复提示）');
+      }
     }
   }
 }

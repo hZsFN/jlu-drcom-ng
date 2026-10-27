@@ -14,6 +14,12 @@ self-healing when the port is taken.
 > needed on the user's machine). Both read and write the same `%APPDATA%\JLU-DrCOM-NG\config.json`,
 > and the stored password format is compatible, so you can switch between them freely.
 > See [drcom_dart/README.md](drcom_dart/README.md) and [desktop/README.md](desktop/README.md).
+>
+> **The 2.0 (Dart) build now covers**: multi-account management, a settings page,
+> log view/copy/clear, launch at startup, and auto-connect on launch. Authentication,
+> keepalive and reconnection behave the same as the Python build.
+> **Still missing**: the headless CLI, the local HTTP status endpoint, traffic stats,
+> and the high-contrast / reduced-motion options.
 
 > 中文文档：[README.md](README.md)
 >

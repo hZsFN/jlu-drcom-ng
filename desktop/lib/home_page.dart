@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:jlu_drcom/jlu_drcom.dart';
 
 import 'controller.dart';
@@ -46,7 +47,21 @@ class HomePage extends StatelessWidget {
                   ),
                   const SizedBox(height: 16),
                   Expanded(
-                    child: _LogView(lines: controller.logs),
+                    child: _LogView(
+                      lines: controller.logs,
+                      onCopy: () async {
+                        await Clipboard.setData(
+                          ClipboardData(text: controller.exportLogs()),
+                        );
+                        if (!context.mounted) return;
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('日志已复制到剪贴板')),
+                        );
+                      },
+                      onClear: controller.logs.isEmpty
+                          ? null
+                          : controller.clearLogs,
+                    ),
                   ),
                   const SizedBox(height: 8),
                   _Footer(
@@ -246,47 +261,105 @@ class _ActionBar extends StatelessWidget {
   }
 }
 
-/// 日志：最新的在最上面，省掉滚动逻辑。
+/// 日志：最新的在最上面，省掉滚动逻辑。右上角两个小按钮（复制 / 清空）。
 class _LogView extends StatelessWidget {
-  const _LogView({required this.lines});
+  const _LogView({
+    required this.lines,
+    required this.onCopy,
+    required this.onClear,
+  });
 
   final List<AppLogLine> lines;
+  final Future<void> Function() onCopy;
+  final VoidCallback? onClear;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    if (lines.isEmpty) {
-      return Center(
-        child: Text(
-          '还没有日志',
-          style: theme.textTheme.bodySmall
-              ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-        ),
-      );
-    }
     return Container(
       decoration: BoxDecoration(
         color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.35),
         borderRadius: BorderRadius.circular(12),
       ),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      child: ListView.builder(
-        reverse: false,
-        itemCount: lines.length,
-        itemBuilder: (BuildContext context, int index) {
-          final line = lines[lines.length - 1 - index];
-          return Padding(
-            padding: const EdgeInsets.symmetric(vertical: 2),
-            child: Text(
-              line.format(),
-              style: theme.textTheme.bodySmall?.copyWith(
-                fontFamily: 'Consolas',
-                color: theme.colorScheme.onSurfaceVariant,
+      padding: const EdgeInsets.fromLTRB(12, 4, 6, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Text(
+                '日志',
+                style: theme.textTheme.labelMedium?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
               ),
-            ),
-          );
-        },
+              const Spacer(),
+              _MiniButton(
+                tooltip: '复制全部日志',
+                icon: Icons.copy_all_outlined,
+                onPressed: () => onCopy(),
+              ),
+              _MiniButton(
+                tooltip: '清空日志',
+                icon: Icons.delete_sweep_outlined,
+                onPressed: onClear,
+              ),
+            ],
+          ),
+          Expanded(
+            child: lines.isEmpty
+                ? Center(
+                    child: Text(
+                      '还没有日志',
+                      style: theme.textTheme.bodySmall
+                          ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                    ),
+                  )
+                : ListView.builder(
+                    reverse: false,
+                    itemCount: lines.length,
+                    itemBuilder: (BuildContext context, int index) {
+                      final line = lines[lines.length - 1 - index];
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 2),
+                        child: Text(
+                          line.format(),
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            fontFamily: 'Consolas',
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
       ),
+    );
+  }
+}
+
+class _MiniButton extends StatelessWidget {
+  const _MiniButton({
+    required this.tooltip,
+    required this.icon,
+    required this.onPressed,
+  });
+
+  final String tooltip;
+  final IconData icon;
+  final VoidCallback? onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      tooltip: tooltip,
+      iconSize: 17,
+      visualDensity: VisualDensity.compact,
+      constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+      padding: EdgeInsets.zero,
+      icon: Icon(icon),
+      onPressed: onPressed,
     );
   }
 }

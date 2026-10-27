@@ -56,6 +56,140 @@ class DrcomController extends ChangeNotifier {
     _notify();
   }
 
+  /// 把内存里的配置写回磁盘。改过账号/密码之后调它。
+  ///
+  /// 写失败不抛给 UI 崩掉，落到 [error] 里显示。
+  bool persist() {
+    try {
+      store.save(config);
+      return true;
+    } on Object catch (e) {
+      _error = '保存配置失败：${describeError(e)}';
+      _notify();
+      return false;
+    }
+  }
+
+  /// 切换当前账号。引擎在跑时不让切，免得状态错乱。
+  void selectAccount(String id) {
+    if (running) {
+      _error = '先断开再切换账号';
+      _notify();
+      return;
+    }
+    try {
+      config.setActiveAccount(id);
+    } on ConfigError catch (e) {
+      _error = e.message;
+      _notify();
+      return;
+    }
+    _error = '';
+    persist();
+    _appendLog('已切换到 ${config.activeAccount()?.maskedAccount ?? id}');
+  }
+
+  /// 新增账号（同时设为当前）。返回新账号，失败返回 null。
+  Account? createAccount({
+    required String account,
+    String mac = Account.defaultMacPlaceholder,
+    String label = '',
+  }) {
+    final trimmed = account.trim();
+    if (trimmed.isEmpty) {
+      _error = '学号/账号不能为空';
+      _notify();
+      return null;
+    }
+    final created = config.addAccount(
+      account: trimmed,
+      mac: mac.trim().isEmpty ? Account.defaultMacPlaceholder : mac.trim(),
+      label: label.trim(),
+    );
+    _error = '';
+    persist();
+    _appendLog('已添加账号 ${created.maskedAccount}');
+    return created;
+  }
+
+  /// 修改账号的显示信息（学号 / MAC / 标签）。
+  void updateAccount(
+    String id, {
+    required String account,
+    required String mac,
+    required String label,
+  }) {
+    final target = _findAccount(id);
+    if (target == null) {
+      _error = '找不到这个账号';
+      _notify();
+      return;
+    }
+    final trimmed = account.trim();
+    if (trimmed.isEmpty) {
+      _error = '学号/账号不能为空';
+      _notify();
+      return;
+    }
+    target.account = trimmed;
+    target.mac = mac.trim().isEmpty ? Account.defaultMacPlaceholder : mac.trim();
+    target.label = label.trim();
+    _error = '';
+    persist();
+    _appendLog('已更新账号 ${target.maskedAccount}');
+  }
+
+  /// 给账号存密码（DPAPI 加密后写配置文件，明文不落盘）。
+  bool setPassword(String id, String plaintext) {
+    final target = _findAccount(id);
+    if (target == null) {
+      _error = '找不到这个账号';
+      _notify();
+      return false;
+    }
+    if (plaintext.isEmpty) {
+      _error = '密码不能为空';
+      _notify();
+      return false;
+    }
+    try {
+      target.passwordProtected = protectPassword(plaintext);
+    } on Object catch (e) {
+      _error = '加密密码失败：${describeError(e)}';
+      _notify();
+      return false;
+    }
+    _error = '';
+    final saved = persist();
+    if (saved) {
+      _appendLog('已保存 ${target.maskedAccount} 的密码');
+    }
+    return saved;
+  }
+
+  /// 删账号（连同它的密码）。删当前账号时会自动落到下一个。
+  void deleteAccount(String id) {
+    if (running) {
+      _error = '先断开再删账号';
+      _notify();
+      return;
+    }
+    final target = _findAccount(id);
+    if (target == null) return;
+    final label = target.maskedAccount;
+    config.removeAccount(id);
+    _error = '';
+    persist();
+    _appendLog('已删除账号 $label');
+  }
+
+  Account? _findAccount(String id) {
+    for (final item in config.accounts) {
+      if (item.id == id) return item;
+    }
+    return null;
+  }
+
   Future<void> connect() async {
     if (_app != null) return;
 
@@ -114,6 +248,25 @@ class DrcomController extends ChangeNotifier {
 
   void _onLog(AppLogLine line) {
     _appendLog(line.text, time: line.time);
+  }
+
+  /// 清空界面上的日志（状态文件里的历史不受影响）。
+  void clearLogs() {
+    _logs.clear();
+    _notify();
+  }
+
+  /// 把日志拼成纯文本，给「复制」按钮用。
+  String exportLogs() {
+    final head = <String>[
+      '# JLU DrCOM-NG 日志',
+      '# 账号 ${activeAccount?.maskedAccount ?? '-'}'
+          ' · 服务器 ${config.auth.server}',
+      '# 状态文件 $statusPath',
+      '',
+    ];
+    final body = _logs.map((line) => line.format()).join('\n');
+    return <String>[...head, body.isEmpty ? '（没有日志）' : body].join('\n');
   }
 
   void _appendLog(String text, {DateTime? time}) {

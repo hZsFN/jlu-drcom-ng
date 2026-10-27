@@ -26,3 +26,7 @@ vendor/
 # Local scratch
 .readme-backup/
 _readme*.md
+
+# Dart / Flutter
+.dart_tool/
+pubspec_overrides.yaml

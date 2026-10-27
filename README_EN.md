@@ -9,6 +9,12 @@ It does the same job as the official Qt client — challenge, login, keepalive �
 but with an interface you can read, explanations instead of "unknown error", and
 self-healing when the port is taken.
 
+> **Two implementations, one shared config**: `drcom/` (Python + Flet — mature, and what the
+> current release ships) and `drcom_dart/` + `desktop/` (Dart auth core + Flutter desktop app,
+> which needs no Python on the user's machine). Both read and write the same
+> `%APPDATA%\JLU-DrCOM-NG\config.json`, and the stored password format is compatible, so you can
+> switch between them freely. See [drcom_dart/README.md](drcom_dart/README.md).
+
 > 中文文档：[README.md](README.md)
 >
 > **Android port**: the same authentication core, running on a phone —

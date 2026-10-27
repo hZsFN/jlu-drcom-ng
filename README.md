@@ -7,6 +7,11 @@
 干的活和原版 Qt 客户端一样 —— 挑战、登录、保活 —— 但界面看得清、失败说得出原因、
 端口被占了自己会想办法。
 
+> **两套实现，共用一份配置**：`drcom/`（Python + Flet，成熟稳定，当前发行版就是它）
+> 和 `drcom_dart/` + `desktop/`（Dart 认证内核 + Flutter 桌面端，不需要用户机器上装 Python）。
+> 两版读写同一个 `%APPDATA%\JLU-DrCOM-NG\config.json`，密码格式也兼容，随时可以互换。
+> Dart 版还在补齐周边功能，见 [drcom_dart/README.md](drcom_dart/README.md)。
+
 > English documentation: [README_EN.md](README_EN.md)
 >
 > **Android 版**：把同一套认证内核搬上手机的移植版在 [jlu-drcom-android](https://github.com/hZsFN/jlu-drcom-android)。

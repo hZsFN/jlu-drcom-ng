@@ -4,7 +4,7 @@
 用法（在仓库根执行）：
     python dart/tool/gen_golden.py
 
-输出：``dart/test/golden/protocol_vectors.json``
+输出：``drcom_dart/test/golden/protocol_vectors.json``
 
 为什么要有这个文件
 ------------------

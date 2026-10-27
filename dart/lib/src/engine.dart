@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show InternetAddressType, NetworkInterface;
 import 'dart:math' as math;
 import 'dart:typed_data';
 
@@ -149,6 +150,15 @@ typedef TransportFactory = Future<AuthTransport> Function();
 /// 可注入的等待：返回 `false` = 被叫停，循环该退出了。
 typedef Sleeper = Future<bool> Function(Duration duration);
 
+/// 探测哪个本机地址能把挑战包送到认证服务器。
+///
+/// 入参是候选地址（`null` 表示 `0.0.0.0`），返回第一个能收到合法挑战响应的
+/// 地址；全不通返回 `null`。
+typedef BindProber = Future<String?> Function(List<String?> candidates);
+
+/// 探测出口网卡时每个地址等多久：真机实测认证服务器在校园网内回包 < 100ms，
+/// 800ms 足够，又不至于让整个探测拖成十几秒。
+const Duration _probeTimeout = Duration(milliseconds: 800);
 enum _SessionResult { transient, fatal }
 
 /// 认证引擎：绑定 → 挑战 → 登录 → 保活，断了按退避重连。
@@ -171,8 +181,11 @@ class AuthEngine {
     this.policy = const ReconnectPolicy(),
     Sleeper? sleeper,
     this.maxSessions = 0,
-  })  : _transportFactory = transportFactory ??
-            (() async => UdpAuthTransport(server: server, port: port)),
+    this.bindAddress,
+    this.autoInterfaceFallback = true,
+    BindProber? bindProber,
+  })  : _transportFactory = transportFactory,
+        _bindProber = bindProber,
         _sleeper = sleeper;
 
   final String account;
@@ -190,7 +203,27 @@ class AuthEngine {
   /// `>0` 时跑完这么多轮会话就自动停（测试用；生产留 0 = 一直跑）。
   final int maxSessions;
 
-  final TransportFactory _transportFactory;
+  /// 显式指定出口网卡地址；留空=自动。
+  ///
+  /// 多网卡时绑定 `0.0.0.0` 也能成功，但内核按路由 metric 挑网卡：一旦 VPN
+  /// 或 Wi-Fi 的 metric 比校园网以太网低，挑战包就从错的网卡发出去，服务端
+  /// 根本不回——看着像"服务器挂了"，其实是"我从错的地址问的"。
+  final String? bindAddress;
+
+  /// 自动枚举本机地址逐个探测（[bindAddress] 为空时才生效）。
+  final bool autoInterfaceFallback;
+
+  final TransportFactory? _transportFactory;
+
+  /// 探测出口网卡的可注入实现（测试用；null = 真发挑战包探）。
+  final BindProber? _bindProber;
+
+  /// 探测选出的绑定地址；null = 0.0.0.0。
+  String? _pickedBind;
+
+  /// 探测选中的地址（诊断用；null 表示走系统默认出口）。
+  String? get pickedBindAddress => _pickedBind;
+
   final Sleeper? _sleeper;
   final math.Random _random = math.Random();
 
@@ -253,6 +286,19 @@ class AuthEngine {
       EngineEventKind.started,
       '认证线程已启动（账号 $maskedAccount → $server:$port）',
     );
+
+    // 只有在用真实 UDP（没注入自定义传输）时才需要探网卡：注入了工厂就说明
+    // 调用方自己管传输，探测只会多占几秒。注入了 prober 则一律探（测试用）。
+    if (autoInterfaceFallback &&
+        (_transportFactory == null || _bindProber != null)) {
+      _pickedBind = await _probeBind();
+      if (_pickedBind != null) {
+        _emit(
+          EngineEventKind.started,
+          '出口网卡已探测：绑定 $_pickedBind',
+        );
+      }
+    }
 
     var sessions = 0;
     try {
@@ -317,10 +363,107 @@ class AuthEngine {
     wake?.call();
   }
 
+  // -- 出口网卡选择 -------------------------------------------------------
+
+  /// 候选绑定地址，按尝试顺序排；`null` 表示交给系统（`0.0.0.0`）。
+  Future<List<String?>> _bindCandidates() async {
+    final explicit = (bindAddress ?? '').trim();
+    if (explicit.isNotEmpty && explicit != '0.0.0.0') {
+      return <String?>[explicit];
+    }
+    if (!autoInterfaceFallback) {
+      return <String?>[null];
+    }
+    final candidates = <String?>[null];
+    try {
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+        includeLoopback: false,
+        includeLinkLocal: false,
+      );
+      for (final iface in interfaces) {
+        for (final address in iface.addresses) {
+          final text = address.address;
+          if (text.startsWith('127.') || text.startsWith('169.254.')) {
+            continue;
+          }
+          if (text == '0.0.0.0' || candidates.contains(text)) {
+            continue;
+          }
+          candidates.add(text);
+        }
+      }
+    } on Object {
+      // 枚举失败就只试默认出口，不影响主流程。
+    }
+    return candidates;
+  }
+
+  /// 逐个地址发一个挑战包，谁先给出合法响应就用谁当出口。
+  Future<String?> _probeBind() async {
+    final candidates = await _bindCandidates();
+    // 只有一个候选（显式指定了地址，或关掉了回退）就没什么可挑的，
+    // 直接用它，别白等一个超时。
+    if (candidates.length <= 1) {
+      return candidates.isEmpty ? null : candidates.first;
+    }
+    final prober = _bindProber;
+    if (prober != null) {
+      return prober(candidates);
+    }
+    for (final candidate in candidates) {
+      UdpAuthTransport? probe;
+      try {
+        probe = UdpAuthTransport(
+          server: server,
+          port: port,
+          localAddress: candidate,
+          defaultTimeout: _probeTimeout,
+        );
+        await probe.send(buildChallengePacket());
+        final reply = await probe.receive();
+        if (reply != null) {
+          parseChallengeResponse(reply); // 不是合法挑战响应就换下一个
+          return candidate;
+        }
+      } catch (e) {
+        // 这个地址绑不上或收不到（虚拟网卡、VPN 网卡常直接 SocketException），
+        // 试下一个。
+        _emit(
+          EngineEventKind.challengeFailed,
+          '探测出口失败：${candidate ?? '0.0.0.0'}',
+          detail: '$e',
+        );
+      } finally {
+        try {
+          await probe?.close();
+        } catch (_) {
+          // 本来就没绑成功，关不掉也无所谓。
+        }
+      }
+      if (!_running) {
+        break;
+      }
+    }
+    return null;
+  }
+
+  Future<AuthTransport> _makeTransport() async {
+    final factory = _transportFactory;
+    if (factory != null) {
+      return factory();
+    }
+    return UdpAuthTransport(
+      server: server,
+      port: port,
+      localAddress: _pickedBind,
+    );
+  }
+
   // -- 一轮会话 ---------------------------------------------------------
 
   Future<_SessionResult> _runSession() async {
-    final transport = await _transportFactory();
+    final transport = await _makeTransport();
     try {
       // ---- 挑战 ----
       _setState(EngineState.challenging, '正在获取挑战码');

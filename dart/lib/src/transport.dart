@@ -37,6 +37,7 @@ class UdpAuthTransport implements AuthTransport {
     required this.server,
     required this.port,
     this.bindPort = 0,
+    this.localAddress,
     this.defaultTimeout = const Duration(milliseconds: recvTimeoutMs),
   });
 
@@ -46,6 +47,14 @@ class UdpAuthTransport implements AuthTransport {
   /// 0 = 交给系统分配。真机实测服务端不校验源端口，所以默认不抢 61440。
   final int bindPort;
 
+  /// 绑定的本机地址；null / "0.0.0.0" = 交给系统选出口。
+  ///
+  /// 多网卡时绑定 `0.0.0.0` 通常也能成功，但内核随后按路由 metric 挑网卡：
+  /// 一旦 VPN 或 Wi-Fi 的 metric 比校园网以太网低，挑战包就从错的网卡出去，
+  /// 服务端根本不回——看起来像"服务器挂了"，其实是"我从错的地址问的"。
+  /// 绑到具体地址才能把出口钉死。
+  final String? localAddress;
+
   final Duration defaultTimeout;
 
   RawDatagramSocket? _socket;
@@ -53,6 +62,11 @@ class UdpAuthTransport implements AuthTransport {
   Completer<Uint8List?>? _waiter;
 
   int _droppedForeign = 0;
+
+  Object? _lastError;
+
+  /// 最近一次 socket 层错误（路由不可达、网卡掉线等），诊断用。
+  Object? get lastError => _lastError;
 
   /// 来自非认证服务器地址的报文数量（诊断串包/劫持用）。
   int get droppedForeign => _droppedForeign;
@@ -65,31 +79,46 @@ class UdpAuthTransport implements AuthTransport {
     if (existing != null) {
       return existing;
     }
-    final socket = await RawDatagramSocket.bind(
-      InternetAddress.anyIPv4,
-      bindPort,
+    final requested = localAddress?.trim() ?? '';
+    final bindTo = (requested.isEmpty || requested == '0.0.0.0')
+        ? InternetAddress.anyIPv4
+        : (InternetAddress.tryParse(requested) ??
+            (throw ArgumentError('localAddress 不是合法 IPv4：$requested')));
+    final socket = await RawDatagramSocket.bind(bindTo, bindPort);
+    socket.listen(
+      (RawSocketEvent event) {
+        if (event != RawSocketEvent.read) {
+          return;
+        }
+        final datagram = socket.receive();
+        if (datagram == null) {
+          return;
+        }
+        if (datagram.address.address != server) {
+          _droppedForeign += 1;
+          return;
+        }
+        final data = Uint8List.fromList(datagram.data);
+        final waiter = _waiter;
+        if (waiter != null && !waiter.isCompleted) {
+          _waiter = null;
+          waiter.complete(data);
+        } else {
+          _inbox.add(data);
+        }
+      },
+      // 不加 onError 的话，路由不可达（Windows errno 1231）这类 socket 异步
+      // 错误会直接变成 zone 里的未捕获异常，把整个进程打掉。这里转成"这一轮
+      // 收不到包"，由引擎的重连策略处理。
+      onError: (Object error) {
+        _lastError = error;
+        final waiter = _waiter;
+        if (waiter != null && !waiter.isCompleted) {
+          _waiter = null;
+          waiter.complete(null);
+        }
+      },
     );
-    socket.listen((RawSocketEvent event) {
-      if (event != RawSocketEvent.read) {
-        return;
-      }
-      final datagram = socket.receive();
-      if (datagram == null) {
-        return;
-      }
-      if (datagram.address.address != server) {
-        _droppedForeign += 1;
-        return;
-      }
-      final data = Uint8List.fromList(datagram.data);
-      final waiter = _waiter;
-      if (waiter != null && !waiter.isCompleted) {
-        _waiter = null;
-        waiter.complete(data);
-      } else {
-        _inbox.add(data);
-      }
-    });
     _socket = socket;
     return socket;
   }

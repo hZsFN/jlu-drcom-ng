@@ -99,12 +99,18 @@ class _Rig {
     this.maxSessions = 1,
     this.sleepLimit = 1 << 20,
     this.policy = const ReconnectPolicy(),
+    this.bindAddress,
+    this.autoInterfaceFallback = true,
+    this.bindProber,
   });
 
   final List<Uint8List?> script;
   final int maxSessions;
   final int sleepLimit;
   final ReconnectPolicy policy;
+  final String? bindAddress;
+  final bool autoInterfaceFallback;
+  final BindProber? bindProber;
 
   final List<Duration> sleeps = <Duration>[];
   late final FakeTransport transport = FakeTransport(script);
@@ -117,6 +123,9 @@ class _Rig {
         transportFactory: () async => transport,
         policy: policy,
         maxSessions: maxSessions,
+        bindAddress: bindAddress,
+        autoInterfaceFallback: autoInterfaceFallback,
+        bindProber: bindProber,
         sleeper: (duration) async {
           sleeps.add(duration);
           sleepCalls += 1;
@@ -382,6 +391,100 @@ void main() {
       expect(
         policy.nextDelay(1, now: DateTime(2026, 10, 27, 12, 0)).inSeconds,
         5,
+      );
+    });
+  });
+
+  group('引擎：出口网卡选择', () {
+    List<Uint8List?> oneRound() => <Uint8List?>[
+          challengeReply(),
+          loginOkReply(),
+          keepalive1Challenge(),
+          keepalive1Ack(),
+          keepalive2Reply(file: true),
+          keepalive2Reply(),
+          keepalive2Reply(),
+        ];
+
+    test('显式指定地址就不探测，直接用', () async {
+      var proberCalls = 0;
+      final rig = _Rig(
+        script: oneRound(),
+        sleepLimit: 1,
+        bindAddress: '192.0.2.77',
+        bindProber: (candidates) async {
+          proberCalls += 1;
+          return candidates.first;
+        },
+      );
+      final engine = rig.build();
+
+      await engine.run();
+
+      expect(proberCalls, 0);
+      expect(engine.pickedBindAddress, '192.0.2.77');
+    });
+
+    test('关掉自动回退就只试系统默认出口', () async {
+      var proberCalls = 0;
+      final rig = _Rig(
+        script: oneRound(),
+        sleepLimit: 1,
+        autoInterfaceFallback: false,
+        bindProber: (candidates) async {
+          proberCalls += 1;
+          return null;
+        },
+      );
+      final engine = rig.build();
+
+      await engine.run();
+
+      expect(proberCalls, 0);
+      expect(engine.pickedBindAddress, isNull);
+    });
+
+    test('默认枚举网卡：先试 0.0.0.0，再逐个具体地址', () async {
+      List<String?>? seen;
+      final rig = _Rig(
+        script: oneRound(),
+        sleepLimit: 1,
+        bindProber: (candidates) async {
+          seen = candidates;
+          return '192.0.2.99';
+        },
+      );
+      final engine = rig.build();
+
+      await engine.run();
+
+      expect(seen, isNotNull);
+      expect(seen!.first, isNull, reason: '首选系统默认出口');
+      expect(
+        seen!.whereType<String>().every(
+              (a) => !a.startsWith('127.') && !a.startsWith('169.254.'),
+            ),
+        isTrue,
+        reason: '回环与链路本地地址不参与探测',
+      );
+      expect(engine.pickedBindAddress, '192.0.2.99');
+    });
+
+    test('探测全不通也不阻塞：退回默认出口照常认证', () async {
+      final rig = _Rig(
+        script: oneRound(),
+        sleepLimit: 1,
+        bindProber: (candidates) async => null,
+      );
+      final engine = rig.build();
+
+      await engine.run();
+
+      expect(engine.pickedBindAddress, isNull);
+      expect(engine.sessionCount, 1);
+      expect(
+        engine.history.map((e) => e.kind),
+        contains(EngineEventKind.online),
       );
     });
   });

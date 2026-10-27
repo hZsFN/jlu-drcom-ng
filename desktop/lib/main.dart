@@ -2,13 +2,14 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:jlu_drcom/jlu_drcom.dart';
 import 'package:flutter/services.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'controller.dart';
 import 'hud/dashboard.dart';
-import 'hud/hud_painter.dart';
+import 'hud/hud_painter.dart' hide formatBytes, formatRate;
 import 'hud/logs_view.dart';
 import 'hud/about_view.dart';
 import 'hud/account_view.dart';
@@ -237,23 +238,58 @@ class _HudShellState extends State<_HudShell> {
   }
 
   /// 从 controller 的状态载荷拼出 HUD 遥测。
-  ///
-  /// 延迟/丢包/速率/今日在线这些还没采集，先留空让 HUD 显示 `--`，
-  /// 采集做好了直接往这里填。
   HudTelemetry _telemetry() {
     final Map<String, Object?> status = _controller.status;
     final String state = status['state']?.toString() ?? 'idle';
     final num uptime = (status['uptime_seconds'] as num?) ?? 0;
+    final TrafficSnapshot traffic = _controller.trafficSnapshot;
+    final Map<String, Object?> probe = _controller.probeSummary;
+    final double? rtt = (probe['rtt_ms'] as num?)?.toDouble();
+    final double? loss = (probe['loss_percent'] as num?)?.toDouble();
+    final double? jitter = (probe['jitter_ms'] as num?)?.toDouble();
+    final bool online = status['online'] == true;
+    final double interval = _controller.config.auth.keepaliveInterval;
+    final double phase = (online && interval > 0)
+        ? (uptime.toDouble() % interval) / interval
+        : 0;
+
     return HudTelemetry(
-      online: status['online'] == true,
+      online: online,
       stateLabel: stateLabels[state] ?? state,
       stateColor: _hexOf(stateColorKey(state)),
       ip: status['ip']?.toString() ?? '',
       account: status['account']?.toString() ?? '',
       uptime: uptime.toDouble(),
+      rxRate: traffic.rxRate,
+      txRate: traffic.txRate,
+      sessionRx: traffic.totalRx,
+      sessionTx: traffic.totalTx,
+      rttMs: rtt,
+      lossPercent: loss,
+      jitterMs: jitter,
+      keepalivePhase: phase,
       drops: ((status['consecutive_failures'] as num?) ?? 0).toInt(),
       detail: status['last_error']?.toString() ?? '',
     );
+  }
+
+  /// 底部统计栏里「延迟 / 丢包 / 本次流量」三格的文本。
+  String get _rttLabel {
+    final Object? rtt = _controller.probeSummary['rtt_ms'];
+    if (rtt is! num) return '—';
+    return '${rtt.round()} ms';
+  }
+
+  String get _lossLabel {
+    final Object? loss = _controller.probeSummary['loss_percent'];
+    if (loss is! num) return '—';
+    return '${loss.round()}%';
+  }
+
+  String get _trafficLabel {
+    final TrafficSnapshot traffic = _controller.trafficSnapshot;
+    return '↓${formatBytes(traffic.totalRx.toDouble())} '
+        '↑${formatBytes(traffic.totalTx.toDouble())}';
   }
 
   /// 当前引擎状态键，给头部胶囊上色用。
@@ -277,12 +313,13 @@ class _HudShellState extends State<_HudShell> {
           account: telemetry.account.isEmpty ? '(未设置)' : telemetry.account,
           message: _controller.error.isEmpty ? '' : _controller.error,
           advice: '',
-          todayLabel: '—',
-          weekLabel: '—',
-          dropsLabel: '${telemetry.drops}',
-          rttLabel: '—',
-          lossLabel: '—',
-          trafficLabel: '—',
+          todayLabel: _uptimeLabel(_controller.stats.today().onlineSeconds +
+              _controller.stats.sessionSeconds),
+          weekLabel: _uptimeLabel(_controller.stats.weekSeconds()),
+          dropsLabel: '${_controller.stats.today().drops}',
+          rttLabel: _rttLabel,
+          lossLabel: _lossLabel,
+          trafficLabel: _trafficLabel,
           onLogin: _controller.running ? null : _controller.connect,
           onLogout: _controller.running ? _controller.disconnect : null,
           onReconnect: _controller.running ? _reconnect : null,

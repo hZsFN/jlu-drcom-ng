@@ -17,3 +17,6 @@ export 'src/md4.dart';
 export 'src/protocol.dart';
 export 'src/secrets.dart';
 export 'src/transport.dart';
+export 'src/netprobe.dart';
+export 'src/stats.dart';
+export 'src/traffic.dart';

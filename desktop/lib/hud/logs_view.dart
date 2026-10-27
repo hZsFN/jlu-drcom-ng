@@ -88,7 +88,7 @@ class _LogsViewState extends State<LogsView> {
                   itemCount: widget.lines.length,
                   itemBuilder: (BuildContext context, int index) {
                     final dynamic line = widget.lines[index];
-                    final String text = line.toString();
+                    final String text = line.format();
                     return Padding(
                       padding: const EdgeInsets.only(bottom: 2),
                       child: SelectableText(

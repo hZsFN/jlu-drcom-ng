@@ -11,12 +11,16 @@ import 'dart:io';
 import 'config.dart';
 import 'engine.dart';
 import 'secrets.dart';
+import 'stats.dart';
 
 /// Dart 客户端版本号（与 Python 版的版本序列分开）。
 const String dartClientVersion = '2.0.0-dev';
 
 /// 状态文件名（与参考实现一致，UI 和 API 可以直接读）。
 const String statusFileName = 'status.json';
+
+/// 在线统计文件名（与状态文件同目录）。
+const String statsFileName = 'stats.json';
 
 /// 把配置应用到引擎上需要的全部参数。
 ///
@@ -102,11 +106,17 @@ class DrcomApp {
     required AppConfig config,
     required this.store,
     String? statusPath,
+    StatsStore? stats,
     this.logSink,
     this.transportFactory,
   })  : _config = config,
         statusPath = statusPath ??
-            store.path.replaceFirst(configFileName, statusFileName);
+            store.path.replaceFirst(configFileName, statusFileName) {
+    this.stats = stats ??
+        StatsStore(
+          File(this.statusPath.replaceFirst(statusFileName, statsFileName)),
+        );
+  }
 
   final AppConfig _config;
 
@@ -118,6 +128,9 @@ class DrcomApp {
 
   /// 状态文件绝对路径。
   final String statusPath;
+
+  /// 在线时长 / 断线 / 流量的账簿。
+  late final StatsStore stats;
 
   /// 日志出口；null = 打到 stdout。
   final void Function(AppLogLine line)? logSink;
@@ -140,6 +153,9 @@ class DrcomApp {
   AppConfig get config => _config;
 
   /// 启动。缺账号或缺密码时抛 [SecretError]/[StateError]。
+  /// 临时诊断：把「写状态文件」和「起子进程」两条链路的真实结果落到临时目录，
+  /// 用来判断 Flutter 宿主里到底是哪一环不通。定位完就删。
+
   Future<void> start() async {
     final account = _config.activeAccount();
     if (account == null) {
@@ -175,6 +191,8 @@ class DrcomApp {
     _subscription = engine.events.listen(_onEvent);
     // 状态文件每秒刷一次：引擎内部状态（uptime / 在线时长）不都通过事件暴露。
     _statusTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      _syncStats();
+      stats.checkpoint();
       _writeStatus();
     });
     _writeStatus();
@@ -186,6 +204,7 @@ class DrcomApp {
     try {
       await engine.run();
     } finally {
+      _syncStats();
       _statusTimer?.cancel();
       _statusTimer = null;
       await _subscription?.cancel();
@@ -202,6 +221,27 @@ class DrcomApp {
     }
     _stopping = true;
     _engine?.stop();
+  }
+
+  /// 上一次 tick 时是否在线，用来识别「上线 / 掉线」这个边沿。
+  bool _wasOnline = false;
+
+  /// 在线状态出现边沿时开关会话，折进 stats.json。
+  void _syncStats() {
+    final engine = _engine;
+    final online = engine?.isOnline ?? false;
+    if (online == _wasOnline) {
+      return;
+    }
+    _wasOnline = online;
+    if (online) {
+      stats.openSession(
+        ip: engine?.ip ?? '',
+        account: _config.activeAccount()?.maskedAccount ?? '',
+      );
+    } else {
+      stats.closeSession(drop: true);
+    }
   }
 
   void _onEvent(EngineEvent event) {
@@ -256,6 +296,7 @@ class DrcomApp {
       'consecutive_failures': engine?.consecutiveFailures ?? 0,
       'ip_local': engine?.pickedBindAddress ?? '',
       'mac': account?.mac ?? '',
+      'stats': stats.asStatus(),
       'timestamp': DateTime.now().millisecondsSinceEpoch / 1000,
     };
   }
@@ -284,7 +325,10 @@ class DrcomApp {
       // 状态文件写不进去不该搞挂认证，也不能刷屏。
       if (!_statusWriteWarned) {
         _statusWriteWarned = true;
-        _log('状态文件写入失败：${error.message}（后续不再重复提示）');
+        _log('状态文件写入失败：${error.message}'
+            ' path=$statusPath'
+            ' errno=${error.osError?.errorCode}'
+            '（后续不再重复提示）');
       }
     }
   }

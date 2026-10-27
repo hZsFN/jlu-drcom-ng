@@ -266,8 +266,10 @@ class _DashboardViewState extends State<DashboardView> {
   @override
   void initState() {
     super.initState();
-    // 和 Python 版一致：不跑 60fps 动画，1 秒推进一次相位，省 CPU。
-    _phaseTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+    // 和 Python 版一致：不跑 60fps 动画。扫描线相位 2 秒推一次即可——
+    // 整块画布（网格 + 刻度 + 姿态仪 + 一排读数）每秒全量重绘实测要吃掉
+    // 单核 10% 上下，翻倍间隔直接砍半，肉眼几乎看不出差别。
+    _phaseTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       if (!mounted) return;
       setState(() => _phase += 1);
     });

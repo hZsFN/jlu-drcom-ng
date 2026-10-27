@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:jlu_drcom/jlu_drcom.dart';
@@ -8,12 +9,41 @@ import 'package:jlu_drcom/jlu_drcom.dart';
 /// [DrcomApp] 的 `start()` 是个一直跑到断线的长 Future，UI 不能 await 它，
 /// 所以这里把它包成 fire-and-forget，并用每秒一次的 tick 把在线时长刷出来。
 class DrcomController extends ChangeNotifier {
-  DrcomController({ConfigStore? store}) : store = store ?? ConfigStore() {
+  DrcomController({ConfigStore? store, StatsStore? stats})
+      : store = store ?? ConfigStore() {
     config = this.store.load();
+    this.stats = stats ??
+        StatsStore(
+          File(this.store.path.replaceFirst(configFileName, statsFileName)),
+        );
   }
 
   final ConfigStore store;
   late AppConfig config;
+
+  /// 在线时长 / 断线 / 流量的账簿（与 [DrcomApp] 共用同一份，别各开一个）。
+  late final StatsStore stats;
+
+  /// 网卡流量采样器（PowerShell 读计数器，2 秒一次）。
+  final TrafficMeter traffic = TrafficMeter();
+
+  /// 延迟 / 抖动 / 丢包的滚动窗口。
+  final ProbeHistory probe = ProbeHistory();
+
+  /// 探测目标：认证服务器本身，ICMP 一般可达。
+  String get probeTarget => config.auth.server;
+
+  /// tick 计数，用来给采样定时（1 秒一跳）。
+  int _tick = 0;
+
+  /// 最近一次流量读数。
+  TrafficSnapshot get trafficSnapshot => traffic.snapshot;
+
+  /// 最近一次探测汇总（没有数据时各字段为 null）。
+  Map<String, Object?> get probeSummary => probe.summary(probeTarget);
+
+  /// 统计快照，字段与 `StatsStore.asStatus` 一致。
+  Map<String, dynamic> get statsStatus => stats.asStatus();
 
   DrcomApp? _app;
   Timer? _ticker;
@@ -48,6 +78,7 @@ class DrcomController extends ChangeNotifier {
         'last_reason': '',
         'ip_local': '',
         'mac': activeAccount?.mac ?? '',
+        'stats': stats.asStatus(),
       };
 
   /// 重新读配置。用户在别处改了 config.json 之后刷新用。
@@ -207,7 +238,8 @@ class DrcomController extends ChangeNotifier {
     }
 
     _error = '';
-    final app = DrcomApp(config: config, store: store, logSink: _onLog);
+    final app =
+        DrcomApp(config: config, store: store, stats: stats, logSink: _onLog);
     _app = app;
     _startTicker();
     _appendLog('正在连接 ${account.maskedAccount} → ${config.auth.server}');
@@ -280,8 +312,69 @@ class DrcomController extends ChangeNotifier {
 
   void _startTicker() {
     _ticker?.cancel();
+    _tick = 0;
     // 引擎内部状态（uptime / 在线时长）不都通过事件暴露，每秒拉一次。
-    _ticker = Timer.periodic(const Duration(seconds: 1), (_) => _notify());
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      _tick++;
+      // 流量每 5 秒采一次。采样走 FFI 直读 GetIfTable2，不再是子进程，
+      // 成本可以忽略，这个间隔纯为让读数不跳。
+      if (_tick % 5 == 0) {
+        unawaited(_sampleTraffic());
+      }
+      // 探测每 10 秒一次，够画读数又不至于刷满日志。
+      if (_tick % 10 == 1) {
+        unawaited(_probeNow());
+      }
+      _notify();
+    });
+  }
+
+  /// 上一次采样时的会话累计，用来算增量。
+  int _lastTotalRx = 0;
+  int _lastTotalTx = 0;
+
+  /// 把流量统计钉在真正在认证的网卡上，采一次并把增量记进账簿。
+  Future<void> _sampleTraffic() async {
+    final engine = _app?.engine;
+    final address = engine?.pickedBindAddress ?? '';
+    if (address.isNotEmpty) {
+      await traffic.setSourceAddress(address);
+    }
+    if (address.isEmpty) {
+      return;
+    }
+    final TrafficSnapshot snapshot = await traffic.sample();
+    final int deltaRx = snapshot.totalRx - _lastTotalRx;
+    final int deltaTx = snapshot.totalTx - _lastTotalTx;
+    if (deltaRx <= 0 && deltaTx <= 0) {
+      return;
+    }
+    _lastTotalRx = snapshot.totalRx;
+    _lastTotalTx = snapshot.totalTx;
+    stats.addTraffic(
+      rx: deltaRx > 0 ? deltaRx : 0,
+      tx: deltaTx > 0 ? deltaTx : 0,
+    );
+  }
+
+  /// 探一次延迟（失败不抛，历史窗口自己记丢包）。
+  Future<void> _probeNow() async {
+    // ICMP 探测已停用：这台机器上未签名进程发不出 ICMP（安全软件拦截），
+    // 而 ping.exe 子进程在受限令牌下又起不来，结果是每次都失败、HUD 上恒显示
+    // 「丢包 100%」，纯属误导。延迟/丢包要等引擎层用协议往返测，见 TODO。
+    // 探针保留在 netprobe.dart 里，签名之后可以打开。
+    if (1 > 0) return;
+    final target = probeTarget;
+    if (target.isEmpty) return;
+    // 必须指定源地址：不指定会走默认路由（可能是 WiFi），校园网网关直接不回包。
+    final source = _app?.engine?.pickedBindAddress ?? '';
+    try {
+      final result =
+          await pingOnce(target, count: 3, timeoutMs: 1000, source: source);
+      probe.add(result);
+    } on Object {
+      // 探测失败不该影响认证。
+    }
   }
 
   void _stopTicker() {

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -6,9 +7,36 @@ import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'controller.dart';
-import 'home_page.dart';
-import 'accounts_page.dart';
+import 'hud/dashboard.dart';
+import 'hud/hud_painter.dart';
+import 'hud/logs_view.dart';
+import 'hud/about_view.dart';
+import 'hud/account_view.dart';
+import 'hud/shell.dart';
+import 'hud/theme.dart';
 import 'settings_page.dart';
+
+/// 引擎状态到中文标签，和 Python 版 `STATE_LABELS` 一字不差。
+const Map<String, String> stateLabels = <String, String>{
+  'idle': '待机',
+  'binding': '绑定端口',
+  'challenging': '获取挑战码',
+  'authenticating': '认证中',
+  'online': '在线',
+  'retry_wait': '等待重试',
+  'fatal': '需处理',
+  'stopped': '已停止',
+};
+
+/// 引擎状态到配色键（喂给 `HudPalette.stateColor`）。
+String stateColorKey(String state) => switch (state) {
+  'online' => 'online',
+  'authenticating' || 'challenging' || 'binding' => 'challenging',
+  'retry_wait' => 'retry_wait',
+  'fatal' => 'fatal',
+  'idle' || 'stopped' => 'idle',
+  _ => 'text',
+};
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -18,12 +46,13 @@ Future<void> main() async {
   final controller = DrcomController();
   final ui = controller.config.ui;
 
+  // 尺寸对齐 Python 版（780 px 高），HUD 的四角读数和模式条才不会被裁掉。
   const options = WindowOptions(
-    size: Size(560, 640),
-    minimumSize: Size(480, 560),
+    size: Size(1100, 780),
+    minimumSize: Size(900, 640),
     center: true,
     title: 'JLU DrCOM-NG',
-    backgroundColor: Colors.transparent,
+    backgroundColor: Color(0xFF0A0E14),
     titleBarStyle: TitleBarStyle.normal,
   );
   await windowManager.waitUntilReadyToShow(options, () async {
@@ -150,69 +179,227 @@ class _DrcomRootState extends State<DrcomRoot> with TrayListener, WindowListener
 
   @override
   Widget build(BuildContext context) {
-    final brightness =
-        WidgetsBinding.instance.platformDispatcher.platformBrightness;
+    final HudPalette palette = HudPalette.standard;
     return MaterialApp(
       title: 'JLU DrCOM-NG',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: palette.bg,
+        canvasColor: palette.bg,
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF1565C0),
-          brightness: brightness,
+          seedColor: palette.cyan,
+          brightness: Brightness.dark,
+          surface: palette.panel,
         ),
+        // 全局把字体换成等宽，HUD 才有仪表感。
+        fontFamily: HudMetrics.fontMono,
+        fontFamilyFallback: HudMetrics.fontMonoFallback,
+        splashFactory: InkSparkle.splashFactory,
       ),
-      home: _Shell(controller: _controller),
+      home: HudThemeScope(
+        palette: palette,
+        child: _HudShell(controller: _controller),
+      ),
     );
   }
 }
 
-/// 三页外壳：主页 / 账号 / 设置。
-class _Shell extends StatefulWidget {
-  const _Shell({required this.controller});
+/// 五页外壳：顶部标题栏 + 顶部导航 + 内容区。
+class _HudShell extends StatefulWidget {
+  const _HudShell({required this.controller});
 
   final DrcomController controller;
 
   @override
-  State<_Shell> createState() => _ShellState();
+  State<_HudShell> createState() => _HudShellState();
 }
 
-class _ShellState extends State<_Shell> {
-  int _index = 0;
+class _HudShellState extends State<_HudShell> {
+  String _view = hudViews.first;
+  TimerHandle? _clock;
+
+  DrcomController get _controller => widget.controller;
 
   @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: IndexedStack(
-        index: _index,
-        children: <Widget>[
-          HomePage(controller: widget.controller),
-          AccountsPage(controller: widget.controller),
-          SettingsPage(controller: widget.controller),
-        ],
-      ),
-      bottomNavigationBar: NavigationBar(
-        height: 58,
-        selectedIndex: _index,
-        onDestinationSelected: (int value) => setState(() => _index = value),
-        destinations: const <NavigationDestination>[
-          NavigationDestination(
-            icon: Icon(Icons.wifi_outlined),
-            selectedIcon: Icon(Icons.wifi),
-            label: '连接',
+  void initState() {
+    super.initState();
+    _clock = TimerHandle(() {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _clock?.cancel();
+    super.dispose();
+  }
+
+  /// 从 controller 的状态载荷拼出 HUD 遥测。
+  ///
+  /// 延迟/丢包/速率/今日在线这些还没采集，先留空让 HUD 显示 `--`，
+  /// 采集做好了直接往这里填。
+  HudTelemetry _telemetry() {
+    final Map<String, Object?> status = _controller.status;
+    final String state = status['state']?.toString() ?? 'idle';
+    final num uptime = (status['uptime_seconds'] as num?) ?? 0;
+    return HudTelemetry(
+      online: status['online'] == true,
+      stateLabel: stateLabels[state] ?? state,
+      stateColor: _hexOf(stateColorKey(state)),
+      ip: status['ip']?.toString() ?? '',
+      account: status['account']?.toString() ?? '',
+      uptime: uptime.toDouble(),
+      drops: ((status['consecutive_failures'] as num?) ?? 0).toInt(),
+      detail: status['last_error']?.toString() ?? '',
+    );
+  }
+
+  /// 当前引擎状态键，给头部胶囊上色用。
+  String get _stateKey => _controller.status['state']?.toString() ?? 'idle';
+
+  String _hexOf(String key) {
+    final HudPalette p = HudPalette.standard;
+    final Color c = p.stateColor(key);
+    return '#${c.toARGB32().toRadixString(16).padLeft(8, '0').substring(2).toUpperCase()}';
+  }
+
+  Widget _body(HudTelemetry telemetry) {
+    switch (_view) {
+      case '状态':
+        return DashboardView(
+          telemetry: telemetry,
+          config: const HudConfig(),
+          statusLabel: telemetry.stateLabel,
+          ip: telemetry.ip.isEmpty ? '—' : telemetry.ip,
+          uptimeLabel: _uptimeLabel(telemetry.uptime),
+          account: telemetry.account.isEmpty ? '(未设置)' : telemetry.account,
+          message: _controller.error.isEmpty ? '' : _controller.error,
+          advice: '',
+          todayLabel: '—',
+          weekLabel: '—',
+          dropsLabel: '${telemetry.drops}',
+          rttLabel: '—',
+          lossLabel: '—',
+          trafficLabel: '—',
+          onLogin: _controller.running ? null : _controller.connect,
+          onLogout: _controller.running ? _controller.disconnect : null,
+          onReconnect: _controller.running ? _reconnect : null,
+          onDiagnose: null,
+          onExportLogs: _exportLogs,
+          canvasHeight: HudSizes.initialCanvasHeight(MediaQuery.sizeOf(context).height),
+        );
+      case '日志':
+        return LogsView(
+          lines: _controller.logs,
+          onClear: _controller.clearLogs,
+          onExport: _exportLogs,
+        );
+      case '账号':
+        return AccountView(controller: _controller);
+      case '设置':
+        return SettingsPage(controller: _controller);
+      case '关于':
+        return const AboutView();
+      default:
+        return const SizedBox.shrink();
+    }
+  }
+
+  /// 重连＝断开再连，中间让引擎把旧 sock 收干净。
+  Future<void> _reconnect() async {
+    await _controller.disconnect();
+    if (!mounted) return;
+    await _controller.connect();
+  }
+
+  void _exportLogs() {
+    final text = _controller.exportLogs();
+    _showTextDialog('导出的日志', text);
+  }
+
+  void _showTextDialog(String title, String body) {
+    showDialog<void>(
+      context: context,
+      builder: (BuildContext ctx) => AlertDialog(
+        backgroundColor: HudPalette.standard.panelAlt,
+        title: Text(title, style: TextStyle(color: HudPalette.standard.cyan)),
+        content: SizedBox(
+          width: 720,
+          height: 420,
+          child: SingleChildScrollView(
+            child: SelectableText(
+              body,
+              style: TextStyle(
+                color: HudPalette.standard.textDim,
+                fontFamily: HudMetrics.fontMono,
+                fontFamilyFallback: HudMetrics.fontMonoFallback,
+                fontSize: 12,
+              ),
+            ),
           ),
-          NavigationDestination(
-            icon: Icon(Icons.people_outline),
-            selectedIcon: Icon(Icons.people),
-            label: '账号',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.settings_outlined),
-            selectedIcon: Icon(Icons.settings),
-            label: '设置',
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: Text('关闭', style: TextStyle(color: HudPalette.standard.cyan)),
           ),
         ],
       ),
     );
   }
+
+  String _uptimeLabel(double seconds) {
+    final int s = seconds.toInt();
+    final int h = s ~/ 3600;
+    final int m = (s % 3600) ~/ 60;
+    return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:'
+        '${(s % 60).toString().padLeft(2, '0')}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final HudPalette palette = HudThemeScope.of(context);
+    final HudTelemetry telemetry = _telemetry();
+    return Scaffold(
+      backgroundColor: palette.bg,
+      body: SafeArea(
+        child: Column(
+          children: <Widget>[
+            HudHeader(
+              stateLabel: telemetry.stateLabel,
+              stateColor: palette.stateColor(stateColorKey(_stateKey)),
+              keepalivePhase: 0,
+              clock: _clockLabel(),
+            ),
+            HudNav(
+              active: _view,
+              onSelect: (String name) => setState(() => _view = name),
+            ),
+            Expanded(child: _body(telemetry)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _clockLabel() {
+    final DateTime now = DateTime.now();
+    return '${now.hour.toString().padLeft(2, '0')}:'
+        '${now.minute.toString().padLeft(2, '0')}:'
+        '${now.second.toString().padLeft(2, '0')}';
+  }
+}
+
+/// 每秒刷一次界面（HUD 不做 60fps 动画，省 CPU）。
+class TimerHandle {
+  TimerHandle(this._onTick) {
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) => _onTick());
+  }
+
+  final void Function() _onTick;
+  late final Timer _timer;
+
+  void cancel() => _timer.cancel();
 }

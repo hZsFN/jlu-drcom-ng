@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'controller.dart';
+import 'hud/dashboard.dart' show HudActionButton, HudThemeScope;
+import 'hud/theme.dart';
 import 'services/autostart.dart';
 
 /// 设置页：线路参数、保活节流、界面行为。
@@ -195,31 +197,46 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    final running = widget.controller.running;
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('设置'),
-        actions: <Widget>[
-          IconButton(
-            tooltip: '恢复默认值',
-            icon: const Icon(Icons.restart_alt),
-            onPressed: _resetDefaults,
-          ),
-        ],
-      ),
-      body: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-          children: <Widget>[
-            if (running)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: Text(
-                  '引擎正在运行，改了要断开重连才生效。',
-                  style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
-                ),
+    final HudPalette palette = HudThemeScope.of(context);
+    final bool running = widget.controller.running;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.fromLTRB(HudMetrics.pad, 0, HudMetrics.pad, 0),
+          child: Row(
+            children: <Widget>[
+              if (running)
+                Expanded(
+                  child: Text(
+                    '引擎正在运行，改了要断开重连才生效。',
+                    style: TextStyle(
+                      fontSize: HudMetrics.sizeMicro,
+                      color: palette.textMuted,
+                    ),
+                  ),
+                )
+              else
+                const Spacer(),
+              HudActionButton(
+                label: '恢复默认值',
+                icon: Icons.restart_alt,
+                accent: palette.amber,
+                onPressed: _resetDefaults,
               ),
+            ],
+          ),
+        ),
+        const SizedBox(height: HudMetrics.gap),
+        Expanded(
+          child: ListView(
+            padding: const EdgeInsets.fromLTRB(
+              HudMetrics.pad,
+              0,
+              HudMetrics.pad,
+              HudMetrics.pad,
+            ),
+            children: <Widget>[
             _Section(
               title: '认证服务器',
               children: <Widget>[
@@ -408,11 +425,15 @@ class _SettingsPageState extends State<SettingsPage> {
             const SizedBox(height: 10),
             Text(
               '配置文件：${widget.controller.store.path}',
-              style: TextStyle(fontSize: 11, color: scheme.outline),
+              style: TextStyle(
+                fontSize: HudMetrics.sizeMicro,
+                color: palette.textMuted,
+              ),
             ),
-          ],
+            ],
+          ),
         ),
-      ),
+      ],
     );
   }
 }
@@ -425,31 +446,57 @@ class _Section extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: <Widget>[
-        Padding(
-          padding: const EdgeInsets.only(left: 4, bottom: 6),
-          child: Text(
-            title,
-            style: TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w600,
-              color: scheme.primary,
-            ),
-          ),
+    final HudPalette palette = HudThemeScope.of(context);
+    return SwitchTheme(
+      data: SwitchThemeData(
+        thumbColor: WidgetStateProperty.resolveWith<Color>(
+          (Set<WidgetState> states) => states.contains(WidgetState.selected)
+              ? palette.green
+              : palette.textMuted,
         ),
-        Container(
-          padding: const EdgeInsets.fromLTRB(14, 6, 14, 6),
-          decoration: BoxDecoration(
-            color: scheme.surfaceContainerHighest.withValues(alpha: 0.35),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: scheme.outlineVariant, width: 0.8),
-          ),
-          child: Column(children: children),
+        trackColor: WidgetStateProperty.resolveWith<Color>(
+          (Set<WidgetState> states) => states.contains(WidgetState.selected)
+              ? palette.greenWash
+              : palette.panelSunk,
         ),
-      ],
+        trackOutlineColor: WidgetStateProperty.resolveWith<Color>(
+          (Set<WidgetState> states) => palette.border,
+        ),
+      ),
+      child: Container(
+      padding: const EdgeInsets.fromLTRB(
+        HudMetrics.pad,
+        HudMetrics.pad - 4,
+        HudMetrics.pad,
+        HudMetrics.pad - 4,
+      ),
+      decoration: BoxDecoration(
+        color: palette.panel,
+        borderRadius: BorderRadius.circular(HudMetrics.radius),
+        border: Border.all(color: palette.border, width: HudMetrics.hairline),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Container(width: 3, height: 12, color: palette.cyan),
+              const SizedBox(width: 6),
+              Text(
+                title,
+                style: TextStyle(
+                  color: palette.textDim,
+                  fontSize: HudMetrics.sizeLabel,
+                  letterSpacing: 1.2,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          ...children,
+        ],
+      ),
+      ),
     );
   }
 }
@@ -462,15 +509,19 @@ class _Row extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final HudPalette palette = HudThemeScope.of(context);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: Row(
         children: <Widget>[
           SizedBox(
-            width: 104,
+            width: 132,
             child: Text(
               label,
-              style: const TextStyle(fontSize: 14),
+              style: TextStyle(
+                color: palette.textMuted,
+                fontSize: HudMetrics.sizeLabel,
+              ),
             ),
           ),
           Expanded(child: child),
@@ -495,6 +546,7 @@ class _Field extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final HudPalette palette = HudThemeScope.of(context);
     return TextField(
       controller: controller,
       onChanged: (_) => onChanged?.call(),
@@ -502,12 +554,31 @@ class _Field extends StatelessWidget {
       inputFormatters: numeric
           ? <TextInputFormatter>[FilteringTextInputFormatter.digitsOnly]
           : null,
-      style: const TextStyle(fontSize: 14),
+      cursorColor: palette.cyan,
+      style: TextStyle(
+        color: palette.text,
+        fontFamily: HudMetrics.fontMono,
+        fontFamilyFallback: HudMetrics.fontMonoFallback,
+        fontSize: HudMetrics.sizeBody,
+      ),
       decoration: InputDecoration(
         hintText: hint,
+        hintStyle: TextStyle(
+          color: palette.textMuted.withValues(alpha: 0.7),
+          fontSize: HudMetrics.sizeLabel,
+        ),
         isDense: true,
+        filled: true,
+        fillColor: palette.panelSunk,
         contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
-        border: const OutlineInputBorder(),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(HudMetrics.radius),
+          borderSide: BorderSide(color: palette.border, width: HudMetrics.hairline),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(HudMetrics.radius),
+          borderSide: BorderSide(color: palette.cyan, width: HudMetrics.hairline),
+        ),
       ),
     );
   }

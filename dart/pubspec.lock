@@ -18,7 +18,7 @@ packages:
     source: hosted
     version: "14.6.0"
   args:
-    dependency: "direct main"
+    dependency: transitive
     description:
       name: args
       sha256: d0481093c50b1da8910eb0bb301626d4d8eb7284aa739614d2b394ee09e3ea04
@@ -90,7 +90,7 @@ packages:
     source: hosted
     version: "3.0.8"
   ffi:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: ffi
       sha256: "6d7fd89431262d8f3125e81b50d3847a091d846eafcd4fdb88dd06f36d705a45"

@@ -182,6 +182,7 @@ class AuthEngine {
     Sleeper? sleeper,
     this.maxSessions = 0,
     this.bindAddress,
+    this.bindPort = defaultBindPort,
     this.autoInterfaceFallback = true,
     BindProber? bindProber,
   })  : _transportFactory = transportFactory,
@@ -209,6 +210,10 @@ class AuthEngine {
   /// 或 Wi-Fi 的 metric 比校园网以太网低，挑战包就从错的网卡发出去，服务端
   /// 根本不回——看着像"服务器挂了"，其实是"我从错的地址问的"。
   final String? bindAddress;
+
+  /// 本地源端口。参考实现绑在 61440，服务端会按 (源 IP, 源端口) 认会话——
+  /// 真机实测：源端口用临时端口时，前两轮保活能过，第三轮服务端就不回了。
+  final int bindPort;
 
   /// 自动枚举本机地址逐个探测（[bindAddress] 为空时才生效）。
   final bool autoInterfaceFallback;
@@ -456,6 +461,7 @@ class AuthEngine {
     return UdpAuthTransport(
       server: server,
       port: port,
+      bindPort: bindPort,
       localAddress: _pickedBind,
     );
   }

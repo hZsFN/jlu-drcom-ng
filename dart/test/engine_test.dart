@@ -119,7 +119,7 @@ class _Rig {
   AuthEngine build() => AuthEngine(
         account: 'testuser01',
         password: 'secret12',
-        mac: '84:A9:38:FC:6A:51',
+        mac: '02:00:00:00:00:01',
         transportFactory: () async => transport,
         policy: policy,
         maxSessions: maxSessions,

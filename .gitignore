@@ -30,3 +30,7 @@ _readme*.md
 # Dart / Flutter
 .dart_tool/
 pubspec_overrides.yaml
+
+# 本地备份与一次性脚本（不进仓库）
+*.bak-*
+tools/swap-readme-*.py

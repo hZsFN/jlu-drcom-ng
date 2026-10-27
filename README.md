@@ -7,10 +7,11 @@
 干的活和原版 Qt 客户端一样 —— 挑战、登录、保活 —— 但界面看得清、失败说得出原因、
 端口被占了自己会想办法。
 
-> **两套实现，共用一份配置**：`drcom/`（Python + Flet，成熟稳定，当前发行版就是它）
-> 和 `drcom_dart/` + `desktop/`（Dart 认证内核 + Flutter 桌面端，不需要用户机器上装 Python）。
-> 两版读写同一个 `%APPDATA%\JLU-DrCOM-NG\config.json`，密码格式也兼容，随时可以互换。
-> Dart 版还在补齐周边功能，见 [drcom_dart/README.md](drcom_dart/README.md)。
+> **两套实现，共用一份配置**：`drcom/`（Python + Flet，功能最全）和
+> `drcom_dart/` + `desktop/`（Dart 认证内核 + Flutter 桌面端，装机包只有 10 MB，
+> 用户机器上不需要 Python）。两版读写同一个 `%APPDATA%\JLU-DrCOM-NG\config.json`，
+> 密码格式也兼容，随时可以互换。见 [drcom_dart/README.md](drcom_dart/README.md)
+> 与 [desktop/README.md](desktop/README.md)。
 
 > English documentation: [README_EN.md](README_EN.md)
 >
@@ -67,6 +68,19 @@
 ## 使用指导
 
 ### 1. 安装
+
+**安装包（推荐）**：从 [Releases](https://github.com/hZsFN/jlu-drcom-ng/releases) 下载
+
+- `JLU-DrCOM-NG-2.0.0-dart-setup.exe` —— Dart + Flutter 版，**10 MB**，不依赖 Python
+- `JLU-DrCOM-NG-1.1.0-setup.exe` —— Python + Flet 版，71 MB，功能最全
+
+双击安装即可。两个包用的是不同的 AppId，可以同时装在同一台机器上、共用同一份配置，互不影响。
+
+安装包没有做代码签名，首次启动会被 SmartScreen 拦一次（「Windows 已保护你的电脑 /
+发布者未知」），点「更多信息 → 仍要运行」就能过。原因和替代方案见
+[known-issues](docs/known-issues.md)。
+
+**从源码跑（Python 版）**：
 
 ```bash
 pip install -r requirements.txt

@@ -9,11 +9,11 @@ It does the same job as the official Qt client — challenge, login, keepalive �
 but with an interface you can read, explanations instead of "unknown error", and
 self-healing when the port is taken.
 
-> **Two implementations, one shared config**: `drcom/` (Python + Flet — mature, and what the
-> current release ships) and `drcom_dart/` + `desktop/` (Dart auth core + Flutter desktop app,
-> which needs no Python on the user's machine). Both read and write the same
-> `%APPDATA%\JLU-DrCOM-NG\config.json`, and the stored password format is compatible, so you can
-> switch between them freely. See [drcom_dart/README.md](drcom_dart/README.md).
+> **Two implementations, one shared config**: `drcom/` (Python + Flet — the most complete) and
+> `drcom_dart/` + `desktop/` (Dart auth core + Flutter desktop app — a 10 MB installer, no Python
+> needed on the user's machine). Both read and write the same `%APPDATA%\JLU-DrCOM-NG\config.json`,
+> and the stored password format is compatible, so you can switch between them freely.
+> See [drcom_dart/README.md](drcom_dart/README.md) and [desktop/README.md](desktop/README.md).
 
 > 中文文档：[README.md](README.md)
 >
@@ -82,6 +82,21 @@ bound to each concrete local address until one works.
 ## Getting started
 
 ### 1. Install
+
+**Installer (recommended)**: grab one from
+[Releases](https://github.com/hZsFN/jlu-drcom-ng/releases)
+
+- `JLU-DrCOM-NG-2.0.0-dart-setup.exe` — Dart + Flutter build, **10 MB**, no Python required
+- `JLU-DrCOM-NG-1.1.0-setup.exe` — Python + Flet build, 71 MB, the most complete
+
+Just run it. The two use different AppIds, so they can coexist on one machine and share
+the same config without interfering.
+
+The installers are not code-signed, so the first launch trips SmartScreen once
+("Windows protected your PC / Unknown publisher") — click **More info → Run anyway**.
+Background and alternatives: [known-issues](docs/known-issues.md).
+
+**From source (Python build)**:
 
 ```bash
 pip install -r requirements.txt

@@ -7,16 +7,12 @@
 干的活和原版 Qt 客户端一样 —— 挑战、登录、保活 —— 但界面看得清、失败说得出原因、
 端口被占了自己会想办法。
 
-> **两套实现，共用一份配置**：`drcom/`（Python + Flet，功能最全）和
-> `drcom_dart/` + `desktop/`（Dart 认证内核 + Flutter 桌面端，装机包只有 10 MB，
-> 用户机器上不需要 Python）。两版读写同一个 `%APPDATA%\JLU-DrCOM-NG\config.json`，
-> 密码格式也兼容，随时可以互换。见 [drcom_dart/README.md](drcom_dart/README.md)
-> 与 [desktop/README.md](desktop/README.md)。
->
-> **2.0 版（Dart）现在已经补齐**：多账号管理、设置页、日志查看/复制/清空、开机自启、
-> 启动后自动连接。认证、保活、断线重连的行为与 Python 版一致。
-> **还差**：无界面 CLI、本地 HTTP 状态接口、流量统计、高对比度/减少动态效果这几项
-> 尚未移植。
+> **Dart 版已归档**：`drcom_dart/` + `desktop/`（Dart 认证内核 + Flutter 桌面端）
+> 是去年那次重写的产物，装在 10 MB、不需要 Python，但功能比 Python 版少一截
+> （没有无界面 CLI、本地 HTTP 状态接口、流量统计、高对比度/减少动态效果）。
+> **不再发布它的安装包**，代码原地保留、随时可查，现状固定在
+> [tag `dart-2.0.0-archive`](../../tree/dart-2.0.0-archive)。日常使用请装下面的
+> Python 版。
 
 > English documentation: [README_EN.md](README_EN.md)
 >
@@ -81,9 +77,8 @@
 打开链接 → 拉到最下面 `Assets` → 点文件名下载。
 
 - `JLU-DrCOM-NG-1.2.0-setup.exe` —— Python + Flet 版，**功能最全**
-- `JLU-DrCOM-NG-2.0.0-dart-setup.exe` —— Dart + Flutter 版，**10 MB 左右**，不依赖 Python
 
-双击安装即可。两个包用的是不同的 AppId，可以同时装在同一台机器上、共用同一份配置，互不影响。
+双击安装即可。它和归档的 Dart 版用的是不同的 AppId，同时装也不会打架、共用同一份配置。
 
 安装包没有做代码签名，首次启动会被 SmartScreen 拦一次（「Windows 已保护你的电脑 /
 发布者未知」），点「更多信息 → 仍要运行」就能过。原因和替代方案见

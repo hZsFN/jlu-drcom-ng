@@ -9,17 +9,12 @@ It does the same job as the official Qt client — challenge, login, keepalive �
 but with an interface you can read, explanations instead of "unknown error", and
 self-healing when the port is taken.
 
-> **Two implementations, one shared config**: `drcom/` (Python + Flet — the most complete) and
-> `drcom_dart/` + `desktop/` (Dart auth core + Flutter desktop app — a 10 MB installer, no Python
-> needed on the user's machine). Both read and write the same `%APPDATA%\JLU-DrCOM-NG\config.json`,
-> and the stored password format is compatible, so you can switch between them freely.
-> See [drcom_dart/README.md](drcom_dart/README.md) and [desktop/README.md](desktop/README.md).
->
-> **The 2.0 (Dart) build now covers**: multi-account management, a settings page,
-> log view/copy/clear, launch at startup, and auto-connect on launch. Authentication,
-> keepalive and reconnection behave the same as the Python build.
-> **Still missing**: the headless CLI, the local HTTP status endpoint, traffic stats,
-> and the high-contrast / reduced-motion options.
+> **The Dart build is archived**: `drcom_dart/` + `desktop/` (Dart auth core + Flutter
+> desktop app) came out of last year's rewrite — a 10 MB installer needing no Python, but
+> missing a fair amount next to the Python build (headless CLI, local HTTP status endpoint,
+> traffic stats, high-contrast / reduced-motion options). **Its installer is no longer
+> published**; the code stays in the tree for reference and its final state is pinned at
+> [tag `dart-2.0.0-archive`](../../tree/dart-2.0.0-archive). Install the Python build below.
 
 > 中文文档：[README.md](README.md)
 >
@@ -99,10 +94,9 @@ only under `Assets` in a release. Open the link, scroll to the bottom, expand
 `Assets`, download the file.
 
 - `JLU-DrCOM-NG-1.2.0-setup.exe` — Python + Flet build, **the most complete**
-- `JLU-DrCOM-NG-2.0.0-dart-setup.exe` — Dart + Flutter build, **around 10 MB**, no Python required
 
-Just run it. The two use different AppIds, so they can coexist on one machine and share
-the same config without interfering.
+Just run it. It uses a different AppId from the archived Dart build, so the two can
+coexist on one machine and share the same config without interfering.
 
 The installers are not code-signed, so the first launch trips SmartScreen once
 ("Windows protected your PC / Unknown publisher") — click **More info → Run anyway**.

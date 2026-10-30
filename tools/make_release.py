@@ -83,6 +83,18 @@ def build_bundle_zip(version: str) -> pathlib.Path:
     return target
 
 
+def find_installers(version: str) -> list[pathlib.Path]:
+    """setup.exe files already sitting in release/ for this version.
+
+    They are built by ``tools/make_installer.py``, not here, but they get
+    uploaded to the same release — so they belong in the checksum file.
+    """
+    found = sorted(RELEASE_DIR.glob(f"{PACKAGE_NAME}-{version}-*setup.exe"))
+    for path in found:
+        print(f"  installer  {path.name}  ({path.stat().st_size / 1048576:.1f} MB)")
+    return found
+
+
 def write_checksums(paths: list[pathlib.Path], *, tag: str = "") -> pathlib.Path:
     """Digests of what we upload, plus a pointer to the source GitHub adds."""
     target = RELEASE_DIR / "SHA256SUMS.txt"
@@ -125,6 +137,9 @@ def main() -> int:
         artefacts.append(build_bundle_zip(version))
     else:
         print("  (没有 --with-bundle，只写校验文件)")
+    artefacts.extend(find_installers(version))
+    if not artefacts:
+        print("  (release/ 里没有该版本的安装包，只写校验文件)")
     write_checksums(artefacts, tag=tag)
 
     print()

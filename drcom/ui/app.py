@@ -1118,7 +1118,38 @@ class DrcomApp:
         timeout_field = self._field("收包超时（毫秒）", str(cfg.auth.timeout_ms))
         keepalive_field = self._field("保活间隔（秒）", str(int(cfg.auth.keepalive_interval)))
 
+        # 绑定地址留空 = 自动挑网卡；填具体 IP 则固定用它。
+        bind_field = self._field(
+            "本地绑定地址（留空＝自动）",
+            cfg.auth.bind_address,
+            hint="留空自动选择；填 0.0.0.0 也等同于自动",
+        )
+        bind_note = self._text(
+            "留空＝自动：交给系统选路，单网卡（只插网线或只连 WiFi）时最省事。"
+            "填成具体 IP＝固定用该网卡，例如有线 172.18.x.x、无线 10.67.x.x。",
+            color=self.palette.text_muted,
+            size=self.hud.size_micro,
+        )
+        iface_fallback = make_switch(
+            "收不到回应时改用本机各网卡地址重试（多网卡/VPN 抢路由时才需要）",
+            cfg.auth.auto_interface_fallback,
+            on_change=lambda e: (setattr(cfg.auth, "auto_interface_fallback", e.control.value), persist()),
+        )
+
+        def detect_bindable(_event) -> None:
+            """List the addresses the engine would try right now."""
+            from ..netiface import candidate_bind_addresses
+
+            found = candidate_bind_addresses(server=cfg.auth.server, port=cfg.auth.port)
+            if found:
+                self._flash(f"自动模式会试：0.0.0.0 → " + " → ".join(found), True)
+            else:
+                self._flash("没找到可用的本机地址，请检查网卡是否已连接", False)
+
         def save_protocol(_event) -> None:
+            raw_bind = (bind_field.value or "").strip()
+            # "自动" 与 "0.0.0.0" 是同一个意思，统一存空串，配置里一眼能看懂。
+            cfg.auth.bind_address = "" if raw_bind in ("0.0.0.0", "::", "*") else raw_bind
             cfg.auth.server = (server_field.value or "").strip() or "10.100.61.3"
             try:
                 cfg.auth.port = int(port_field.value or 61440)
@@ -1163,8 +1194,13 @@ class DrcomApp:
                                        self._button("保存探测设置", save_probe, accent=self.palette.cyan)],
                                       spacing=self.hud.gap), title="探测与流量"),
                 self._panel(ft.Column([server_field, ft.Row([port_field, timeout_field, keepalive_field], spacing=10),
-                                       alt_port,
-                                       self._button("保存协议参数", save_protocol, accent=self.palette.amber)],
+                                       bind_field,
+                                       bind_note,
+                                       iface_fallback,
+                                       ft.Row([self._button("保存协议参数", save_protocol, accent=self.palette.amber),
+                                               self._button("查看本机可选地址", detect_bindable, accent=self.palette.cyan,
+                                                            icon=ft.Icons.SEARCH)], spacing=10, wrap=True),
+                                       alt_port],
                                       spacing=self.hud.gap), title="协议参数（高级）"),
             ],
             spacing=self.hud.gap,

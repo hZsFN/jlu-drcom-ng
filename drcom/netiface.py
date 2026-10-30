@@ -17,7 +17,13 @@ import subprocess
 import sys
 from dataclasses import dataclass
 
-__all__ = ["InterfaceInfo", "get_default_route_ip", "list_interfaces", "pick_relevant_interface"]
+__all__ = [
+    "InterfaceInfo",
+    "candidate_bind_addresses",
+    "get_default_route_ip",
+    "list_interfaces",
+    "pick_relevant_interface",
+]
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -369,6 +375,59 @@ def pick_relevant_interface(
     )
     best = ranked[0]
     return best if _score_interface(best, route_ip, addrs) > -100 else interfaces[0]
+
+
+def candidate_bind_addresses(
+    *,
+    server: str = "10.100.61.3",
+    port: int = 61440,
+) -> list[str]:
+    """Concrete local IPv4 addresses to try binding, best first.
+
+    Never contains ``0.0.0.0`` — the caller puts the wildcard in front itself.
+    The address the OS would route to *server* through comes first, then the
+    rest by how likely they are to be the real uplink.  Virtual adapters (NDIS
+    filter shims, Hyper-V switches, VPN tunnels) are dropped when at least one
+    physical adapter survives, because binding those can never reach the campus
+    server and each miss costs a full timeout.
+    """
+    addrs = _interface_addresses()
+    if not addrs:
+        return []
+
+    route_ip = get_default_route_ip(server, port)
+    if route_ip.startswith("127."):
+        route_ip = ""
+
+    ranked = sorted(
+        list_interfaces(),
+        key=lambda item: _score_interface(item, route_ip, addrs),
+        reverse=True,
+    )
+
+    def collect(*, skip_virtual: bool) -> list[str]:
+        out: list[str] = []
+        for iface in ranked:
+            if iface.if_type in (_IF_TYPE_SOFTWARE_LOOPBACK, _IF_TYPE_TUNNEL):
+                continue
+            if skip_virtual:
+                haystack = f"{iface.name} {iface.description}".lower()
+                if any(hint in haystack for hint in _VIRTUAL_HINTS):
+                    continue
+            for address in addrs.get(iface.index, ()):
+                # 169.254.x.x is a link-local placeholder for "DHCP never
+                # answered"; binding it can never reach the campus server.
+                if address.startswith(("127.", "169.254.")) or address in out:
+                    continue
+                out.append(address)
+        return out
+
+    ordered = collect(skip_virtual=True)
+    if not ordered:
+        # Everything looked virtual (a VM with only a virtual switch, or a name
+        # we do not recognise): a possible-but-imperfect address beats none.
+        ordered = collect(skip_virtual=False)
+    return ordered
 
 
 def _interface_addresses() -> dict[int, list[str]]:

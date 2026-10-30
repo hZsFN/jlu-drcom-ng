@@ -134,7 +134,10 @@ class AuthConfig:
 
     server: str = "10.100.61.3"
     port: int = 61440
-    bind_address: str = "0.0.0.0"
+    #: Source address to bind.  Empty means "pick an adapter automatically";
+    #: a concrete IP pins it, which is what you want on a laptop that switches
+    #: between dorm Ethernet and campus Wi-Fi.
+    bind_address: str = ""
     bind_port: int = 61440
     timeout_ms: int = 3000
     keepalive_interval: float = 20.0
@@ -144,10 +147,11 @@ class AuthConfig:
     #: system-reserved, try a nearby free source port instead.  Off by default
     #: because it deviates from the spec'd behaviour.
     allow_alternate_port: bool = False
-    #: When bind_address is 0.0.0.0 and the challenge goes unanswered, retry
-    #: bound to each concrete local address.  Fixes the very common "Wi-Fi or a
-    #: VPN stole the default route so the campus server never answers" case.
-    auto_interface_fallback: bool = True
+    #: Optional rescue for the "several adapters up at once" case: after the
+    #: wildcard bind gets no reply, retry bound to each concrete local address.
+    #: Off by default — with one cable plugged in, the wildcard is right the
+    #: first time and each extra candidate only costs a wasted timeout.
+    auto_interface_fallback: bool = False
 
 
 @dataclass

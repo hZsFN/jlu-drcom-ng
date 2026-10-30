@@ -241,46 +241,38 @@ class AuthEngine:
         self.reason = self.reason or OfflineReason.USER_LOGOUT
         self._emit("stopped", message="认证已停止")
 
-    # -- bind-address fallback -------------------------------------------
+    # -- bind address ------------------------------------------------------
     def _bind_candidates(self) -> list[str]:
         """Bind addresses to try, in order.
 
-        When several adapters are up, binding ``0.0.0.0`` normally *succeeds* but
-        the kernel then picks the route by metric.  If a VPN, a hotspot or a
-        Wi-Fi link has a lower metric than the campus Ethernet, the challenge
-        packet leaves through the wrong interface and the server simply never
-        answers.  That looks like "the server is down" but is really "I asked
-        from the wrong address", so we retry bound to each concrete local
-        address before giving up.
+        Two modes, one field:
+
+        * ``bind_address`` holds a concrete IP → use exactly that one.  This is
+          the "pinned" mode for a machine that always logs in on the same link.
+        * ``bind_address`` is empty (or ``0.0.0.0``) → bind the wildcard and let
+          the kernel choose the exit.  That is correct whenever there is a
+          single uplink, which is the normal case; if there are several and the
+          reply never arrives, :attr:`AuthConfig.auto_interface_fallback` (off by
+          default) adds every concrete adapter address as a retry.
         """
         configured = (self.config.auth.bind_address or "").strip()
         if configured and configured not in ("0.0.0.0", "::", "*"):
             return [configured]
-        if not getattr(self.config.auth, "auto_interface_fallback", True):
-            return [configured or "0.0.0.0"]
+        if not getattr(self.config.auth, "auto_interface_fallback", False):
+            return ["0.0.0.0"]
 
-        candidates = [configured or "0.0.0.0"]
         try:
-            from .netiface import _interface_addresses, list_interfaces, pick_relevant_interface
+            from .netiface import candidate_bind_addresses
 
-            preferred = pick_relevant_interface(
-                server=self.config.auth.server, port=self.config.auth.port
+            candidates = candidate_bind_addresses(
+                server=self.config.auth.server,
+                port=self.config.auth.port,
             )
-            addresses = _interface_addresses()
-            ordered: list[str] = []
-            if preferred is not None:
-                ordered.extend(addresses.get(preferred.index, ()))
-            for iface in list_interfaces():
-                if iface.if_type == 24:  # loopback
-                    continue
-                ordered.extend(addresses.get(iface.index, ()))
-            for address in ordered:
-                if address in candidates or address.startswith(("127.", "169.254.")):
-                    continue
-                candidates.append(address)
         except Exception as exc:  # pragma: no cover - never block authentication
-            self.log.debug(f"枚举本机地址失败，跳过接口回退：{exc!r}")
-        return candidates
+            self.log.debug(f"枚举本机地址失败，只用 0.0.0.0：{exc!r}")
+            candidates = []
+
+        return ["0.0.0.0", *candidates]
 
     # -- one full session attempt ---------------------------------------
     def _session(self) -> str:

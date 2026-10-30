@@ -297,19 +297,47 @@ def test_bind_candidates_respects_an_explicit_address(tmp_path) -> None:
         assert engine._bind_candidates() == ["192.0.2.7"]
 
 
-def test_bind_candidates_wildcard_lists_interface_addresses(tmp_path) -> None:
-    """With 0.0.0.0 the engine must offer concrete addresses as fallbacks.
+def test_bind_candidates_auto_is_just_the_wildcard(tmp_path) -> None:
+    """Automatic mode binds 0.0.0.0 and nothing else, by default.
 
-    This is the real-world bug: binding 0.0.0.0 succeeds but the kernel routes
-    by metric, so a Wi-Fi or VPN link can steal the auth traffic.
+    One uplink is the normal case and the wildcard is right the first time;
+    enumerating adapters only adds candidates that each cost a wasted timeout on
+    failure.  The list is opt-in via ``auto_interface_fallback``.
     """
     with MockAuthServer() as server:
+        engine = build_engine(tmp_path, server, bind_address="")
+        assert engine.config.auth.auto_interface_fallback is False
+        assert engine._bind_candidates() == ["0.0.0.0"]
+
+
+def test_bind_candidates_wildcard_also_means_automatic(tmp_path) -> None:
+    """0.0.0.0 is the historic spelling of "automatic" and must still work."""
+    with MockAuthServer() as server:
         engine = build_engine(tmp_path, server, bind_address="0.0.0.0")
+        assert engine._bind_candidates() == ["0.0.0.0"]
+
+
+def test_interface_fallback_adds_concrete_addresses_when_opted_in(tmp_path) -> None:
+    """With the fallback on, the wildcard leads and adapters follow it."""
+    with MockAuthServer() as server:
+        engine = build_engine(tmp_path, server, bind_address="")
+        engine.config.auth.auto_interface_fallback = True
         candidates = engine._bind_candidates()
         assert candidates[0] == "0.0.0.0"
-        assert len(candidates) >= 1
         assert len(set(candidates)) == len(candidates), "duplicate candidates"
         assert not any(c.startswith(("127.", "169.254.")) for c in candidates)
+
+
+def test_interface_enumeration_failure_still_returns_the_wildcard(tmp_path, monkeypatch) -> None:
+    """A broken interface table must degrade to 0.0.0.0, never to an empty list."""
+    with MockAuthServer() as server:
+        engine = build_engine(tmp_path, server, bind_address="")
+        engine.config.auth.auto_interface_fallback = True
+
+        import drcom.netiface as netiface
+
+        monkeypatch.setattr(netiface, "candidate_bind_addresses", lambda **kw: [])
+        assert engine._bind_candidates() == ["0.0.0.0"]
 
 
 def test_bind_candidates_can_be_disabled(tmp_path) -> None:

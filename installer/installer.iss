@@ -1,9 +1,9 @@
-; JLU DrCOM NG —— Inno Setup 6 安装包脚本
+﻿; JLU DrCOM NG —— Inno Setup 6 安装包脚本
 ;
 ; 编译（别直接双击 ISCC）：
 ;     python tools/make_installer.py
 ; 或手工：
-;     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=1.1.0 installer\installer.iss
+;     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=1.2.0 installer\installer.iss
 ;
 ; 版本号不是写死在这里：由 make_installer.py 从 git tag / drcom\__init__.py 读出来再传进来，
 ; 和 make_release.py 保持一致（单一来源）。

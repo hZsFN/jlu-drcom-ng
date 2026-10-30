@@ -54,10 +54,14 @@ another program holding the port exclusively. So the client *measures* instead
 of guessing — it scans neighbouring ports to find the blocked range, identifies
 the process holding it, and gives advice that matches the actual cause.
 
-**Survives a network that changes under it** — with Wi-Fi and Ethernet both up,
-binding `0.0.0.0` succeeds but the kernel routes by metric, so the packet can
-leave through the wrong adapter and the server never answers. The client retries
-bound to each concrete local address until one works.
+**Follows you between wired and wireless** — leave *Local bind address* empty and
+the client binds `0.0.0.0`, letting the routing table choose the exit. With a
+single uplink — only a cable, or only Wi-Fi — that is right the first time and
+needs no attention. Only when both are up and the server still never answers
+(the kernel sent the packet out the wrong adapter) is there anything to do: pin
+the address to the adapter you actually want (the *Show usable addresses* button
+lists them), or switch on *Retry on each local adapter address* and let it try
+them until one gets a reply.
 
 **Never stores your password in clear** — Windows DPAPI, bound to your account.
 
@@ -89,11 +93,13 @@ bound to each concrete local address until one works.
 
 ### 1. Install
 
-**Installer (recommended)**: grab one from
-[Releases](https://github.com/hZsFN/jlu-drcom-ng/releases)
+**Get the installer from the [Releases page](https://github.com/hZsFN/jlu-drcom-ng/releases/latest)** —
+the source tree does **not** contain a ready-to-run binary; the `.exe` files live
+only under `Assets` in a release. Open the link, scroll to the bottom, expand
+`Assets`, download the file.
 
-- `JLU-DrCOM-NG-2.0.0-dart-setup.exe` — Dart + Flutter build, **10 MB**, no Python required
-- `JLU-DrCOM-NG-1.1.0-setup.exe` — Python + Flet build, 71 MB, the most complete
+- `JLU-DrCOM-NG-1.2.0-setup.exe` — Python + Flet build, **the most complete**
+- `JLU-DrCOM-NG-2.0.0-dart-setup.exe` — Dart + Flutter build, **around 10 MB**, no Python required
 
 Just run it. The two use different AppIds, so they can coexist on one machine and share
 the same config without interfering.

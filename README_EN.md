@@ -14,7 +14,7 @@ self-healing when the port is taken.
 > missing a fair amount next to the Python build (headless CLI, local HTTP status endpoint,
 > traffic stats, high-contrast / reduced-motion options). **Its installer is no longer
 > published**; the code stays in the tree for reference and its final state is pinned at
-> [tag `dart-2.0.0-archive`](../../tree/dart-2.0.0-archive). Install the Python build below.
+> [tag `dart-2.0.0-archive`](https://github.com/hZsFN/jlu-drcom-ng/tree/dart-2.0.0-archive). Install the Python build below.
 
 > 中文文档：[README.md](README.md)
 >

@@ -11,7 +11,7 @@
 > 是去年那次重写的产物，装在 10 MB、不需要 Python，但功能比 Python 版少一截
 > （没有无界面 CLI、本地 HTTP 状态接口、流量统计、高对比度/减少动态效果）。
 > **不再发布它的安装包**，代码原地保留、随时可查，现状固定在
-> [tag `dart-2.0.0-archive`](../../tree/dart-2.0.0-archive)。日常使用请装下面的
+> [tag `dart-2.0.0-archive`](https://github.com/hZsFN/jlu-drcom-ng/tree/dart-2.0.0-archive)。日常使用请装下面的
 > Python 版。
 
 > English documentation: [README_EN.md](README_EN.md)

@@ -64,6 +64,11 @@ them until one gets a reply.
 
 - **Tray icon** and close-to-tray (needs `pystray`; without it, "close"
   minimises instead of hiding, so the window can never get lost)
+- **Closing the window frees its memory**: the UI is a separate Flet client
+  process sitting on 100-190 MB, and hiding a window hands none of it back. So
+  closing destroys that process outright -- authentication and the tray keep
+  running, and clicking the tray icon rebuilds the window (about a second). Turn
+  it off under Settings -> Startup & window to get the old hide-instead behaviour
 - **Watchdog** (`--watchdog`): a supervisor outside the client that restarts it
   after a crash -- a fault inside a native library leaves no traceback and no
   log line -- and clears the orphaned window such a crash leaves behind. The
@@ -224,6 +229,8 @@ capture.
   timeout. The UI says so rather than pretending otherwise.
 - The tray needs `pystray`. Flet has no tray control, so without it the app
   minimises rather than hiding.
+- After the window is released, reopening rebuilds it and takes about a second.
+  Authentication and keepalives run throughout — only the window is gone.
 - The interface is dark-only, which is what a HUD needs. A high-contrast variant
   is available.
 - Built and tested on Windows. The socket handling has POSIX paths, but they are

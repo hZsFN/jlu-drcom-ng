@@ -86,6 +86,16 @@ class DrcomApp:
         self.events: "queue.Queue[ControllerEvent]" = queue.Queue()
         self.log_queue: "queue.Queue[LogRecordView]" = queue.Queue()
 
+        #: Set by the tray thread when the user asks for the window back after
+        #: it was released.  A plain Event rather than the UI queue: with no
+        #: client attached nothing drains that queue, so a queued request would
+        #: never be seen.
+        self._show_requested = threading.Event()
+        #: Set by the tray thread when "quit" is picked and no window is up.
+        self._quit_requested = threading.Event()
+        #: True once a window was released and a fresh one should be built.
+        self.relaunch_wanted = False
+
         self.active_view = VIEWS[0]
         self._tray: TrayIcon | None = None
         self._last_keepalive_at = 0.0
@@ -296,7 +306,11 @@ class DrcomApp:
         except Exception:
             pass
 
+        # Remove before adding: this method runs again for every rebuilt window,
+        # and a duplicated listener would deliver every event twice.
+        self.controller.remove_listener(self._on_controller_event)
         self.controller.add_listener(self._on_controller_event)
+        self.controller.log.remove_listener(self._on_log_record)
         self.controller.log.add_listener(self._on_log_record)
 
         # Seed the log panel with whatever is already buffered.
@@ -1031,6 +1045,14 @@ class DrcomApp:
         self._sync_close_action_control()
         auto_login_launch = make_switch("启动后自动登录", cfg.ui.auto_login_on_launch,
                                         on_change=lambda e: (setattr(cfg.ui, "auto_login_on_launch", e.control.value), persist()))
+        # Keep the memory claim honest: 100-190 MB is what flet.exe actually
+        # holds on this machine, and the parenthetical is the price (a rebuild).
+        release_ui = make_switch(
+            "关闭窗口时释放界面内存（约 100–190 MB，重新打开约需 1 秒）",
+            cfg.ui.release_ui_on_close,
+            on_change=lambda e: (setattr(cfg.ui, "release_ui_on_close", e.control.value), persist()),
+            disabled=not tray_available(),
+        )
 
         # --- HUD / accessibility -------------------------------------------
         reduce_motion = make_switch("减少动态效果（关闭扫描线扫过动画）", cfg.ui.reduce_motion,
@@ -1177,6 +1199,7 @@ class DrcomApp:
                                        size=self.hud.size_body),
                             close_action,
                             close_action_note,
+                            release_ui,
                         ],
                         spacing=6,
                     ),
@@ -1372,10 +1395,16 @@ class DrcomApp:
             if action == "ask":
                 note.value = "每次点关闭都会询问，并可选「记住我的选择」。"
             elif action == "tray":
-                note.value = (
-                    "关闭即隐藏到托盘，认证继续在后台运行；"
-                    "要真正退出请用托盘菜单的「退出」，或在「设置」里改回。"
-                )
+                if self.controller.config.ui.release_ui_on_close:
+                    note.value = (
+                        "关闭即释放界面进程并退到托盘，可回收一百多 MB 内存；"
+                        "认证继续在后台运行，双击托盘图标重新打开（约 1 秒）。"
+                    )
+                else:
+                    note.value = (
+                        "关闭即隐藏到托盘，认证继续在后台运行；"
+                        "要真正退出请用托盘菜单的「退出」，或在「设置」里改回。"
+                    )
             else:
                 note.value = "关闭即退出程序，认证会中断。"
             note.color = self.palette.amber if action == "quit" else self.palette.text_muted
@@ -1448,6 +1477,10 @@ class DrcomApp:
     # tray / window
     # ------------------------------------------------------------------
     def _setup_tray(self) -> None:
+        # Idempotent: a rebuilt window must reuse the icon started by the first
+        # one, or the old icon would be orphaned (and quit twice).
+        if self._tray is not None:
+            return
         if not tray_available():
             self.controller.log.warning(
                 "未安装 pystray，无法创建系统托盘图标；「关闭时隐藏」将改为最小化，"
@@ -1456,27 +1489,115 @@ class DrcomApp:
             return
         self._tray = TrayIcon(
             tooltip="JLU DrCOM NG · 待机",
-            on_show=lambda: self.events.put(ControllerEvent(kind="tray_show")),
-            on_toggle=lambda: self.events.put(ControllerEvent(kind="tray_toggle")),
-            on_reconnect=lambda: self.events.put(ControllerEvent(kind="tray_reconnect")),
-            on_quit=lambda: self.events.put(ControllerEvent(kind="tray_quit")),
+            on_show=lambda: self._tray_show(),
+            on_toggle=lambda: self._tray_engine("tray_toggle"),
+            on_reconnect=lambda: self._tray_engine("tray_reconnect"),
+            on_quit=lambda: self._tray_quit(),
         )
         if not self._tray.start():
             self._tray = None
 
+    def _tray_engine(self, kind: str) -> None:
+        """Tray login/logout or reconnect.
+
+        With a window these travel through the UI queue so the banner updates.
+        Without one the queue has no reader, so drive the controller directly --
+        the engine never depended on the window.
+        """
+        if self.page is not None:
+            self.events.put(ControllerEvent(kind=kind))
+            return
+        try:
+            if kind == "tray_toggle":
+                if self.controller.online:
+                    self.controller.request_logout()
+                else:
+                    self.controller.request_login()
+            else:
+                self.controller.request_reconnect()
+        except Exception as exc:  # pragma: no cover - tray thread
+            self.controller.log.warning(f"托盘命令失败：{exc!r}")
+
+    def _tray_show(self) -> None:
+        """Tray "show": bring the window up, rebuilding it if it was released.
+
+        Runs on the pystray thread, so it must not touch Flet directly.  When a
+        window exists the UI tick picks the event up; when none does, the Event
+        wakes the ``run_gui`` loop, which starts a fresh client.
+        """
+        if self.page is not None:
+            self.events.put(ControllerEvent(kind="tray_show"))
+            return
+        self._show_requested.set()
+
+    def _tray_quit(self) -> None:
+        """Tray "quit", which may arrive while no window exists."""
+        if self.page is not None:
+            self.events.put(ControllerEvent(kind="tray_quit"))
+            return
+        # Released window: there is no page to run the graceful path on, so
+        # wake the run_gui loop and let it shut down from the main thread.
+        self._quit_requested.set()
+        self._show_requested.set()
+
     def _hide_window(self) -> None:
-        """Hide to the tray, or minimise if there is no tray to come back from."""
+        """Close to the tray.
+
+        Two ways, depending on ``ui.release_ui_on_close``:
+
+        * release (default) -- destroy the Flet client.  It is a separate
+          process holding 100-190 MB, and a hidden window never gives any of
+          it back.  The engine and the tray keep running; the window is
+          rebuilt on demand (about a second).
+        * hide -- keep the client alive and just stop showing the window.
+
+        Without a tray there is nothing to come back from, so the window is
+        only minimised.
+        """
         if self.page is None:
             return
-        if self._tray is not None:
-            try:
-                self.page.window.visible = False
-                self.page.window.skip_task_bar = True
-                self._safe_update()
-                return
-            except Exception:
-                pass
+        if self._tray is None:
+            self._minimize()
+            return
+        if self.controller.config.ui.release_ui_on_close:
+            self._release_window()
+            return
+        try:
+            self.page.window.visible = False
+            self.page.window.skip_task_bar = True
+            self._safe_update()
+            return
+        except Exception:
+            pass
         self._minimize()
+
+    def _release_window(self) -> None:
+        """Destroy the Flet client, keeping the engine and the tray alive.
+
+        ``ft.run`` returns once the client process is gone, which is what lets
+        ``run_gui`` wait for the next "show" request instead of exiting.
+        """
+        if self.page is None:
+            return
+        self.relaunch_wanted = True
+        self.controller.log.info("界面已释放，释放前端进程内存；认证继续在后台运行。")
+        try:
+            self.page.run_task(self._destroy_window)
+        except Exception:
+            self._minimize()
+
+    async def _destroy_window(self) -> None:
+        if self.page is None:
+            return
+        try:
+            await self.page.window.destroy()
+        except Exception as exc:
+            # Destroy usually *succeeds and then* drops the session: the client
+            # tears the window down, exits, and only then does the awaiting
+            # call notice the socket is gone ("Session closed").  So this is
+            # only worth a warning when the client is still there -- otherwise
+            # ft.run returns normally and the release worked as intended.
+            self.controller.log.debug("销毁窗口时连接先断了：%r", exc)
 
     def _minimize(self) -> None:
         if self.page is None:
@@ -1486,6 +1607,49 @@ class DrcomApp:
             self._safe_update()
         except Exception:
             pass
+
+    # -- window lifetime across releases --------------------------------
+    def prepare_new_window(self) -> None:
+        """Drop everything that belonged to the destroyed window.
+
+        Controls are bound to the page (and the client process) that created
+        them, so none of them may be carried into a rebuild.  The engine, the
+        tray icon and the log buffer all survive: only the widgets go.
+        """
+        self.page = None
+        self._log_rows = []
+        self.log_list = None
+        self.message_text = None
+        self.advice_text = None
+        self.alert_panel = None
+        self.log_file_text = None
+        self.close_action_control = None
+        self.close_action_note = None
+        self._hud_signature = None
+        self._page_size = (0.0, 0.0)
+        self._pending_log_count = 0
+        self._log_paused = False
+        # Events and log lines still queued belong to the old window; the log
+        # bus itself is the source of truth on rebuild (main() re-seeds it).
+        for pending in (self.events, self.log_queue):
+            while True:
+                try:
+                    pending.get_nowait()
+                except queue.Empty:
+                    break
+        # The user explicitly asked for the window back, so do not re-minimise.
+        self.minimized = False
+
+    def wait_for_show(self) -> bool:
+        """Block until the tray asks for the window again.  False = quit."""
+        while not self._quit_requested.is_set():
+            if self._show_requested.wait(0.5):
+                self._show_requested.clear()
+                # "Quit" sets both events, because it also has to wake this
+                # loop up.  Re-check on the way out, or an exit request would
+                # be read as "open the window again".
+                return not self._quit_requested.is_set()
+        return False
 
     def _show_window(self) -> None:
         if self.page is None:
@@ -1538,8 +1702,14 @@ class DrcomApp:
         )
 
         tray_ok = self._tray is not None
+        release = self.controller.config.ui.release_ui_on_close
         hint = (
-            "隐藏到托盘后，认证继续在后台运行，双击托盘图标可以再打开。"
+            (
+                "关闭后界面进程会被释放（可回收一百多 MB 内存），认证继续在后台运行；"
+                "双击托盘图标可以重新打开窗口。"
+                if release
+                else "隐藏到托盘后，认证继续在后台运行，双击托盘图标可以再打开。"
+            )
             if tray_ok
             else "未安装 pystray，无法隐藏到托盘，将改为最小化到任务栏。安装：pip install pystray"
         )
@@ -1552,8 +1722,9 @@ class DrcomApp:
                 self._sync_close_action_control()
             self._close_dialog()
             if action == "tray":
-                self._hide_window()
+                # Flash first: releasing the window throws the banner away.
                 self._flash("已隐藏到托盘，认证继续在后台运行", True)
+                self._hide_window()
             else:
                 self._quit()
 
@@ -1644,9 +1815,37 @@ class DrcomApp:
 
     def _on_controller_event(self, event: ControllerEvent) -> None:
         # Called from worker threads — only enqueue.
+        if self.page is None:
+            # Released window: nothing drains the queue, so the tray icon is the
+            # only channel left.  Keep it truthful instead of letting events
+            # pile up in a queue no one will ever read.
+            self._notify_engine_headless(event)
+            return
         self.events.put(event)
 
+    def _notify_engine_headless(self, event: ControllerEvent) -> None:
+        """Tray balloon + tooltip while the window is closed."""
+        if event.kind != "engine" or event.engine_event is None:
+            return
+        inner = event.engine_event
+        if inner.kind == "online":
+            self._notify_tray("已上线", f"IP {inner.ip}")
+        elif inner.kind == "login_failed":
+            self._notify_tray("认证失败", inner.message)
+        elif inner.kind == "fatal":
+            self._notify_tray("需要处理", inner.message)
+        elif inner.kind == "bind_failed":
+            self._notify_tray("端口冲突", inner.message)
+        try:
+            self._update_tooltip(self._build_telemetry())
+        except Exception:
+            pass
+
     def _on_log_record(self, record: LogRecordView) -> None:
+        if self.page is None:
+            # The log bus keeps its own ring buffer; main() re-seeds the panel
+            # from it when a window is next built, so nothing is lost here.
+            return
         self.log_queue.put(record)
 
     def _handle_event(self, event: ControllerEvent) -> None:
@@ -1952,7 +2151,35 @@ class DrcomApp:
         except Exception:
             pass
 
+    def shutdown_from_main_thread(self) -> None:
+        """Quit cleanly when no window exists and the loop is still running.
+
+        The tray thread cannot do this itself: there is no page to run the
+        graceful destroy on, and ``os._exit`` from there would skip the port
+        release.  Calling it on the main thread lets ``run_gui`` return normally
+        instead.
+        """
+        try:
+            from ..watchdog import StopMarker
+
+            StopMarker(self.controller.data_dir).write()
+        except Exception:
+            pass
+        if self._tray is not None:
+            self._tray.stop()
+            self._tray = None
+        self.controller.shutdown()
+        self._exit_now.set()
+
     def _quit(self) -> None:
+        # No window means nothing to tear down: hand the decision to the
+        # run_gui loop, which is parked in wait_for_show() and can exit
+        # without the os._exit hammer.
+        if self.page is None:
+            self._quit_requested.set()
+            self._show_requested.set()
+            return
+
         # Tell the watchdog this exit was asked for.  Without it, "退出" in the
         # tray menu would be answered by the supervisor starting the app right
         # back up -- a fight the user cannot win.
@@ -2066,5 +2293,17 @@ def run_gui(
             port=port or 8550,
             assets_dir=None,
         )
-    else:
+        return
+
+    # Each ft.run() blocks until its client process is gone.  Closing to the
+    # tray destroys the client to reclaim its memory, so the window is rebuilt
+    # from here on demand instead of ending the program.
+    while True:
         ft.run(target, assets_dir=None)
+        if not app.relaunch_wanted:
+            return
+        app.relaunch_wanted = False
+        app.prepare_new_window()
+        if not app.wait_for_show():
+            app.shutdown_from_main_thread()
+            return

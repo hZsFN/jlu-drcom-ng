@@ -90,7 +90,10 @@ class FakeWindow:
         self.destroyed = False
         self.on_event = None
 
-    def destroy(self) -> None:
+    async def destroy(self) -> None:
+        # Async on purpose: Flet 1.0's Window.destroy is a coroutine, and a
+        # sync fake would let an un-awaited call pass here while failing in the
+        # real client (that exact mismatch was a reported bug).
         self.destroyed = True
 
     def to_front(self) -> None:

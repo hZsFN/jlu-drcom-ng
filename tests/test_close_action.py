@@ -174,12 +174,36 @@ def test_ask_shows_the_chooser(app) -> None:
     assert app.page.window.visible is True, "asking must not hide the window first"
 
 
-def test_tray_hides_the_window(app_with_tray) -> None:
+def test_tray_releases_the_client_by_default(app_with_tray) -> None:
+    """Closing to the tray destroys the Flet client instead of hiding it.
+
+    A hidden window never gives its memory back: flet.exe is a separate process
+    that sits on 100-190 MB whatever ``visible`` says.  Destroying it is what
+    lets ``ft.run`` return, so ``run_gui`` can wait for the next "show" and
+    rebuild the window.
+    """
     app_with_tray.controller.config.ui.close_action = "tray"
+    assert app_with_tray.controller.config.ui.release_ui_on_close is True
     app_with_tray._on_window_event(close_event())
+
+    assert app_with_tray.relaunch_wanted is True, "run_gui must wait for a rebuild"
+    handler, _ = app_with_tray.page.tasks[-1]
+    assert handler == app_with_tray._destroy_window
+
+    asyncio.run(app_with_tray._destroy_window())
+    assert app_with_tray.page.window.destroyed is True
+    assert not app_with_tray.page.dialogs, "a remembered choice must not ask again"
+
+
+def test_tray_can_still_just_hide_the_window(app_with_tray) -> None:
+    """Opting out of the release keeps the old cheap hide."""
+    app_with_tray.controller.config.ui.close_action = "tray"
+    app_with_tray.controller.config.ui.release_ui_on_close = False
+    app_with_tray._on_window_event(close_event())
+    assert app_with_tray.relaunch_wanted is False
     assert app_with_tray.page.window.visible is False
     assert app_with_tray.page.window.skip_task_bar is True
-    assert not app_with_tray.page.dialogs, "a remembered choice must not ask again"
+    assert app_with_tray.page.window.destroyed is False
 
 
 def test_tray_without_a_tray_minimises_instead(app) -> None:
@@ -251,13 +275,16 @@ def test_quit_starts_a_watchdog(app, exits) -> None:
 
 def test_watchdog_stands_down_after_a_clean_shutdown(app, exits) -> None:
     """A completed shutdown must not leave the watchdog armed."""
-    app.quit_watchdog_seconds = 0.05
+    # Must outlast the 0.2 s the finaliser sleeps after destroying the client
+    # (that pause lets the client process actually exit), so 0.05 is too tight
+    # now that the release path really awaits the destroy.
+    app.quit_watchdog_seconds = 0.5
     app._quit()
     asyncio.run(app._finish_quit())
     assert exits == [0]
 
     exits.clear()
-    time.sleep(0.6)
+    time.sleep(0.8)
     assert exits == [], "the watchdog fired after the shutdown had finished"
 
 
@@ -284,7 +311,7 @@ def test_choosing_tray_remembers_it(app_with_tray) -> None:
 
     assert app_with_tray.controller.config.ui.close_action == "tray"
     assert not app_with_tray.page.dialogs, "the dialog should be closed"
-    assert app_with_tray.page.window.visible is False
+    assert app_with_tray.relaunch_wanted is True, "the client is released, not hidden"
 
 
 def test_choosing_quit_remembers_it(app, exits) -> None:

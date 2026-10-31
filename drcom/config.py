@@ -200,6 +200,12 @@ class UiConfig:
     window_width: int = 1100
     window_height: int = 780
     hud_decorations: bool = True
+    #: Close the window by destroying the Flet client instead of hiding it.
+    #: The desktop client is a separate process (flet.exe) that holds 100-190 MB,
+    #: and hiding a window never gives any of it back.  Destroying it keeps the
+    #: authentication engine and the tray icon running; the window is rebuilt
+    #: (about a second) the next time the tray asks for it.
+    release_ui_on_close: bool = True
     #: The sweeping bright band.  Off by default: it is the only continuously
     #: animating element, it costs a websocket update ~13 times a second, and on
     #: a monitoring panel a moving highlight reads as flicker rather than as

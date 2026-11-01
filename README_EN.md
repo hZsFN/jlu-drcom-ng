@@ -60,15 +60,29 @@ them until one gets a reply.
 
 **Never stores your password in clear** — Windows DPAPI, bound to your account.
 
+**Closing the window hands its memory back** — the UI is not drawn inside the main
+process: a Flet desktop window is a **separate `flet.exe` process**, measured at
+**100-190 MB** on this machine. Nearly every program treats "close" as hiding the
+window (`visible = False`), and **not one byte of that memory goes back to the
+system** — leave it authenticating all day and open/close the window a few dozen
+times, and it just keeps sitting there. This client **destroys that front-end
+process outright** on close, so the memory is reclaimed on the spot:
+
+- Authentication never stops — the engine lives in the Python process, so losing
+  the window does not affect login, keepalives or traffic counters
+- The tray stays — the icon keeps changing colour and popping notifications;
+  double-click it to get the window back
+- Reopening takes about a second — a brand new window is built, with the last 200
+  log lines restored
+- Opt out — *Settings → Startup & window → Release interface memory on close*
+  gives you the old hide-instead behaviour
+
 ### Also included
 
 - **Tray icon** and close-to-tray (needs `pystray`; without it, "close"
   minimises instead of hiding, so the window can never get lost)
-- **Closing the window frees its memory**: the UI is a separate Flet client
-  process sitting on 100-190 MB, and hiding a window hands none of it back. So
-  closing destroys that process outright -- authentication and the tray keep
-  running, and clicking the tray icon rebuilds the window (about a second). Turn
-  it off under Settings -> Startup & window to get the old hide-instead behaviour
+- **Memory released on close** (detailed above) — the front-end process is
+  destroyed and rebuilt on demand from the tray
 - **Watchdog** (`--watchdog`): a supervisor outside the client that restarts it
   after a crash -- a fault inside a native library leaves no traceback and no
   log line -- and clears the orphaned window such a crash leaves behind. The
@@ -100,8 +114,10 @@ only under `Assets` in a release. Open the link, scroll to the bottom, expand
 
 - `JLU-DrCOM-NG-1.3.0-setup.exe` — Python + Flet build, **the most complete**
 
-Just run it. It uses a different AppId from the archived Dart build, so the two can
-coexist on one machine and share the same config without interfering.
+**If double-clicking does nothing, right-click → Run as administrator.** The
+installer writes into `C:\Program Files` and therefore asks for elevation; on an
+account where the UAC prompt is suppressed — or if the setup window **flashes and
+vanishes** — right-click and pick *Run as administrator*.
 
 The installers are not code-signed, so the first launch trips SmartScreen once
 ("Windows protected your PC / Unknown publisher") — click **More info → Run anyway**.

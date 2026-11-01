@@ -80,7 +80,7 @@
 本仓库的源码树里**不含**可直接双击运行的成品，`.exe` 只在 Releases 的 Assets 里。
 打开链接 → 拉到最下面 `Assets` → 点文件名下载。
 
-- `JLU-DrCOM-NG-1.2.0-setup.exe` —— Python + Flet 版，**功能最全**
+- `JLU-DrCOM-NG-1.3.0-setup.exe` —— Python + Flet 版，**功能最全**
 
 双击安装即可。它和归档的 Dart 版用的是不同的 AppId，同时装也不会打架、共用同一份配置。
 

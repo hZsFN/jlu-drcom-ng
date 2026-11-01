@@ -98,7 +98,7 @@ the source tree does **not** contain a ready-to-run binary; the `.exe` files liv
 only under `Assets` in a release. Open the link, scroll to the bottom, expand
 `Assets`, download the file.
 
-- `JLU-DrCOM-NG-1.2.0-setup.exe` — Python + Flet build, **the most complete**
+- `JLU-DrCOM-NG-1.3.0-setup.exe` — Python + Flet build, **the most complete**
 
 Just run it. It uses a different AppId from the archived Dart build, so the two can
 coexist on one machine and share the same config without interfering.

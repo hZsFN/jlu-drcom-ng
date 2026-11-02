@@ -329,6 +329,9 @@ def main(argv: list[str] | None = None) -> int:
         from drcom.ui import run_gui
 
         controller = AppController(data_dir=args.data_dir, log_level=args.log_level)
+        # The native core owns the tray icon when it is in use, so it has to
+        # know whether one is wanted before the session starts.
+        controller.enable_tray = not args.no_tray
         # Authenticate before the window exists.  The GUI is the slowest part
         # of a cold start, and there is no reason for the network to wait on it.
         controller.begin_session()

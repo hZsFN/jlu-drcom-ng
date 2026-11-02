@@ -30,11 +30,18 @@ if errorlevel 1 (
 )
 
 set "CFLAGS=/nologo /O2 /MT /W3 /utf-8 /D_CRT_SECURE_NO_WARNINGS"
-set "SRC=md4.c md5.c sha1.c protocol.c engine.c config_load.c main.c"
+set "SRC=md4.c md5.c sha1.c protocol.c engine.c config_load.c tray.c main.c"
 
 echo [build] %VSROOT%
+rem The tray icon is loaded from resources, so the .rc has to be compiled and
+rem then linked in.  Skipping it would give an installed daemon the generic
+rem Windows icon - nobody would know which tray entry was theirs.
+echo [build] compiling resources
+rc /nologo /fo drcomd.res drcomd.rc
+if errorlevel 1 exit /b 1
+
 echo [build] compiling drcomd.exe
-cl %CFLAGS% %SRC% /Fe:drcomd.exe
+cl %CFLAGS% %SRC% drcomd.res /Fe:drcomd.exe
 if errorlevel 1 exit /b 1
 
 echo [build] compiling tests

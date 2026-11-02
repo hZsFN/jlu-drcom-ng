@@ -45,3 +45,7 @@ native/tests/*.obj
 native/.vs/
 .vs/
 native/*.vcxproj.user
+
+# 资源编译产物
+native/*.res
+native/*-preview.png

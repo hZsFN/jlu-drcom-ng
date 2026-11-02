@@ -1056,11 +1056,17 @@ class DrcomApp:
                                         on_change=lambda e: (setattr(cfg.ui, "auto_login_on_launch", e.control.value), persist()))
         # Keep the memory claim honest: 100-190 MB is what flet.exe actually
         # holds on this machine, and the parenthetical is the price (a rebuild).
+        # With the native core this switch has nothing left to control -- the
+        # window process always exits on close -- so it is shown as locked
+        # rather than removed, which would look like a missing feature.
+        native_tray = self._native_core_active()
         release_ui = make_switch(
-            "关闭窗口时释放界面内存（约 100–190 MB，重新打开约需 1 秒）",
-            cfg.ui.release_ui_on_close,
+            "关闭窗口时释放界面内存（原生核心模式下界面进程整体退出）"
+            if native_tray
+            else "关闭窗口时释放界面内存（约 100–190 MB，重新打开约需 1 秒）",
+            cfg.ui.release_ui_on_close or native_tray,
             on_change=lambda e: (setattr(cfg.ui, "release_ui_on_close", e.control.value), persist()),
-            disabled=not tray_available(),
+            disabled=native_tray or not tray_available(),
         )
 
         # --- HUD / accessibility -------------------------------------------
@@ -1428,7 +1434,14 @@ class DrcomApp:
             if action == "ask":
                 note.value = "每次点关闭都会询问，并可选「记住我的选择」。"
             elif action == "tray":
-                if self.controller.config.ui.release_ui_on_close:
+                if self._native_core_active():
+                    # The window process really ends here; the icon belongs to
+                    # the core, so "close to tray" is now a complete exit.
+                    note.value = (
+                        "关闭即整个界面进程退出（只留约 1 MB 的原生核心），"
+                        "认证不断；点托盘图标可重新打开窗口。"
+                    )
+                elif self.controller.config.ui.release_ui_on_close:
                     note.value = (
                         "关闭即释放界面进程并退到托盘，可回收一百多 MB 内存；"
                         "认证继续在后台运行，双击托盘图标重新打开（约 1 秒）。"
@@ -1509,10 +1522,27 @@ class DrcomApp:
     # ------------------------------------------------------------------
     # tray / window
     # ------------------------------------------------------------------
+    def _native_core_active(self) -> bool:
+        """Is authentication delegated to drcomd.exe?
+
+        It matters here because the daemon also owns the tray icon in that
+        mode, so this process holds nothing the user needs after the window
+        goes away -- no engine, no icon -- and can therefore exit outright
+        instead of lingering to rebuild a window later.
+        """
+        from ..remote_engine import RemoteEngine
+
+        return isinstance(getattr(self.controller, "engine", None), RemoteEngine)
+
     def _setup_tray(self) -> None:
         # Idempotent: a rebuilt window must reuse the icon started by the first
         # one, or the old icon would be orphaned (and quit twice).
         if self._tray is not None:
+            return
+        if self._native_core_active():
+            # drcomd.exe owns it now.  A second icon would show up twice, and
+            # this one would vanish the moment the window closes -- which is
+            # exactly the thing the move was meant to fix.
             return
         if not tray_available():
             self.controller.log.warning(
@@ -1589,6 +1619,11 @@ class DrcomApp:
         """
         if self.page is None:
             return
+        if self._native_core_active():
+            # Nothing here outlives the window, so "close" can mean "end this
+            # process" -- which is the whole reason the tray moved into C.
+            self._leave_ui_to_core()
+            return
         if self._tray is None:
             self._minimize()
             return
@@ -1603,6 +1638,45 @@ class DrcomApp:
         except Exception:
             pass
         self._minimize()
+
+    def _leave_ui_to_core(self) -> None:
+        """Close the window by ending this process; drcomd keeps the session.
+
+        This is the native-core variant of "close to tray".  There is no tray
+        here any more (the daemon owns it) and no engine either, so keeping the
+        process alive would buy nothing: it would sit in the background with a
+        Flet client to rebuild and no way for the user to reach it.  Instead the
+        window closes, this process exits, and the icon the user clicks belongs
+        to the core that never stopped authenticating.
+        """
+        # Stand the supervisor down.  It restarts a client that exited by
+        # itself, so without this marker "close" would be undone five seconds
+        # later, forever.  It never supervised the core, which is the part that
+        # has to survive.
+        try:
+            from ..watchdog import StopMarker
+
+            StopMarker(self.controller.data_dir).write()
+        except Exception:
+            pass
+        self.controller.log.info(
+            "界面已关闭，认证由 drcomd 核心继续；托盘图标可以重新打开窗口。"
+        )
+        self.relaunch_wanted = False
+        try:
+            self.page.run_task(self._destroy_window_then_exit)
+        except Exception:
+            self._finish_quit_now()
+
+    async def _destroy_window_then_exit(self) -> None:
+        """Close the client window first, then end the process."""
+        try:
+            await self.page.window.destroy()
+        except Exception:
+            # The connection often dies *because* the window was destroyed --
+            # that is success, not failure.
+            pass
+        self._finish_quit_now()
 
     def _release_window(self) -> None:
         """Destroy the Flet client, keeping the engine and the tray alive.
@@ -1734,18 +1808,22 @@ class DrcomApp:
             label_style=ft.TextStyle(color=self.palette.text_dim, size=self.hud.size_body),
         )
 
-        tray_ok = self._tray is not None
+        tray_ok = self._tray is not None or self._native_core_active()
         release = self.controller.config.ui.release_ui_on_close
-        hint = (
-            (
+        if self._native_core_active():
+            hint = (
+                "关闭后整个界面进程退出，只留约 1 MB 的原生核心继续认证；"
+                "点托盘图标可以重新打开窗口。"
+            )
+        elif tray_ok:
+            hint = (
                 "关闭后界面进程会被释放（可回收一百多 MB 内存），认证继续在后台运行；"
                 "双击托盘图标可以重新打开窗口。"
                 if release
                 else "隐藏到托盘后，认证继续在后台运行，双击托盘图标可以再打开。"
             )
-            if tray_ok
-            else "未安装 pystray，无法隐藏到托盘，将改为最小化到任务栏。安装：pip install pystray"
-        )
+        else:
+            hint = "未安装 pystray，无法隐藏到托盘，将改为最小化到任务栏。安装：pip install pystray"
 
         def choose(action: str) -> None:
             if remember.value:
@@ -1781,8 +1859,10 @@ class DrcomApp:
             ),
             bgcolor=self.palette.panel,
             actions=[
-                self._button("最小化到托盘", lambda e: choose("tray"), primary=True,
-                             accent=self.palette.green, icon=ft.Icons.MINIMIZE),
+                self._button(
+                    "关闭界面、继续认证" if self._native_core_active() else "最小化到托盘",
+                    lambda e: choose("tray"), primary=True,
+                    accent=self.palette.green, icon=ft.Icons.MINIMIZE),
                 self._button("退出程序", lambda e: choose("quit"), accent=self.palette.amber,
                              icon=ft.Icons.POWER_SETTINGS_NEW),
                 self._button("取消", lambda e: self._close_dialog(), accent=self.palette.cyan),
@@ -2236,6 +2316,17 @@ class DrcomApp:
         except Exception:
             pass
         self.controller.shutdown()
+
+        # In native mode "quit" means the program, tray icon included: the core
+        # has to go too, or a windowless daemon would keep running with the very
+        # icon the user just tried to get rid of.  (Quitting from the tray menu
+        # arrives in C instead, which stops the daemon itself.)
+        native_quit = getattr(self.controller.engine, "shutdown_daemon", None)
+        if callable(native_quit):
+            try:
+                native_quit()
+            except Exception:
+                pass
 
         # Never let a wedged client keep the process (and port 61440) alive.
         # The event lets a completed shutdown stand the watchdog down, so it

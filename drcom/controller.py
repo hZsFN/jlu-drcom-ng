@@ -109,6 +109,10 @@ class AppController:
         )
 
         self.engine: AuthEngine | None = None
+        #: Whether a notification-area icon is wanted.  Only the native core
+        #: reads this (it owns the tray); the Python engine's tray lives in the
+        #: UI, which gets its own flag.  ``main.py`` sets it from ``--no-tray``.
+        self.enable_tray = True
         self.account: Account | None = None
         self.local_ip = ""
         self.last_error = ""
@@ -294,6 +298,7 @@ class AppController:
                     log=self.log,
                     stats=self.stats,
                     config_path=self.data_dir / "config.json",
+                    enable_tray=self.enable_tray,
                 )
             else:
                 self.engine = AuthEngine(

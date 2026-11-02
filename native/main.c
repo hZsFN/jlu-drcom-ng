@@ -17,12 +17,17 @@
  *   drcomd.exe --config %APPDATA%\JLU-DrCOM-NG\config.json --api-port 61441
  *   drcomd.exe --dry-run          # load config, print what it found, exit
  */
-#include "engine.h"
-#include "config.h"
-
+/* Winsock2 must come before windows.h: windows.h pulls in the ancient winsock.h,
+ * and the two then redefine ip_mreq and friends. */
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <shellapi.h>
+
+#include "engine.h"
+#include "config.h"
+#include "tray.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -30,6 +35,7 @@
 #include <process.h>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "shell32.lib")
 
 /* ------------------------------------------------------------- log ring */
 /* Sizing matters: this array is zero-initialised .data, so it is resident for
@@ -101,6 +107,100 @@ static void engine_event(void *user, const char *kind, const char *message,
     log_line(kind, message, detail);
 }
 
+/* ------------------------------------------------------------ tray glue */
+static const char *state_name(engine_state st);
+
+/*
+ * The tray callbacks run on the icon's own thread, where blocking is not an
+ * option: the menu would freeze.  They only record what the user asked for and
+ * let the main loop do it.
+ */
+enum { TRAY_CMD_NONE = 0, TRAY_CMD_SHOW = 1, TRAY_CMD_RECONNECT = 2, TRAY_CMD_QUIT = 3 };
+
+static volatile LONG g_tray_cmd = TRAY_CMD_NONE;
+static tray_t       *g_tray = NULL;
+
+static void tray_on_show(void *ctx)
+{
+    (void)ctx;
+    InterlockedExchange(&g_tray_cmd, TRAY_CMD_SHOW);
+}
+
+static void tray_on_reconnect(void *ctx)
+{
+    (void)ctx;
+    InterlockedExchange(&g_tray_cmd, TRAY_CMD_RECONNECT);
+}
+
+static void tray_on_quit(void *ctx)
+{
+    (void)ctx;
+    InterlockedExchange(&g_tray_cmd, TRAY_CMD_QUIT);
+}
+
+/* Path of the GUI, given on the command line by whoever started us. */
+static char g_gui_path[MAX_PATH];
+
+/*
+ * Launch the window.
+ *
+ * The daemon is started by the GUI, so the GUI's path has to come back to us
+ * somehow: the installer puts JLU-DrCOM-NG.exe one level above _internal, and a
+ * source checkout puts main.py in the parent of native/.  Try the recorded path
+ * first, then those two shapes.
+ */
+static int launch_gui(void)
+{
+    char candidate[MAX_PATH];
+    const char *paths[3];
+    int count = 0;
+
+    if (g_gui_path[0]) paths[count++] = g_gui_path;
+
+    char self[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, self, sizeof self);
+    if (n > 0 && n < sizeof self) {
+        char *slash = strrchr(self, '\\');
+        if (slash) {
+            *slash = '\0';
+            /* ...\_internal\drcomd.exe -> ...\JLU-DrCOM-NG.exe */
+            snprintf(candidate, sizeof candidate, "%s\\..\\JLU-DrCOM-NG.exe", self);
+            paths[count++] = candidate;
+        }
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (GetFileAttributesA(paths[i]) == INVALID_FILE_ATTRIBUTES) continue;
+        HINSTANCE rc = ShellExecuteA(NULL, "open", paths[i], NULL, NULL, SW_SHOWNORMAL);
+        if ((INT_PTR)rc > 32) return 1;
+        log_line("warn", "无法打开界面", paths[i]);
+    }
+    log_line("warn", "找不到界面程序 JLU-DrCOM-NG.exe", NULL);
+    return 0;
+}
+
+/* Refresh the hover text; only touches the shell when something changed. */
+static void tray_sync(engine_t *e, int *last_online, char *last_tip, size_t cap)
+{
+    if (!g_tray) return;
+    int online = engine_is_online(e);
+    char ip[16] = {0};
+    engine_get_ip(e, ip);
+
+    char tip[128];
+    if (online) {
+        snprintf(tip, sizeof tip, "JLU DrCOM NG · 已上线%s%s",
+                 ip[0] ? " · " : "", ip);
+    } else {
+        snprintf(tip, sizeof tip, "JLU DrCOM NG · %s",
+                 state_name(engine_get_state(e)));
+    }
+    if (online == *last_online && strcmp(tip, last_tip) == 0) return;
+    *last_online = online;
+    snprintf(last_tip, cap, "%s", tip);
+    tray_set_state(g_tray, online, tip);
+}
+
 /* ---------------------------------------------------------------- status */
 static const char *state_name(engine_state st)
 {
@@ -164,7 +264,7 @@ static void build_status_json(engine_t *e, const engine_config *cfg, char *out, 
     double timestamp = (double)(ticks / 10000000ULL) - 11644473600.0;
 
     snprintf(out, cap,
-             "{\"app\":\"JLU-DrCOM-NG\",\"core\":\"native\",\"version\":\"1.4.0-dev\","
+             "{\"app\":\"JLU-DrCOM-NG\",\"core\":\"native\",\"version\":\"2.0.0\","
              "\"state\":\"%s\",\"online\":%s,\"ip\":\"%s\",\"account\":\"%s\","
              "\"server\":\"%s\",\"uptime_seconds\":%.1f,"
              "\"last_reason\":\"%s\",\"consecutive_failures\":%d,"
@@ -407,6 +507,8 @@ static void usage(void)
     printf("drcomd - native Dr.COM keepalive core\n\n"
            "  --config <path>    settings file (default: %%APPDATA%%\\JLU-DrCOM-NG\\config.json)\n"
            "  --api-port <n>     status/control port (default: 61441)\n"
+           "  --gui <path>       window binary the tray menu should open\n"
+           "  --tray             show a notification-area icon (menu: open / reconnect / quit)\n"
            "  --no-api           run without the HTTP listener\n"
            "  --dry-run          load the config, print what was found, exit\n"
            "  --once             authenticate once and exit (no reconnect loop)\n"
@@ -417,13 +519,17 @@ int main(int argc, char **argv)
 {
     const char *config_path = NULL;
     int api_port = 0;              /* 0 = not given on the command line */
-    int no_api = 0, dry_run = 0, once = 0;
+    int no_api = 0, dry_run = 0, once = 0, want_tray = 0;
     char default_path[MAX_PATH];
     static char path_buf[MAX_PATH];
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) config_path = argv[++i];
         else if (strcmp(argv[i], "--api-port") == 0 && i + 1 < argc) api_port = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--gui") == 0 && i + 1 < argc) {
+            snprintf(g_gui_path, sizeof g_gui_path, "%s", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--tray") == 0) want_tray = 1;
         else if (strcmp(argv[i], "--no-api") == 0) no_api = 1;
         else if (strcmp(argv[i], "--dry-run") == 0) dry_run = 1;
         else if (strcmp(argv[i], "--once") == 0) once = 1;
@@ -489,6 +595,19 @@ int main(int argc, char **argv)
         api = (HANDLE)_beginthreadex(NULL, 0, api_thread, &ctx, 0, NULL);
     }
 
+    int last_online = -1;
+    char last_tip[128] = {0};
+    if (want_tray && !dry_run) {
+        g_tray = tray_create(tray_on_show, tray_on_reconnect, tray_on_quit, NULL);
+        if (g_tray) {
+            log_line("info", "托盘图标已就绪", NULL);
+        } else {
+            /* Not fatal: without Explorer there is nowhere to put an icon, and
+             * the daemon still authenticates. */
+            log_line("warn", "托盘图标创建失败（资源管理器没在跑？）", NULL);
+        }
+    }
+
     if (once) {
         /* Wait for a terminal state, then leave. */
         while (!g_stop) {
@@ -502,10 +621,28 @@ int main(int argc, char **argv)
         }
     } else {
         printf("drcomd 运行中（Ctrl+C 退出）\n");
-        while (!g_stop) Sleep(200);
+        while (!g_stop) {
+            tray_sync(e, &last_online, last_tip, sizeof last_tip);
+            LONG cmd = InterlockedExchange(&g_tray_cmd, TRAY_CMD_NONE);
+            if (cmd == TRAY_CMD_SHOW) {
+                launch_gui();
+            } else if (cmd == TRAY_CMD_RECONNECT) {
+                if (engine_is_running(e)) { engine_stop(e); engine_join(e, 5000); }
+                if (engine_start(e) != 0) {
+                    log_line("warn", "重新连接失败（上一个线程还没退出）", NULL);
+                }
+            } else if (cmd == TRAY_CMD_QUIT) {
+                break;
+            }
+            /* 200 ms is the same cadence the API thread uses; both are far below
+             * the cost of a keepalive packet, so this does not register on CPU. */
+            Sleep(200);
+        }
     }
 
     printf("正在退出…\n");
+    tray_destroy(g_tray);
+    g_tray = NULL;
     engine_stop(e);
     engine_join(e, 4000);
     if (api) { WaitForSingleObject(api, 2000); CloseHandle(api); }

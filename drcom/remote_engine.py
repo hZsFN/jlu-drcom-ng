@@ -34,7 +34,7 @@ from .engine import EngineEvent, EngineState, Listener, OfflineReason
 from .logbus import LogBus
 from .stats import StatsStore
 
-__all__ = ["RemoteEngine", "DEFAULT_API_PORT", "daemon_path", "daemon_is_up"]
+__all__ = ["RemoteEngine", "DEFAULT_API_PORT", "daemon_path", "daemon_is_up", "gui_path"]
 
 #: Loopback port the native core listens on.  Fixed rather than dynamic so the
 #: GUI can find a daemon it did not start (autostart, previous run, watchdog).
@@ -82,6 +82,18 @@ def daemon_is_up(port: int = DEFAULT_API_PORT) -> bool:
     return _request(port, "/health", timeout=0.6) is not None
 
 
+def gui_path() -> str | None:
+    """Path of the window binary, for the tray menu to reopen it.
+
+    Only meaningful in a frozen build: from source there is no single file to
+    launch (the window is ``python main.py``), so we say nothing and let the
+    daemon try the layout it knows about.
+    """
+    if getattr(sys, "frozen", False):
+        return str(Path(sys.executable).resolve())
+    return None
+
+
 class RemoteEngine:
     """Talks to drcomd instead of doing the protocol work itself."""
 
@@ -95,6 +107,7 @@ class RemoteEngine:
         stats: StatsStore | None = None,
         api_port: int = DEFAULT_API_PORT,
         config_path: Path | None = None,
+        enable_tray: bool = True,
     ) -> None:
         self.config = config
         self.account = account
@@ -102,6 +115,9 @@ class RemoteEngine:
         self.log = log
         self.stats = stats
         self.api_port = api_port
+        #: Whether the daemon should put up a notification-area icon.  False in
+        #: web mode and with ``--no-tray``, where nothing would ever click it.
+        self.enable_tray = enable_tray
         #: The daemon reads the very same config.json, so it must be told where
         #: that file is (portable installs and tests both move it).
         self.config_path = Path(config_path) if config_path else None
@@ -200,6 +216,13 @@ class RemoteEngine:
 
             config_file = default_data_dir() / "config.json"
         args = [str(exe), "--config", str(config_file), "--api-port", str(self.api_port)]
+        # The icon belongs to the core, not to this process: that is what lets
+        # the window close without taking the tray (or the session) with it.
+        if self.enable_tray:
+            args.append("--tray")
+            window = gui_path()
+            if window:
+                args += ["--gui", window]
         creation = 0
         if sys.platform == "win32":
             # Detach: the daemon must outlive the window, so no console and no
@@ -250,6 +273,17 @@ class RemoteEngine:
                 self._process.kill()
             self._process = None
         self.start()
+
+    def shutdown_daemon(self) -> None:
+        """Ask the resident core to exit.
+
+        Closing the window must *not* do this -- the whole point of the split is
+        that the session outlives the window.  This is for the explicit "quit"
+        path, where the user means the program, tray icon included.  When the
+        tray menu is used instead, the daemon stops itself from C and this is
+        never called.
+        """
+        _request(self.api_port, "/shutdown", method="POST", timeout=2.0)
 
     # -- polling ---------------------------------------------------------
     def _poll_loop(self) -> None:

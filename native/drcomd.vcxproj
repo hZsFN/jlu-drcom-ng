@@ -101,6 +101,7 @@
     <ClCompile Include="protocol.c" />
     <ClCompile Include="engine.c" />
     <ClCompile Include="config_load.c" />
+    <ClCompile Include="tray.c" />
     <ClCompile Include="main.c" />
   </ItemGroup>
   <ItemGroup>
@@ -110,12 +111,17 @@
     <ClInclude Include="protocol.h" />
     <ClInclude Include="engine.h" />
     <ClInclude Include="config.h" />
+    <ClInclude Include="tray.h" />
+    <ClInclude Include="resource.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="tests\mock_server.py" />
     <None Include="tests\test_hash.c" />
     <None Include="tests\test_protocol.c" />
     <None Include="tests\test_engine.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="drcomd.rc" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

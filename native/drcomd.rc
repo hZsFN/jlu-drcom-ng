@@ -1,0 +1,11 @@
+// drcomd.rc - icons compiled into the daemon.
+//
+// The tray icon is the daemon's own: when the window is closed the core is all
+// that is left, and it needs a face in the notification area.  Two versions
+// because the colour of the dot is the whole point - green means the session is
+// up, grey means it is not, and the user should not have to open the menu to
+// find out.
+#include "resource.h"
+
+IDI_APP_ONLINE  ICON "app-online.ico"
+IDI_APP_OFFLINE ICON "app-offline.ico"

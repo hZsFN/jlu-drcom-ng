@@ -162,9 +162,19 @@ python main.py
 On the **Account** page:
 
 1. Enter your student ID
-2. Click **Detect MAC** (or type it as `AA:BB:CC:DD:EE:FF`)
+2. Enter the MAC — **any value works, as long as it matches the one registered when
+   your network account was opened**; a physical NIC address (wired or wireless) is
+   the sensible choice, not a virtual adapter's. **Detect MAC** picks a relevant
+   interface for you; check that it is the one you actually use
 3. Enter your password
 4. Save
+
+> The server only compares that string against the one registered for your account.
+> It **does not check whether it is the real hardware address of a NIC in your
+> machine**. So swapping a NIC, reinstalling Windows or running in a VM does not
+> require touching the registration — just keep typing the registered value. Get it
+> wrong (or pick a different adapter's) and authentication fails with "MAC not
+> bound".
 
 The password is encrypted immediately and never lands on disk in clear text.
 

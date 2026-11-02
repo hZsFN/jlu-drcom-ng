@@ -754,6 +754,14 @@ class DrcomApp:
                                     hint="例如 2023xxxxxxxx")
         mac_field = self._field("网卡 MAC", account.mac if account else "",
                                 hint="AA:BB:CC:DD:EE:FF")
+        # 这一条别的客户端从来不说，害得很多人以为必须填「本机真实 MAC」，
+        # 其实服务器只拿这串去比对开户时登记的那一个。
+        mac_note = self._text(
+            "填什么都行，只要和开网时登记的那一个一致就能认证过；"
+            "建议填自己物理网卡（有线或无线）的地址，别用虚拟网卡的。",
+            color=self.palette.text_dim,
+            size=self.hud.size_micro,
+        )
         label_field = self._field("备注名（可选）", account.label if account else "", hint="例如 宿舍以太网")
         password_field = self._field("密码", "", hint="留空表示不修改", password=True)
 
@@ -829,6 +837,7 @@ class DrcomApp:
                             ),
                             account_field,
                             mac_field,
+                            mac_note,
                             label_field,
                             password_field,
                             auto_switch,

@@ -199,3 +199,25 @@ def test_detected_interface_has_a_mac_when_one_exists() -> None:
     picked = pick_relevant_interface(server="10.100.61.3", port=61440)
     assert picked is not None
     assert picked.mac, f"picked {picked.label!r}, which has no MAC"
+
+
+def test_account_view_says_the_mac_need_not_be_your_own(guarded, controller) -> None:
+    """Pin the note under the MAC field.
+
+    Users routinely assume the value has to be the hardware address of a NIC in
+    this machine, then go hunting for ways to spoof it.  The server only compares
+    the string with the one registered for the account, so the window has to say
+    so.  Asserting on the rendered tree (not the source) keeps the note from
+    being dropped by a refactor of the account view.
+    """
+    from drcom.ui.app import DrcomApp
+
+    app = DrcomApp(controller, enable_tray=False)
+    app.page = FakePage()
+    app.view_host = None
+
+    texts = [getattr(c, "value", "") for c in walk(app._build_view("账号"))]
+    joined = "\n".join(t for t in texts if isinstance(t, str))
+
+    assert "开网时登记" in joined, joined
+    assert "物理网卡" in joined, joined

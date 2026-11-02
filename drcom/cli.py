@@ -64,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # `set` subcommand options
     parser.add_argument("--account", help="学号/账号")
-    parser.add_argument("--mac", help="网卡 MAC，形如 AA:BB:CC:DD:EE:FF")
+    parser.add_argument("--mac", help="网卡 MAC，形如 AA:BB:CC:DD:EE:FF（与开网时登记的一致即可）")
     parser.add_argument("--password", help="密码（写入时立即加密，不会明文落盘）")
     parser.add_argument("--label", help="账号备注名")
     parser.add_argument("--auto-login", action="store_true", help="启动时自动登录该账号")

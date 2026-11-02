@@ -68,22 +68,24 @@ system**.
 
 This client splits "authenticating" from "showing things" completely:
 
-- Authentication runs in **`drcomd.exe`** — a 220 KB native core with about
+- Authentication runs in **`drcomd.exe`** — a 268 KB native core with about
   **1 MB of private memory**. It keeps the session alive on its own; no window is
   involved, and it works whether or not one is ever opened
-- Closing the window really ends the UI process: those 100-190 MB go back to the
-  system immediately, and the session does not blink
-- Open it again from the shortcut (or the tray) and the new window reconnects to
-  the core that never stopped — state, logs and traffic are there at once, with no
-  "logging in again" gap
-- Opt out — *Settings → Startup & window → Release interface memory on close*
-  gives you the old hide-instead behaviour
+- **The tray icon belongs to it too.** So closing the window ends the whole UI
+  process (`flet.exe` included): those 100-190 MB go back to the system at once,
+  the session does not blink, and nothing is left in the background waiting to
+  rebuild a window
+- Open it again from the tray icon (or the shortcut) and the new window reconnects
+  to the core that never stopped — state, logs and traffic are there at once, with
+  no "logging in again" gap
+- The dot on the icon is the state: **green = online, grey = not**; right-click
+  for *open window / reconnect / quit*
 
 | Moment | Resident |
 | --- | --- |
 | Window open | UI (including the flet front end) + 1 MB core |
-| Window closed, tray alive | UI process gone: tray + 1 MB core |
-| Everything closed | **just `drcomd.exe`, about 1 MB** |
+| Window closed | **just `drcomd.exe` plus the tray icon, about 1 MB** |
+| "Quit" from the tray menu | nothing |
 
 (If the native core was never built — running from source without executing
 `native\build.bat` — the app falls back to the in-process Python engine. Same
@@ -91,7 +93,7 @@ features, without the memory win above.)
 
 ### Also included
 
-- **Tray icon** and close-to-tray (needs `pystray`; without it, "close"
+- **Tray icon** (provided by the native core; the Python fallback uses `pystray`, and without it "close"
   minimises instead of hiding, so the window can never get lost)
 - **Native auth core** (`drcomd.exe`) — authentication is fully decoupled from
   the UI: closing the window frees the whole interface and leaves about 1 MB
@@ -265,8 +267,8 @@ capture.
 - "Log out" is not a real logout packet — this Dr.COM variant has none. It stops
   the keepalives and closes the socket; the server releases the session on
   timeout. The UI says so rather than pretending otherwise.
-- The tray needs `pystray`. Flet has no tray control, so without it the app
-  minimises rather than hiding.
+- The tray icon comes from the native core. The Python fallback needs
+  `pystray`; without it the app minimises rather than hiding.
 - After the window is released, reopening rebuilds it and takes about a second.
   Authentication and keepalives run throughout — only the window is gone.
 - The interface is dark-only, which is what a HUD needs. A high-contrast variant

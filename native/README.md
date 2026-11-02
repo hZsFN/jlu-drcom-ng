@@ -1,6 +1,6 @@
 # drcomd —— 原生认证核心
 
-认证与保活的原生实现，用 C 写，编译出约 220 KB 的 `drcomd.exe`。界面（Python +
+认证与保活的原生实现，用 C 写，编译出约 268 KB 的 `drcomd.exe`。界面（Python +
 Flet）只是这个进程的客户端，关掉窗口不影响登录。
 
 **为什么要有它**：原来认证跑在 Python 主进程里，主进程又拖着 Flet 前端（`flet.exe`

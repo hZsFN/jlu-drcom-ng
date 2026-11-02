@@ -34,3 +34,14 @@ pubspec_overrides.yaml
 # 本地备份与一次性脚本（不进仓库）
 *.bak-*
 tools/swap-readme-*.py
+
+# 原生核心的构建产物（源码在 native/，二进制不入库）
+native/obj/
+native/bin/
+native/*.obj
+native/drcomd.exe
+native/tests/*.exe
+native/tests/*.obj
+native/.vs/
+.vs/
+native/*.vcxproj.user

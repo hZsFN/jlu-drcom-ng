@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -43,12 +44,37 @@ def run(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
                           encoding="utf-8", errors="replace", check=check)
 
 
-def current_version() -> str:
+def tag_version() -> str:
     """The version from the newest tag, e.g. ``v1.0.0`` -> ``1.0.0``."""
     tag = run(["git", "describe", "--tags", "--abbrev=0"]).stdout.strip()
-    if not tag:
-        raise SystemExit("no git tag found; tag the release commit first")
     return tag.lstrip("v")
+
+
+def source_version() -> str:
+    """``__version__`` from drcom/__init__.py, the single source of truth."""
+    init = ROOT / "drcom" / "__init__.py"
+    match = re.search(r'__version__\s*=\s*"([^"]+)"', init.read_text(encoding="utf-8"))
+    return match.group(1) if match else ""
+
+
+def current_version() -> str:
+    """Prefer drcom/__init__.py over the tag.
+
+    The tag is moved to the release commit *after* the build, so reading it first
+    names the artefacts after the previous version -- exactly what happened on
+    2026-10-31 (a "1.1.0" installer containing 1.2.0 code) and again on
+    2026-11-02 (a "1.3.0" bundle built from 2.0.0 sources).
+    """
+    tv, sv = tag_version(), source_version()
+    if tv and sv and tv != sv:
+        print(
+            f"note: git tag says {tv}, drcom/__init__.py says {sv} — using the source version",
+            file=sys.stderr,
+        )
+    version = sv or tv
+    if not version:
+        raise SystemExit("cannot determine version: no git tag and no __version__ in drcom/__init__.py")
+    return version
 
 
 def ensure_clean() -> None:

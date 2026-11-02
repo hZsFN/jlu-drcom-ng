@@ -152,6 +152,11 @@ class AuthConfig:
     #: Off by default — with one cable plugged in, the wildcard is right the
     #: first time and each extra candidate only costs a wasted timeout.
     auto_interface_fallback: bool = False
+    #: Run the authentication core as the native drcomd.exe instead of this
+    #: process.  The window can then be closed for real: the daemon keeps the
+    #: session alive for ~1 MB, where the Python core needs ~30 MB and the GUI
+    #: another ~90 MB.  Set to False to fall back to the in-process engine.
+    native_core: bool = True
 
 
 @dataclass

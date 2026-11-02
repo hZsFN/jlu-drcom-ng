@@ -273,13 +273,36 @@ class AppController:
             self.account = account
             self.last_error = ""
             self.last_advice = ""
-            self.engine = AuthEngine(
-                config=self.config,
-                account=account,
-                password=password,
-                log=self.log,
-                stats=self.stats,
-            )
+            native = self.config.auth.native_core
+            if native:
+                from .remote_engine import daemon_path
+
+                if daemon_path() is None:
+                    # Installed build is missing the core, or a source checkout
+                    # never ran nativeuild.bat.  Degrade instead of failing.
+                    self.log.warning("找不到 drcomd.exe，回退到内置 Python 核心")
+                    native = False
+
+            if native:
+                # Native core: the window may close, the session stays up.
+                from .remote_engine import RemoteEngine
+
+                self.engine = RemoteEngine(
+                    config=self.config,
+                    account=account,
+                    password=password,
+                    log=self.log,
+                    stats=self.stats,
+                    config_path=self.data_dir / "config.json",
+                )
+            else:
+                self.engine = AuthEngine(
+                    config=self.config,
+                    account=account,
+                    password=password,
+                    log=self.log,
+                    stats=self.stats,
+                )
             self.engine.subscribe(self._on_engine_event)
             self.engine.start()
         self.log.info("用户请求登录")

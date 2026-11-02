@@ -191,6 +191,21 @@ def build(*, onefile: bool = False, name: str = "JLU-DrCOM-NG", console: bool = 
     if icon.exists():
         arguments += ["--icon", str(icon)]
 
+    # The resident core.  It lives in _internal/ next to everything else, which
+    # is where drcom/remote_engine.py::daemon_path() looks for it.  Without it the
+    # app still runs, just with the fatter in-process Python engine.
+    native_core = ROOT / "native" / "drcomd.exe"
+    if native_core.exists():
+        separator = ";" if sys.platform == "win32" else ":"
+        arguments += ["--add-binary", f"{native_core}{separator}."]
+        print(f"bundling native core: drcomd.exe ({native_core.stat().st_size / 1024:.0f} KB)")
+    else:
+        print(
+            "WARNING: native/drcomd.exe is missing (run native/build.bat).\n"
+            "         The app will fall back to the in-process Python core.",
+            file=sys.stderr,
+        )
+
     for extra in ("README.md", "README_EN.md"):
         path = ROOT / extra
         if path.exists():

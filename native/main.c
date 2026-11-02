@@ -151,29 +151,39 @@ static char g_gui_path[MAX_PATH];
  */
 static int launch_gui(void)
 {
-    char candidate[MAX_PATH];
-    const char *paths[3];
+    /* Wide strings throughout: the install path may sit under a user name that
+     * the ANSI code page cannot represent, and ShellExecuteA would then fail
+     * with a perfectly good path. */
+    WCHAR candidate[MAX_PATH];
+    WCHAR self[MAX_PATH];
+    const WCHAR *paths[3];
+    WCHAR given[MAX_PATH];
     int count = 0;
 
-    if (g_gui_path[0]) paths[count++] = g_gui_path;
+    if (g_gui_path[0]) {
+        given[0] = L'\0';
+        if (MultiByteToWideChar(CP_UTF8, 0, g_gui_path, -1, given, MAX_PATH) > 0) {
+            paths[count++] = given;
+        }
+    }
 
-    char self[MAX_PATH];
-    DWORD n = GetModuleFileNameA(NULL, self, sizeof self);
-    if (n > 0 && n < sizeof self) {
-        char *slash = strrchr(self, '\\');
+    DWORD n = GetModuleFileNameW(NULL, self, (DWORD)ARRAYSIZE(self));
+    if (n > 0 && n < ARRAYSIZE(self)) {
+        WCHAR *slash = wcsrchr(self, L'\\');
         if (slash) {
-            *slash = '\0';
+            *slash = L'\0';
             /* ...\_internal\drcomd.exe -> ...\JLU-DrCOM-NG.exe */
-            snprintf(candidate, sizeof candidate, "%s\\..\\JLU-DrCOM-NG.exe", self);
-            paths[count++] = candidate;
+            if (swprintf(candidate, ARRAYSIZE(candidate), L"%s\\..\\JLU-DrCOM-NG.exe", self) > 0) {
+                paths[count++] = candidate;
+            }
         }
     }
 
     for (int i = 0; i < count; i++) {
-        if (GetFileAttributesA(paths[i]) == INVALID_FILE_ATTRIBUTES) continue;
-        HINSTANCE rc = ShellExecuteA(NULL, "open", paths[i], NULL, NULL, SW_SHOWNORMAL);
+        if (GetFileAttributesW(paths[i]) == INVALID_FILE_ATTRIBUTES) continue;
+        HINSTANCE rc = ShellExecuteW(NULL, L"open", paths[i], NULL, NULL, SW_SHOWNORMAL);
         if ((INT_PTR)rc > 32) return 1;
-        log_line("warn", "无法打开界面", paths[i]);
+        log_line("warn", "无法打开界面（ShellExecute 失败）", NULL);
     }
     log_line("warn", "找不到界面程序 JLU-DrCOM-NG.exe", NULL);
     return 0;

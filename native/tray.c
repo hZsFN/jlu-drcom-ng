@@ -11,6 +11,13 @@
  * installer has to carry a .ico and rc.exe has to be called by build.bat.  If the
  * resource is missing we fall back to the stock application icon rather than
  * leaving the user with an invisible entry.
+ *
+ * Everything goes through the *wide* Win32 API.  The source file is UTF-8, but
+ * the ANSI entry points (AppendMenuA, Shell_NotifyIconA, DefWindowProcA) decode
+ * their arguments using the process ANSI code page, which on a Chinese system is
+ * GBK: passing UTF-8 bytes gave a right-click menu full of mojibake.  Text
+ * coming in from the rest of the program is UTF-8, so it is converted on the way
+ * in with MultiByteToWideChar.
  */
 #include "tray.h"
 
@@ -42,7 +49,7 @@ struct tray {
     int online;
     int visible;
     UINT taskbar_created_msg;
-    char tooltip[128];
+    WCHAR tooltip[128];
     tray_show_fn on_show;
     tray_reconnect_fn on_reconnect;
     tray_quit_fn on_quit;
@@ -54,22 +61,36 @@ struct tray {
  * pointer must already be stored). */
 static tray_t *g_tray = NULL;
 
+/* UTF-8 -> UTF-16, in place into a fixed buffer.  Returns dst always. */
+static WCHAR *wide(const char *src, WCHAR *dst, size_t cap)
+{
+    if (cap == 0) return dst;
+    dst[0] = L'\0';
+    if (!src) return dst;
+    int n = MultiByteToWideChar(CP_UTF8, 0, src, -1, dst, (int)cap);
+    if (n <= 0) dst[0] = L'\0';      /* not valid UTF-8: show nothing rather
+                                      * than half-decoded bytes */
+    return dst;
+}
+
 static HICON load_icon(int which)
 {
     /* The exe carries a multi-size icon; the shell picks the right size. */
-    HICON icon = (HICON)LoadImageA(GetModuleHandleA(NULL),
-                                   MAKEINTRESOURCEA(which),
+    HICON icon = (HICON)LoadImageW(GetModuleHandleW(NULL),
+                                   MAKEINTRESOURCEW(which),
                                    IMAGE_ICON, 0, 0,
                                    LR_DEFAULTSIZE | LR_SHARED);
     if (!icon) {
-        icon = LoadIconA(NULL, IDI_APPLICATION);
+        /* 32512 == IDI_APPLICATION.  Spelled as a resource id because
+         * IDI_APPLICATION is the ANSI macro unless UNICODE is defined. */
+        icon = LoadIconW(NULL, MAKEINTRESOURCEW(32512));
     }
     return icon;
 }
 
 static void add_icon(tray_t *t)
 {
-    NOTIFYICONDATAA nid;
+    NOTIFYICONDATAW nid;
     memset(&nid, 0, sizeof nid);
     nid.cbSize = sizeof nid;
     nid.hWnd = t->hwnd;
@@ -77,25 +98,25 @@ static void add_icon(tray_t *t)
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY_CALLBACK;
     nid.hIcon = t->online ? t->icon_online : t->icon_offline;
-    snprintf(nid.szTip, sizeof nid.szTip, "%s", t->tooltip);
-    if (Shell_NotifyIconA(NIM_ADD, &nid)) {
+    wcsncpy(nid.szTip, t->tooltip, ARRAYSIZE(nid.szTip) - 1);
+    if (Shell_NotifyIconW(NIM_ADD, &nid)) {
         t->visible = 1;
         /* Windows 2000-era icons are 32x32 unless we say otherwise; ask for the
          * modern behaviour so the icon is not a blurry upscale on high DPI. */
         nid.uVersion = NOTIFYICON_VERSION_4;
-        Shell_NotifyIconA(NIM_SETVERSION, &nid);
+        Shell_NotifyIconW(NIM_SETVERSION, &nid);
     }
 }
 
 static void remove_icon(tray_t *t)
 {
     if (!t->visible) return;
-    NOTIFYICONDATAA nid;
+    NOTIFYICONDATAW nid;
     memset(&nid, 0, sizeof nid);
     nid.cbSize = sizeof nid;
     nid.hWnd = t->hwnd;
     nid.uID = TRAY_ICON_ID;
-    Shell_NotifyIconA(NIM_DELETE, &nid);
+    Shell_NotifyIconW(NIM_DELETE, &nid);
     t->visible = 0;
 }
 
@@ -104,10 +125,10 @@ static void show_menu(tray_t *t)
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
 
-    AppendMenuA(menu, MF_STRING, CMD_SHOW, "打开窗口(&O)");
-    AppendMenuA(menu, MF_STRING, CMD_RECONNECT, "重新连接(&R)");
-    AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuA(menu, MF_STRING, CMD_QUIT, "退出(&Q)");
+    AppendMenuW(menu, MF_STRING, CMD_SHOW, L"打开窗口(&O)");
+    AppendMenuW(menu, MF_STRING, CMD_RECONNECT, L"重新连接(&R)");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, CMD_QUIT, L"退出(&Q)");
 
     POINT pt;
     GetCursorPos(&pt);
@@ -117,7 +138,7 @@ static void show_menu(tray_t *t)
     SetForegroundWindow(t->hwnd);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
                    pt.x, pt.y, 0, t->hwnd, NULL);
-    PostMessageA(t->hwnd, WM_NULL, 0, 0);
+    PostMessageW(t->hwnd, WM_NULL, 0, 0);
     DestroyMenu(menu);
 }
 
@@ -166,34 +187,34 @@ static LRESULT CALLBACK tray_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
     }
-    return DefWindowProcA(hwnd, msg, wp, lp);
+    return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 static unsigned __stdcall tray_thread(void *arg)
 {
     tray_t *t = arg;
 
-    WNDCLASSA wc;
+    WNDCLASSW wc;
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = tray_wndproc;
-    wc.hInstance = GetModuleHandleA(NULL);
-    wc.lpszClassName = "DrcomdTrayWindow";
-    RegisterClassA(&wc);
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.lpszClassName = L"DrcomdTrayWindow";
+    RegisterClassW(&wc);
 
     /* A real (if invisible) window rather than HWND_MESSAGE: message-only
      * windows do not receive the TaskbarCreated broadcast. */
-    t->hwnd = CreateWindowExA(0, wc.lpszClassName, "drcomd",
+    t->hwnd = CreateWindowExW(0, wc.lpszClassName, L"drcomd",
                               WS_OVERLAPPED, 0, 0, 0, 0,
                               NULL, NULL, wc.hInstance, NULL);
     if (!t->hwnd) return 1;
 
-    t->taskbar_created_msg = RegisterWindowMessageA("TaskbarCreated");
+    t->taskbar_created_msg = RegisterWindowMessageW(L"TaskbarCreated");
     add_icon(t);
 
     MSG msg;
-    while (GetMessageA(&msg, NULL, 0, 0) > 0) {
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
-        DispatchMessageA(&msg);
+        DispatchMessageW(&msg);
     }
 
     remove_icon(t);
@@ -212,7 +233,7 @@ tray_t *tray_create(tray_show_fn on_show, tray_reconnect_fn on_reconnect,
     t->on_quit = on_quit;
     t->ctx = ctx;
     t->online = 0;
-    t->tooltip[0] = '\0';
+    t->tooltip[0] = L'\0';
     t->icon_online = load_icon(IDI_APP_ONLINE);
     t->icon_offline = load_icon(IDI_APP_OFFLINE);
 
@@ -230,40 +251,40 @@ void tray_set_state(tray_t *t, int online, const char *tooltip)
 {
     if (!t) return;
     t->online = online ? 1 : 0;
-    if (tooltip) snprintf(t->tooltip, sizeof t->tooltip, "%s", tooltip);
+    if (tooltip) wide(tooltip, t->tooltip, ARRAYSIZE(t->tooltip));
 
     if (!t->hwnd) return;
-    NOTIFYICONDATAA nid;
+    NOTIFYICONDATAW nid;
     memset(&nid, 0, sizeof nid);
     nid.cbSize = sizeof nid;
     nid.hWnd = t->hwnd;
     nid.uID = TRAY_ICON_ID;
     nid.uFlags = NIF_ICON | NIF_TIP;
     nid.hIcon = t->online ? t->icon_online : t->icon_offline;
-    snprintf(nid.szTip, sizeof nid.szTip, "%s", t->tooltip);
+    wcsncpy(nid.szTip, t->tooltip, ARRAYSIZE(nid.szTip) - 1);
     /* Fails harmlessly if the icon is not up yet (thread still starting). */
-    Shell_NotifyIconA(NIM_MODIFY, &nid);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
 void tray_notify(tray_t *t, const char *title, const char *text, int warning)
 {
     if (!t || !t->hwnd || !t->visible) return;
-    NOTIFYICONDATAA nid;
+    NOTIFYICONDATAW nid;
     memset(&nid, 0, sizeof nid);
     nid.cbSize = sizeof nid;
     nid.hWnd = t->hwnd;
     nid.uID = TRAY_ICON_ID;
     nid.uFlags = NIF_INFO;
     nid.dwInfoFlags = warning ? NIIF_WARNING : NIIF_INFO;
-    snprintf(nid.szInfoTitle, sizeof nid.szInfoTitle, "%s", title ? title : "");
-    snprintf(nid.szInfo, sizeof nid.szInfo, "%s", text ? text : "");
-    Shell_NotifyIconA(NIM_MODIFY, &nid);
+    wide(title, nid.szInfoTitle, ARRAYSIZE(nid.szInfoTitle));
+    wide(text, nid.szInfo, ARRAYSIZE(nid.szInfo));
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
 void tray_destroy(tray_t *t)
 {
     if (!t) return;
-    if (t->hwnd) PostMessageA(t->hwnd, WM_CLOSE, 0, 0);
+    if (t->hwnd) PostMessageW(t->hwnd, WM_CLOSE, 0, 0);
     if (t->thread) {
         WaitForSingleObject(t->thread, 3000);
         CloseHandle(t->thread);

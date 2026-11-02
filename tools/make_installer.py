@@ -72,10 +72,19 @@ def source_version() -> str | None:
 
 
 def current_version() -> str:
+    """Prefer drcom/__init__.py: it is the single source of truth for the version.
+
+    The tag only becomes correct *after* the release is cut, which happens after
+    this script has already produced the installer.  Reading the tag first is what
+    produced a 1.1.0-named installer containing 1.2.0 code on 2026-10-31.
+    """
     tv, sv = tag_version(), source_version()
     if tv and sv and tv != sv:
-        print(f"warning: git tag says {tv}, drcom/__init__.py says {sv} — using git tag", file=sys.stderr)
-    version = tv or sv
+        print(
+            f"note: git tag says {tv}, drcom/__init__.py says {sv} — using the source version",
+            file=sys.stderr,
+        )
+    version = sv or tv
     if not version:
         raise SystemExit("cannot determine version: no git tag and no __version__ in drcom/__init__.py")
     return version

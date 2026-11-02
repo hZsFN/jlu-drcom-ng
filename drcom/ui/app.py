@@ -1139,6 +1139,28 @@ class DrcomApp:
             self._flash("探测设置已保存", True)
 
         # --- advanced protocol ---------------------------------------------
+        # 原生核心是 2.0 的新默认。它第一次在真实校园网上跑的时候，谁也不敢保证
+        # 和 Python 引擎逐字节等价，所以这里必须留一个能立刻退回去的开关 ——
+        # 断网的时候人是没法翻配置文件改的。
+        from ..remote_engine import daemon_path
+
+        native_present = daemon_path() is not None
+        native_core = make_switch(
+            "使用原生认证核心（drcomd.exe，常驻约 1 MB）",
+            cfg.auth.native_core,
+            on_change=lambda e: (setattr(cfg.auth, "native_core", e.control.value), persist()),
+            disabled=not native_present,
+        )
+        native_note = self._text(
+            ("开着：认证跑在独立的 drcomd.exe 里，关掉窗口它也继续工作；重新打开窗口会接回"
+             "原来那个会话，不会重新登录。关掉：认证和界面在同一个进程里，关掉窗口就一起退出。"
+             "改完下次点「登录」时生效。")
+            if native_present else
+            "找不到 drcomd.exe，只能用内置的 Python 认证核心（功能一样，只是常驻内存高一些）。",
+            color=self.palette.text_dim,
+            size=self.hud.size_micro,
+        )
+
         alt_port = make_switch(
             "允许备选源端口自愈（61440 被占用时改用邻近端口）",
             cfg.auth.allow_alternate_port,
@@ -1232,7 +1254,9 @@ class DrcomApp:
                                        ft.Row([self._button("保存协议参数", save_protocol, accent=self.palette.amber),
                                                self._button("查看本机可选地址", detect_bindable, accent=self.palette.cyan,
                                                             icon=ft.Icons.SEARCH)], spacing=10, wrap=True),
-                                       alt_port],
+                                       alt_port,
+                                       native_core,
+                                       native_note],
                                       spacing=self.hud.gap), title="协议参数（高级）"),
             ],
             spacing=self.hud.gap,

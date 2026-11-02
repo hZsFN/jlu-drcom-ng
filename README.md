@@ -100,7 +100,7 @@
 本仓库的源码树里**不含**可直接双击运行的成品，`.exe` 只在 Releases 的 Assets 里。
 打开链接 → 拉到最下面 `Assets` → 点文件名下载。
 
-- `JLU-DrCOM-NG-1.3.0-setup.exe` —— Python + Flet 版，**功能最全**
+- `JLU-DrCOM-NG-2.0.0-setup.exe` —— Python + Flet 版，**功能最全**
 
 **双击装不上就右键「以管理员身份运行」。** 安装包要往 `C:\Program Files` 写文件，
 所以它会申请管理员权限；如果你用的账号关掉了 UAC 提示、或者双击后**窗口一闪就没了 /

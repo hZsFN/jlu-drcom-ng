@@ -279,7 +279,7 @@ class AppController:
 
                 if daemon_path() is None:
                     # Installed build is missing the core, or a source checkout
-                    # never ran nativeuild.bat.  Degrade instead of failing.
+                    # never ran native/build.bat.  Degrade instead of failing.
                     self.log.warning("找不到 drcomd.exe，回退到内置 Python 核心")
                     native = False
 

@@ -124,7 +124,7 @@ the source tree does **not** contain a ready-to-run binary; the `.exe` files liv
 only under `Assets` in a release. Open the link, scroll to the bottom, expand
 `Assets`, download the file.
 
-- `JLU-DrCOM-NG-1.3.0-setup.exe` — Python + Flet build, **the most complete**
+- `JLU-DrCOM-NG-2.0.0-setup.exe` — Python + Flet build, **the most complete**
 
 **If double-clicking does nothing, right-click → Run as administrator.** The
 installer writes into `C:\Program Files` and therefore asks for elevation; on an

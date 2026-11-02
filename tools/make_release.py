@@ -116,6 +116,10 @@ def find_installers(version: str) -> list[pathlib.Path]:
     uploaded to the same release — so they belong in the checksum file.
     """
     found = sorted(RELEASE_DIR.glob(f"{PACKAGE_NAME}-{version}-*setup.exe"))
+    # The archived Dart build carries the same version number and a "-dart" suffix.
+    # It is not shipped any more (see the dart-2.0.0-archive tag), so a leftover
+    # copy in release/ must not be swept into this release.
+    found = [p for p in found if "-dart" not in p.name]
     for path in found:
         print(f"  installer  {path.name}  ({path.stat().st_size / 1048576:.1f} MB)")
     return found

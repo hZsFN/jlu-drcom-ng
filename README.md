@@ -257,4 +257,6 @@ python build.py --onefile       # 单文件 exe
 
 ## 许可证
 
-GPL-3.0，与所参考的项目保持一致。见 [LICENSE](LICENSE)。
+**AGPL-3.0**。本项目参考的原版客户端实现以 GPL-3.0 发布，按 GPLv3 第 13 条与 AGPLv3 的组合条款，整体以 AGPL-3.0 分发。见 [LICENSE](LICENSE)。
+
+AGPL 额外要求：如果你修改本程序并通过网络向他人提供服务，也要向这些使用者提供完整的对应源码。

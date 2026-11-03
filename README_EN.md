@@ -301,5 +301,10 @@ Dr.COM variants made the JLU-specific quirks much easier to spot.
 
 ## License
 
-GPL-3.0, the same license as the project this is derived from. See
-[LICENSE](LICENSE).
+**AGPL-3.0**. The original client implementation this project refers to is
+licensed under GPL-3.0; under GPLv3 section 13 (combination with AGPLv3 code)
+the whole work is distributed under AGPL-3.0. See [LICENSE](LICENSE).
+
+AGPL adds one requirement: if you modify this program and make it available to
+others over a network, you must offer those users the complete corresponding
+source.

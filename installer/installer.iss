@@ -1,21 +1,28 @@
-﻿; JLU DrCOM NG —— Inno Setup 6 安装包脚本
+; JLU DrCOM NG —— Inno Setup 6 安装包脚本
 ;
-; 编译（别直接双击 ISCC）：
+; 起点是 Inno Setup 向导生成的 1.iss（桌面那份）：[Setup] 骨架沿用向导的写法，
+; 向导留下的几个坑在这里改掉，并在注释里写明为什么改。
+;
+;   1. 版本号写死 "1.3.0"      → 由 make_installer.py 从 drcom/__init__.py 注入，
+;                                程序内部版本 / 安装包文件名 / release 资产名三处一致。
+;   2. ChangesAssociations=yes  → 删掉。向导顺手给 .exe 建了 OpenWithProgids 项，
+;      + [Registry] 里一串 .exe 关联    等于把自家程序挂进所有 exe 的"打开方式"，
+;                                污染系统且与程序无关。
+;   3. OutputDir=桌面 / mysetup → release\JLU-DrCOM-NG-<版本>-setup.exe。
+;   4. 没有许可页               → AGPL-3.0（仓库根目录 LICENSE）。
+;   5. 自启只有 Run 键          → 计划任务（登录瞬间由任务计划服务并行拉起，
+;                                优先级高于 normal；Run 键要排队等资源管理器）。
+;
+; 编译（别直接双击 ISCC，版本号会变成 0.0.0）：
 ;     python tools/make_installer.py
-; 或手工：
-;     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=1.2.0 installer\installer.iss
+; 手工编译：
+;     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=2.0.0 installer\installer.iss
 ;
-; 版本号不是写死在这里：由 make_installer.py 从 git tag / drcom\__init__.py 读出来再传进来，
-; 和 make_release.py 保持一致（单一来源）。
+; 安装位置：管理员 → {autopf}，/CURRENTUSER → %LOCALAPPDATA%\Programs。
+; 用户数据在 %APPDATA%\JLU-DrCOM-NG（账号、日志、统计），卸载时故意保留。
 ;
-; 默认装到 {autopf}\JLU-DrCOM-NG（管理员 → C:\Program Files，仅当前用户 → %LOCALAPPDATA%\Programs）：
-; 启动时自动申请提权（UAC），因为写 Program Files 需要管理员权限。
-; 想只装给当前用户、不弹 UAC：setup.exe /CURRENTUSER
-; 用户数据仍在 %APPDATA%\JLU-DrCOM-NG（账号配置、日志、统计），卸载时故意保留。
-;
-; 签名状态：本机无代码签名证书，setup.exe 是未签名状态，
-; 首次运行会被 SmartScreen 拦成"Windows 已保护你的电脑"（需点 更多信息 → 仍要运行）。
-; 去掉提示只能买代码签名证书（OV/EV）或 Azure Trusted Signing；签名钩子见 make_installer.py。
+; 签名：本机无代码签名证书，setup.exe 未签名，首次运行会被 SmartScreen 拦。
+; 签名钩子见 tools/make_installer.py（SIGN_PFX / SIGN_CERT_SHA1）。
 
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0"
@@ -26,12 +33,12 @@
 #define MyAppPublisher "hZsFN"
 #define MyAppURL "https://github.com/hZsFN/jlu-drcom-ng"
 #define MyAppExeName "JLU-DrCOM-NG.exe"
-; 打包源目录：默认相对 installer\ 的上一级；换机器编译可用 /DSourceDir=D:\path\dist\JLU-DrCOM-NG 覆盖
 #ifndef SourceDir
   #define SourceDir "..\dist\JLU-DrCOM-NG"
 #endif
 
 [Setup]
+; AppId 必须与历史安装包一致，否则新版本会在旁边再装一份而不是升级。
 AppId={{8F3A2B14-6C5D-4E7A-9B21-3D4F5E6A7B8C}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
@@ -43,12 +50,12 @@ AppUpdatesURL={#MyAppURL}/releases
 VersionInfoVersion={#MyAppVersion}
 VersionInfoDescription={#MyAppName} 安装程序
 VersionInfoCompany={#MyAppPublisher}
-VersionInfoCopyright=MIT License
+VersionInfoCopyright=AGPL-3.0
 DefaultDirName={autopf}\{#MyAppShortName}
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 DisableProgramGroupPage=yes
-; 许可页只在 LICENSE 确实存在时启用：把 iss 拷到别处单独编译也不会因此报错
+; 许可页只在 LICENSE 确实存在时启用：把 iss 拷到别处单独编译也不会报错
 #if FileExists(AddBackslash(SourcePath) + "..\LICENSE")
 LicenseFile=..\LICENSE
 #endif
@@ -60,18 +67,16 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName}
 Compression=lzma2/max
 SolidCompression=yes
-WizardStyle=modern
+WizardStyle=modern dynamic windows11
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-; admin = 启动时自动弹 UAC 申请提权（默认装进 Program Files，快捷方式对所有用户可见）
-; 需要免提权安装的场景可加 /CURRENTUSER，会退回 %LOCALAPPDATA%\Programs
+; admin：启动即申请提权，装进 Program Files；/CURRENTUSER 可退回按用户安装
 PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=commandline
 CloseApplications=yes
 RestartApplications=no
 MinVersion=10.0
-; 每次运行都写安装日志到 %TEMP%\Setup Log *.txt —— 排查"到底有没有提权"直接看日志里的
-; Install mode 那行（administrative / non administrative）
+; 每次安装都写 %TEMP%\Setup Log *.txt：查"到底有没有提权"看 Install mode 那行
 SetupLogging=yes
 
 [Languages]
@@ -80,10 +85,14 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："; Flags: unchecked
-Name: "autostart"; Description: "开机自动启动（静默守护，出错不弹窗）"; GroupDescription: "附加任务："; Flags: unchecked
+Name: "autostart"; Description: "开机自动启动（计划任务，登录后立即拉起认证）"; GroupDescription: "附加任务："; Flags: unchecked
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; 许可全文单独放到安装根目录，卸载前也能翻
+#if FileExists(AddBackslash(SourcePath) + "..\LICENSE")
+Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+#endif
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
@@ -91,27 +100,32 @@ Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#MyAppShortName}"; ValueData: """{app}\{#MyAppExeName}"" --autostart"; Flags: uninsdeletevalue; Tasks: autostart
+; 老版本用 HKCU Run 键自启，现在改成计划任务：装的时候把这个值清掉，免得两份同时拉起。
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "{#MyAppShortName}"; ValueType: none; Flags: uninsdeletevalue
 
 [Run]
+; 计划任务注册：早于资源管理器、优先级高于 normal。注册失败不影响安装（程序里还能再开）。
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--cli autostart task"; Flags: runhidden waituntilterminated; Tasks: autostart; StatusMsg: "正在注册开机自启（计划任务）…"
 Filename: "{app}\{#MyAppExeName}"; Description: "立即启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--cli autostart off"; Flags: runhidden; RunOnceId: "RemoveAutostart"
 
 [UninstallDelete]
 ; 只清安装目录里的生成物；%APPDATA%\JLU-DrCOM-NG 里的账号配置/日志/统计一律保留
 Type: filesandordirs; Name: "{app}\__pycache__"
 
 [Code]
-// 老版本（1.1.0 之前的 zip 版）可能被手工解压到别处，这里只提示不强删。
+// 装完把用户数据位置写进安装日志：提到「数据还在不在」时直接看日志，不用猜。
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  LegacyData, AppData: String;
+  AppData: String;
 begin
   if CurStep = ssPostInstall then
   begin
     AppData := ExpandConstant('{userappdata}\JLU-DrCOM-NG');
-    LegacyData := AppData;
-    if DirExists(LegacyData) then
-      Log('found existing user data at ' + LegacyData + ' (kept as-is)');
+    if DirExists(AppData) then
+      Log('existing user data kept at ' + AppData);
   end;
 end;
 

@@ -48,6 +48,34 @@ POLL_INTERVAL = 1.0
 #: How long to wait for a freshly spawned daemon to answer its first request.
 START_TIMEOUT = 6.0
 
+#: The daemon reports why it stopped in "last_reason" (see reason_name() in
+#: native/main.c).  Nothing used to read it, so the window showed a red
+#: "需处理" and no explanation -- the exact complaint the error-code table was
+#: meant to answer.
+REASON_TEXT = {
+    "user_logout": "你点了注销",
+    "bind_failed": "UDP 端口绑定失败",
+    "challenge_failed": "没有拿到挑战码",
+    "login_failed": "服务器拒绝了登录",
+    "timeout": "等待服务器回应超时",
+    "keepalive_failed": "保活失败，会话已断开",
+    "stopped": "已经停止",
+}
+
+REASON_ADVICE = {
+    "bind_failed": "端口被别的程序占了，或者落在 Windows 的保留区间：点「端口诊断」看是谁占用，"
+                   "关掉它，或在设置里换一个绑定端口。",
+    "challenge_failed": "服务器没回应：确认连着校园网、没有 TUN/VPN 代理抢路由，再试一次。",
+    "login_failed": "核对账号密码；仍不行就把日志里的错误码发出来（0x03 密码错 / 0x0B MAC 不符 / "
+                    "0x07 IP 不符 / 0x17 需要 DHCP）。",
+    "timeout": "校园网这边丢包严重或被劫持：换有线/无线再试，先关掉代理软件。",
+    "keepalive_failed": "会话已经掉了：点「重新连接」。",
+}
+
+#: Substrings that make a core log line worth showing at WARNING instead of
+#: DEBUG, so a failure cannot hide behind the log page's default filter.
+_CORE_FAILURE_TOKENS = ("error", "fail", "fatal", "失败", "错误", "超时", "拒绝")
+
 
 def daemon_path() -> Path | None:
     """Locate drcomd.exe: next to the frozen exe, else inside the source tree."""
@@ -128,6 +156,9 @@ class RemoteEngine:
         self.online_since: float | None = None
         self.attempt = 0
         self.consecutive_failures = 0
+        #: Why the core stopped, as the daemon's own "last_reason" string.
+        #: Empty while it is fine; the reason a FATAL state is FATAL.
+        self.last_reason = ""
         self.last_diagnosis = None
         self.socket_info = None
 
@@ -138,6 +169,9 @@ class RemoteEngine:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_log_count = 0
+        #: Last reason we already showed, so a retry with a *new* reason still
+        #: reaches the user while the state stays FATAL.
+        self._announced_reason = ""
 
     # -- interface parity with AuthEngine --------------------------------
     @property
@@ -311,6 +345,7 @@ class RemoteEngine:
 
         self.state = state
         self.ip = ip
+        self.last_reason = str(payload.get("last_reason") or "")
         self.consecutive_failures = int(payload.get("consecutive_failures") or 0)
         if online:
             if not was_online:
@@ -321,8 +356,21 @@ class RemoteEngine:
         if online and not was_online:
             self._emit("online", f"已上线，IP {ip}" if ip else "已上线")
             return
-        if state != previous_state:
-            self._emit("state", self._state_text(state))
+        reason_changed = state == EngineState.FATAL and self.last_reason != self._announced_reason
+        if state != previous_state or reason_changed:
+            if state == EngineState.FATAL:
+                # Say why.  A bare "需要处理" tells the user nothing and reads
+                # like the client gave up on purpose.
+                reason = self.last_reason
+                self._emit(
+                    "fatal",
+                    REASON_TEXT.get(reason) or "核心已经停下来，但没有说明原因",
+                    advice=REASON_ADVICE.get(reason, ""),
+                    detail=f"core last_reason={reason or 'unknown'}",
+                )
+                self._announced_reason = reason
+            elif state != previous_state:
+                self._emit("state", self._state_text(state))
 
     def _drain_logs(self) -> None:
         """Forward anything new from the daemon's ring buffer into our log bus."""
@@ -333,7 +381,11 @@ class RemoteEngine:
         if len(lines) < self._last_log_count:
             self._last_log_count = 0          # ring buffer wrapped
         for line in lines[self._last_log_count:]:
-            self.log.debug("core: %s", line)
+            lowered = line.lower()
+            if any(token in lowered for token in _CORE_FAILURE_TOKENS):
+                self.log.warning("core: %s", line)
+            else:
+                self.log.debug("core: %s", line)
         self._last_log_count = len(lines)
 
     @staticmethod
@@ -350,12 +402,15 @@ class RemoteEngine:
         }.get(state, state.value)
 
     # -- events ----------------------------------------------------------
-    def _emit(self, kind: str, message: str = "", *, detail: str = "", ip: str = "") -> None:
+    def _emit(
+        self, kind: str, message: str = "", *, detail: str = "", advice: str = "", ip: str = ""
+    ) -> None:
         event = EngineEvent(
             kind=kind,
             state=self.state,
             message=message,
             ip=ip or self.ip,
+            advice=advice,
             detail=detail,
         )
         with self._lock:

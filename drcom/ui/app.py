@@ -1284,6 +1284,8 @@ class DrcomApp:
 
         lines = [
             ("版本", __version__),
+            ("许可证", "AGPL-3.0（源码公开，网络服务同样受约束）"),
+            ("项目主页", "https://github.com/hZsFN/jlu-drcom-ng"),
             ("认证服务器", f"{controller.config.auth.server}:{controller.config.auth.port}"),
             ("本地绑定端口", str(controller.config.auth.bind_port)),
             ("数据目录", str(controller.data_dir)),
@@ -1315,6 +1317,8 @@ class DrcomApp:
             "密码使用 Windows DPAPI 加密后以 Base64 存储；DPAPI 不可用时改用 Fernet，"
             "再不可用则降级为可逆混淆并在界面明确告警。",
             "账号写入日志前会脱敏，密码任何时候都不写日志。",
+            "本程序以 AGPL-3.0 分发：原版客户端实现按 GPL-3.0 发布，依 GPLv3 第 13 条与 "
+            "AGPLv3 的组合条款，整体改用 AGPL-3.0；用它对外提供网络服务时，修改后的源码同样要公开。",
         ]
 
         return ft.Column(
@@ -2080,10 +2084,31 @@ class DrcomApp:
             attempts=engine.consecutive_failures if engine else 0,
         )
 
+    def _sync_fatal_alert(self, telemetry) -> None:
+        """Keep the banner honest when a poll, not an event, is what we see first.
+
+        RemoteEngine emits one event on entering FATAL.  If the window was closed
+        at that moment the event became a tray balloon, and a window built
+        afterwards would otherwise show the cheerful default line above a red
+        state -- the "只红不解释" report that started this fix.
+        """
+        if telemetry.state_label != STATE_LABELS[EngineState.FATAL]:
+            self._fatal_alert_shown = False
+            return
+        if getattr(self, "_fatal_alert_shown", False) or self.message_text is None:
+            return
+        from ..remote_engine import REASON_ADVICE, REASON_TEXT
+
+        reason = getattr(self.controller.engine, "last_reason", "") or ""
+        message = "需要处理：" + (REASON_TEXT.get(reason) or "核心停下来等人工处理，但没有给出原因")
+        self._set_alert(message, REASON_ADVICE.get(reason, ""), color=self.palette.danger)
+        self._fatal_alert_shown = True
+
     def _refresh_dashboard(self) -> None:
         controller = self.controller
         telemetry = self._build_telemetry()
         self._telemetry = telemetry
+        self._sync_fatal_alert(telemetry)
 
         # --- HUD canvas -------------------------------------------------
         # Only rebuild when something the HUD actually draws has moved.  The

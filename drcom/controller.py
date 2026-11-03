@@ -30,6 +30,7 @@ from .logbus import LogBus
 from .netprobe import NetworkProbe
 from .netiface import get_default_route_ip
 from .notify import NotificationEvent, Notifier
+from . import autostart as task_autostart
 from .single_instance import (
     autostart_command,
     disable_autostart,
@@ -592,7 +593,24 @@ class AppController:
         return True, f"密码已加密保存（{self.store.password_backend_note(acc.id) or 'DPAPI'}）"
 
     def set_autostart(self, enabled: bool) -> tuple[bool, str]:
-        ok, message = enable_autostart() if enabled else disable_autostart()
+        """Turn boot startup on or off, preferring the logon task.
+
+        Task Scheduler starts a logon-triggered task the instant the session
+        exists, in parallel with the shell; a HKCU Run entry is walked by Explorer
+        after the rest of the startup queue.  On a cold boot that difference is
+        the whole "is the network up before the browser opens" question, which is
+        the point of autostarting an authenticator at all.  The Run key stays as
+        the fallback for machines where the task cannot be registered (policy).
+        """
+        if enabled:
+            ok, message = task_autostart.install_current(minimized=True)
+            if not ok:
+                fallback_ok, fallback_message = enable_autostart(minimized=True)
+                if fallback_ok:
+                    ok, message = True, f"{fallback_message}（计划任务注册失败：{message}）"
+        else:
+            task_autostart.remove_task()
+            ok, message = disable_autostart()
         if ok:
             self.config.ui.autostart = enabled
             self.store.save()
@@ -600,12 +618,17 @@ class AppController:
 
     def autostart_enabled(self) -> bool:
         try:
-            return is_autostart_enabled()
+            return bool(task_autostart.task_exists() or is_autostart_enabled())
         except Exception:
             return False
 
     @property
     def autostart_cmd(self) -> str:
+        try:
+            if task_autostart.task_exists():
+                return task_autostart.task_command()
+        except Exception:
+            pass
         return autostart_command()
 
     def export_logs(self, destination: Path | None = None) -> Path:

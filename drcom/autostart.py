@@ -29,7 +29,9 @@ from pathlib import Path
 __all__ = [
     "TASK_NAME",
     "build_task_xml",
+    "install_current",
     "install_task",
+    "launch_target",
     "remove_task",
     "task_exists",
     "task_command",
@@ -130,6 +132,36 @@ def _current_user() -> str:
     domain = os.environ.get("USERDOMAIN", "")
     name = os.environ.get("USERNAME") or getpass.getuser()
     return f"{domain}\\{name}" if domain else name
+
+
+def launch_target(*, minimized: bool = True, with_watchdog: bool = False) -> tuple[str, str, str]:
+    """(command, arguments, working_dir) for the logon entry.
+
+    From a frozen build the command is the app exe.  From source it is python.exe
+    with main.py as its *first argument* -- pointing the task at sys.executable
+    alone would start an interpreter and exit immediately.
+    """
+    args: list[str] = []
+    if getattr(sys, "frozen", False):
+        command = str(Path(sys.executable).resolve())
+        workdir = str(Path(command).parent)
+    else:
+        entry = Path(__file__).resolve().parent.parent / "main.py"
+        command = str(Path(sys.executable).resolve())
+        args.append(str(entry))
+        workdir = str(entry.parent)
+    if with_watchdog:
+        args.append("--watchdog")
+    args.append("--autostart")
+    if minimized:
+        args.append("--minimized")
+    return command, subprocess.list2cmdline(args), workdir
+
+
+def install_current(*, minimized: bool = True, with_watchdog: bool = False) -> tuple[bool, str]:
+    """Register the logon task for the running executable."""
+    command, arguments, workdir = launch_target(minimized=minimized, with_watchdog=with_watchdog)
+    return install_task(command, arguments, working_dir=workdir)
 
 
 def install_task(

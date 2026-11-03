@@ -2,6 +2,8 @@
 
 # JLU DrCOM NG
 
+![JLU DrCOM NG 封面](docs/cover.png)
+
 吉林大学校园网认证客户端，用 Python 重写，界面是基于 Flet 的 **HUD（平视显示器）风格**面板。
 
 干的活和原版 Qt 客户端一样 —— 挑战、登录、保活 —— 但界面看得清、失败说得出原因、

@@ -2,6 +2,8 @@
 
 # JLU DrCOM NG
 
+![JLU DrCOM NG cover](docs/cover.png)
+
 A campus-network authentication client for Jilin University, rewritten in
 Python with a **HUD-styled** (heads-up display) interface built on Flet.
 

@@ -100,8 +100,8 @@ Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Registry]
-; 老版本用 HKCU Run 键自启，现在改成计划任务：装的时候把这个值清掉，免得两份同时拉起。
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "{#MyAppShortName}"; ValueType: none; Flags: uninsdeletevalue
+; （老版本的 HKCU\...\Run 自启值改在 [Code] 里删：写在这里会触发 Inno 的
+;  UsedUserAreasWarning —— 提权安装时 HKCU 指向谁容易让人误会。）
 
 [Run]
 ; 计划任务注册：早于资源管理器、优先级高于 normal。注册失败不影响安装（程序里还能再开）。
@@ -129,7 +129,16 @@ begin
   end;
 end;
 
+// 迁移：老版本把自启写在 HKCU\...\Run。新版改计划任务，这里顺手清掉那个值，
+// 免得开机时 Run 键与计划任务各拉起一份。
+procedure RemoveLegacyRunValue();
+begin
+  RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run',
+    '{#MyAppShortName}');
+end;
+
 function InitializeSetup(): Boolean;
 begin
+  RemoveLegacyRunValue();
   Result := True;
 end;

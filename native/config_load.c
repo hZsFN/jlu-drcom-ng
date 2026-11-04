@@ -228,6 +228,16 @@ int drcom_config_load(const char *path, engine_config *cfg, char *err, size_t er
         if (get_str(s, e, "host", host, sizeof host) != 0) host[0] = '\0';
     }
 
+    /* ---- logging ----
+     * The UI has always written logging.protocol_hex here; nothing read it, so
+     * the "协议转储开关" was a no-op in native mode.  Read it now.  Anything
+     * missing leaves the default (off) in place, so an old config.json that
+     * predates the field keeps working unchanged. */
+    if (find_object(json, "logging", &s, &e) == 0) {
+        int b = 0;
+        if (get_bool(s, e, "protocol_hex", &b) == 0) cfg->protocol_hex = b;
+    }
+
     /* ---- first account that actually has a password ----
      * accounts is an array (not an object), so find_object does not apply;
      * walk the array and take the first entry whose password decrypts. */

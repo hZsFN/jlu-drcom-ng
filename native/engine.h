@@ -53,6 +53,13 @@ typedef struct {
     char   account[128];
     char   password[256];
     char   mac[64];
+    /* diagnostics */
+    /* Dump every datagram as hex into the event log.  The UI has had a
+     * "协议转储开关" since the Python build, but the core never implemented it:
+     * the config field was written and silently ignored, so the switch did
+     * nothing at all in native mode.  Off by default -- a hex line per packet
+     * would otherwise push the useful events out of the 120-entry ring. */
+    int    protocol_hex;
 } engine_config;
 
 /* Event sink.  `kind` is one of:
@@ -84,5 +91,10 @@ double         engine_uptime(engine_t *e);
 /* Current session facts, safe to read from any thread. */
 void           engine_get_ip(engine_t *e, char out[16]);
 int            engine_get_consecutive_failures(engine_t *e);
+
+/* Toggle packet dumping on a live engine without restarting the session.
+ * Called when the UI flips the switch: the daemon reads config.json once at
+ * startup, so without this the setting only took effect after a restart. */
+void           engine_set_protocol_hex(engine_t *e, int on);
 
 #endif

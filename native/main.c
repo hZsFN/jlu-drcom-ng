@@ -40,10 +40,14 @@
 /* ------------------------------------------------------------- log ring */
 /* Sizing matters: this array is zero-initialised .data, so it is resident for
  * the life of the process.  200x256 was 50 KB for entries that average 60 bytes
- * and that nobody scrolls back through; 120x192 is 23 KB and still covers the
- * last couple of hours of events. */
+ * and that nobody scrolls back through.
+ *
+ * LOG_LEN went from 192 to 320 when packet dumping landed: a dump line is
+ * "packet  tx [Login sent] len=120" plus 64 bytes of hex (~192 chars), which
+ * does not fit in 192.  120x320 is 37 KB and still covers the last couple of
+ * hours of events. */
 #define LOG_LINES 120
-#define LOG_LEN   192
+#define LOG_LEN   320
 
 static SRWLOCK   log_lock = SRWLOCK_INIT;
 static char      log_ring[LOG_LINES][LOG_LEN];
@@ -140,6 +144,10 @@ static void tray_on_quit(void *ctx)
 
 /* Path of the GUI, given on the command line by whoever started us. */
 static char g_gui_path[MAX_PATH];
+
+/* config.json we were started with.  /reload re-reads it so a switch flipped
+ * in the UI can take effect without restarting a live session. */
+static char g_config_path[MAX_PATH];
 
 /*
  * Launch the window.
@@ -441,6 +449,24 @@ static void handle_client(SOCKET s, engine_t *e, const engine_config *cfg)
             } else {
                 http_reply(s, 200, "{\"ok\":true}", "application/json");
             }
+        } else if (strcmp(path, "/reload") == 0) {
+            /* Re-read just the diagnostics switch.  The engine is very likely
+             * mid-session, so this deliberately does *not* replace the running
+             * engine's config wholesale: only protocol_hex is pushed through,
+             * and that one is safe to change while packets are in flight. */
+            engine_config fresh;
+            engine_config_defaults(&fresh);
+            char rerr[256] = {0};
+            if (!g_config_path[0] ||
+                drcom_config_load(g_config_path, &fresh, rerr, sizeof rerr, NULL) != 0) {
+                http_reply(s, 500, "{\"ok\":false,\"error\":\"config reload failed\"}",
+                           "application/json");
+            } else {
+                engine_set_protocol_hex(e, fresh.protocol_hex);
+                snprintf(body, sizeof body, "{\"ok\":true,\"protocol_hex\":%s}",
+                         fresh.protocol_hex ? "true" : "false");
+                http_reply(s, 200, body, "application/json");
+            }
         } else if (strcmp(path, "/shutdown") == 0) {
             http_reply(s, 200, "{\"ok\":true}", "application/json");
             InterlockedExchange(&g_stop, 1);
@@ -522,14 +548,15 @@ static void usage(void)
            "  --no-api           run without the HTTP listener\n"
            "  --dry-run          load the config, print what was found, exit\n"
            "  --once             authenticate once and exit (no reconnect loop)\n"
-           "  --verbose          also print keepalive ticks\n");
+           "  --verbose          also print keepalive ticks\n"
+           "  --dump-hex         dump every datagram as hex, whatever config.json says\n");
 }
 
 int main(int argc, char **argv)
 {
     const char *config_path = NULL;
     int api_port = 0;              /* 0 = not given on the command line */
-    int no_api = 0, dry_run = 0, once = 0, want_tray = 0;
+    int no_api = 0, dry_run = 0, once = 0, want_tray = 0, dump_hex = 0;
     char default_path[MAX_PATH];
     static char path_buf[MAX_PATH];
 
@@ -544,6 +571,7 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--dry-run") == 0) dry_run = 1;
         else if (strcmp(argv[i], "--once") == 0) once = 1;
         else if (strcmp(argv[i], "--verbose") == 0) g_verbose = 1;
+        else if (strcmp(argv[i], "--dump-hex") == 0) dump_hex = 1;
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { usage(); return 0; }
         else { printf("unknown argument: %s\n\n", argv[i]); usage(); return 2; }
     }
@@ -555,6 +583,7 @@ int main(int argc, char **argv)
         config_path = default_path;
     }
     snprintf(path_buf, sizeof path_buf, "%s", config_path);
+    snprintf(g_config_path, sizeof g_config_path, "%s", config_path);
 
     engine_config cfg;
     engine_config_defaults(&cfg);
@@ -569,6 +598,8 @@ int main(int argc, char **argv)
      * only for someone starting the daemon by hand, and even then we avoid the
      * port the Python StatusServer may already own. */
     if (api_port == 0) api_port = (cfg_api > 0 && cfg_api != 8862) ? cfg_api : 61441;
+    /* Command line beats the file, same rule as every other switch here. */
+    if (dump_hex) cfg.protocol_hex = 1;
 
     printf("drcomd 配置\n");
     printf("  配置文件 : %s\n", path_buf);
@@ -578,6 +609,8 @@ int main(int argc, char **argv)
     printf("  服务器   : %s:%d\n", cfg.server, cfg.port);
     printf("  本地绑定 : %s:%d\n", cfg.bind_address[0] ? cfg.bind_address : "0.0.0.0", cfg.bind_port);
     printf("  保活间隔 : %.0f 秒\n", cfg.keepalive_interval);
+    printf("  协议转储 : %s\n", cfg.protocol_hex ? "开" : "关");
+    printf("  接口回退 : %s\n", cfg.auto_interface_fallback ? "开" : "关");
     printf("  密码     : %s (%zu 字节)\n", cfg.password[0] ? "已解密" : "空", strlen(cfg.password));
     if (dry_run) return 0;
 

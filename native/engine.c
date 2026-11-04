@@ -22,12 +22,14 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <process.h>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 struct engine {
     engine_config cfg;
@@ -50,6 +52,9 @@ struct engine {
     uint8_t     auth_info[16];
     volatile LONG running;
     int         ws_ready;
+    /* Live copy of cfg.protocol_hex: the UI can flip the switch while a
+     * session is up, and the setting must not require a restart to apply. */
+    volatile LONG protocol_hex;
 };
 
 /* ----------------------------------------------------------------- utils */
@@ -78,6 +83,56 @@ static void emit(engine_t *e, const char *kind, const char *message,
                  const char *detail, int error_code)
 {
     if (e->fn) e->fn(e->user, kind, message, detail, error_code);
+}
+
+/* --------------------------------------------------------- packet dumping */
+/* How many bytes of a datagram go into the log line.  Sixty-four covers
+ * everything we have ever had to look at: the opcode/length header, the byte
+ * that carries the IP, the account run at [20:..] and the MAC at [58:64].
+ * The body hashes past 64 are checked against the reference capture offline,
+ * not by eye in a log. */
+#define DUMP_BYTES 64
+
+/*
+ * Space-separated lowercase hex, matching the format the reference Qt client
+ * writes to its .lgt captures (tools/verify_against_log.py parses both).
+ *
+ * A redacted byte becomes "--" instead of being dropped, so offsets in the log
+ * line still line up with the real datagram -- which is the entire point of
+ * having the dump.  The login packet carries the account string at [20:...]
+ * and the password-derived hashes after it, and writing those to a log file
+ * would defeat the account masking the rest of the program does.
+ */
+static void hex_encode(const uint8_t *data, size_t len, size_t max_bytes,
+                       size_t redact_from, size_t redact_to,
+                       char *out, size_t cap)
+{
+    size_t shown = len < max_bytes ? len : max_bytes;
+    size_t used = 0;
+    for (size_t i = 0; i < shown; i++) {
+        if (used + 4 >= cap) break;
+        int hidden = (redact_to > redact_from) && (i >= redact_from) && (i < redact_to);
+        used += (size_t)snprintf(out + used, cap - used, hidden ? "-- " : "%02x ", data[i]);
+    }
+    if (redact_to > redact_from && redact_from < shown) {
+        used += (size_t)snprintf(out + used, cap - used, " (敏感字段已用 -- 屏蔽)");
+    }
+    if (len > shown) {
+        snprintf(out + used, cap - used, " ... (+%lu bytes)", (unsigned long)(len - shown));
+    }
+}
+
+/* One dump line per datagram, at most.  Off unless the user turned it on. */
+static void dump_packet(engine_t *e, const char *dir, const char *label,
+                        const uint8_t *data, size_t len,
+                        size_t redact_from, size_t redact_to)
+{
+    if (!InterlockedCompareExchange(&e->protocol_hex, 0, 0)) return;
+    char hex[DUMP_BYTES * 4 + 96];
+    hex_encode(data, len, DUMP_BYTES, redact_from, redact_to, hex, sizeof hex);
+    char head[96];
+    snprintf(head, sizeof head, "%s %-22s len=%lu", dir, label, (unsigned long)len);
+    emit(e, "packet", head, hex, -1);
 }
 
 static void set_state(engine_t *e, engine_state st, const char *message)
@@ -110,12 +165,137 @@ static double next_backoff(engine_t *e)
     return delay;
 }
 
+/* ------------------------------------------------------- bind candidates */
+/*
+ * Which local addresses to try, in order.
+ *
+ * Two modes, one field -- the same contract the Python engine has had since
+ * the beginning, and the reason this file grew a candidate list at all:
+ *
+ *  * `bind_address` holds a concrete IP -> use exactly that one.  That is the
+ *    "pinned" mode for a machine that always logs in over the same link.
+ *  * `bind_address` is empty (or 0.0.0.0) -> bind the wildcard and let the
+ *    kernel pick the exit.  Correct whenever there is a single uplink, which
+ *    is the normal case.  With several uplinks the wildcard follows the
+ *    *default route*, which on a laptop with Wi-Fi up is the Wi-Fi -- so the
+ *    auth datagram leaves over the wrong adapter and the server never answers.
+ *    `auto_interface_fallback` (off by default) adds every concrete adapter
+ *    address as an extra attempt, which is what makes a plugged-in cable win
+ *    over a live Wi-Fi association.
+ *
+ * The old core parsed `auto_interface_fallback` out of config.json and then
+ * never looked at it again, so the switch silently did nothing.
+ */
+#define MAX_BIND_CANDIDATES 8
+
+static int collect_local_ipv4(char out[][16], int cap)
+{
+    ULONG size = 16 * 1024;
+    IP_ADAPTER_ADDRESSES *addrs = (IP_ADAPTER_ADDRESSES *)malloc(size);
+    if (!addrs) return 0;
+    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    ULONG rc = GetAdaptersAddresses(AF_INET, flags, NULL, addrs, &size);
+    if (rc == ERROR_BUFFER_OVERFLOW) {
+        free(addrs);
+        addrs = (IP_ADAPTER_ADDRESSES *)malloc(size);
+        if (!addrs) return 0;
+        rc = GetAdaptersAddresses(AF_INET, flags, NULL, addrs, &size);
+    }
+    if (rc != NO_ERROR) { free(addrs); return 0; }
+
+    int n = 0;
+    for (IP_ADAPTER_ADDRESSES *a = addrs; a && n < cap; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp) continue;
+        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        for (IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u && n < cap; u = u->Next) {
+            if (!u->Address.lpSockaddr) continue;
+            if (u->Address.lpSockaddr->sa_family != AF_INET) continue;
+            struct sockaddr_in *sa = (struct sockaddr_in *)u->Address.lpSockaddr;
+            char buf[16];
+            if (!InetNtopA(AF_INET, &sa->sin_addr, buf, (DWORD)sizeof buf)) continue;
+            /* 169.254/16 is what Windows invents when DHCP failed: binding to
+             * it can never reach the campus server. */
+            if (strncmp(buf, "169.254.", 8) == 0) continue;
+            if (strcmp(buf, "0.0.0.0") == 0) continue;
+            int dup = 0;
+            for (int i = 0; i < n; i++) if (strcmp(out[i], buf) == 0) { dup = 1; break; }
+            if (!dup) snprintf(out[n++], 16, "%s", buf);
+        }
+    }
+    free(addrs);
+    return n;
+}
+
+/* The address the OS would use to reach the server.  Asked the only way that
+ * needs no packets: connect() on a UDP socket only fills in the route. */
+static void default_route_ip(const char *server, int port, char out[16])
+{
+    out[0] = '\0';
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return;
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof to);
+    to.sin_family = AF_INET;
+    to.sin_port = htons((u_short)port);
+    if (InetPtonA(AF_INET, server, &to.sin_addr) == 1 && connect(s, (struct sockaddr *)&to, sizeof to) == 0) {
+        struct sockaddr_in me;
+        int me_len = sizeof me;
+        if (getsockname(s, (struct sockaddr *)&me, &me_len) == 0) {
+            InetNtopA(AF_INET, &me.sin_addr, out, 16);
+        }
+    }
+    closesocket(s);
+}
+
+static int build_bind_candidates(engine_t *e, char out[][16], int cap)
+{
+    const char *pinned = e->cfg.bind_address;
+    if (pinned[0] && strcmp(pinned, "0.0.0.0") != 0) {
+        snprintf(out[0], 16, "%s", pinned);
+        return 1;
+    }
+
+    int n = 0;
+    snprintf(out[n++], 16, "0.0.0.0");
+    if (!e->cfg.auto_interface_fallback || n >= cap) return n;
+
+    /* Put the default-route address first among the concrete ones: when the
+     * wildcard failed, that is the one most likely to be the *other* uplink
+     * the user meant. */
+    char routed[16];
+    default_route_ip(e->cfg.server, e->cfg.port, routed);
+    if (routed[0] && strcmp(routed, "0.0.0.0") != 0) {
+        snprintf(out[n++], 16, "%s", routed);
+    }
+    n += collect_local_ipv4(&out[n], cap - n);
+    return n;
+}
+
 /* -------------------------------------------------------------- socket IO */
 static int send_packet(engine_t *e, const uint8_t *data, size_t len)
 {
     int rc = sendto(e->sock, (const char *)data, (int)len, 0,
                     (const struct sockaddr *)&e->peer, sizeof e->peer);
     return rc == (int)len ? 0 : -1;
+}
+
+/*
+ * Send with a dump line.  The label names the step ("[Login sent]"), so a
+ * capture reads like the reference client's log and the two can be diffed.
+ *
+ * `redact_from`/`redact_to` blank a byte range; pass from >= to for none.
+ * Only the login packet needs it -- the account string sits at [20:...] and
+ * the salted-password section near the end.  The MAC at [58:80] is
+ * deliberately *not* blanked: "MAC 不符" (0x0B) is the single most common
+ * login failure and the dump is the only place that shows which MAC was
+ * actually sent.  A MAC is not a credential -- it is visible to every peer on
+ * the same segment -- so this leaks nothing a LAN neighbour could not read.
+ */
+static int send_labeled(engine_t *e, const uint8_t *data, size_t len,
+                        const char *label, size_t redact_from, size_t redact_to)
+{
+    dump_packet(e, "tx", label, data, len, redact_from, redact_to);
+    return send_packet(e, data, len);
 }
 
 /*
@@ -140,6 +320,16 @@ static int recv_packet(engine_t *e, uint8_t *buf, size_t cap, int skip_notificat
     return -1;
 }
 
+/* Receive with a dump line on whatever eventually arrived.  The reply is not
+ * redacted: the server echoes no account string back. */
+static int recv_labeled(engine_t *e, uint8_t *buf, size_t cap, int skip_notifications,
+                        int max_packets, const char *label)
+{
+    int n = recv_packet(e, buf, cap, skip_notifications, max_packets);
+    if (n > 0) dump_packet(e, "rx", label, buf, (size_t)n, 0, 0);
+    return n;
+}
+
 /* ------------------------------------------------------------ challenge */
 static int do_challenge(engine_t *e, uint8_t seed[4], char ip_out[16])
 {
@@ -150,9 +340,9 @@ static int do_challenge(engine_t *e, uint8_t seed[4], char ip_out[16])
     rnd[0] = (uint8_t)(rand() & 0xFF);
     rnd[1] = (uint8_t)(rand() & 0xFF);
     if (proto_build_challenge(rnd, packet) != PROTO_OK) return -1;
-    if (send_packet(e, packet, sizeof packet) != 0) return -1;
+    if (send_labeled(e, packet, sizeof packet, "[Challenge sent]", 0, 0) != 0) return -1;
 
-    int n = recv_packet(e, reply, sizeof reply, 0, 32);
+    int n = recv_labeled(e, reply, sizeof reply, 0, 32, "[Challenge recv]");
     if (n < 0) return -1;
 
     proto_challenge_t ch;
@@ -183,18 +373,18 @@ static int keepalive_1(engine_t *e)
     int encrypt_type = 0;
 
     const uint8_t *p1 = proto_keepalive1_pkt1();
-    if (send_packet(e, p1, 8) != 0) return -1;
+    if (send_labeled(e, p1, 8, "[Keepalive1 sent]", 0, 0) != 0) return -1;
 
-    int n = recv_packet(e, reply, sizeof reply, 1, 32);
+    int n = recv_labeled(e, reply, sizeof reply, 1, 32, "[Keepalive1 recv]");
     if (n < 0) return -1;
     if (proto_parse_keepalive1(reply, (size_t)n, seed, &encrypt_type) != PROTO_OK) return -2;
 
     uint8_t rnd[2] = { (uint8_t)(rand() & 0xFF), (uint8_t)(rand() & 0xFF) };
     uint8_t packet2[PROTO_KEEPALIVE1_PKT2_LEN];
     if (proto_build_keepalive1_pkt2(seed, e->auth_info, rnd, packet2) != PROTO_OK) return -1;
-    if (send_packet(e, packet2, sizeof packet2) != 0) return -1;
+    if (send_labeled(e, packet2, sizeof packet2, "[Keepalive1 answer sent]", 0, 0) != 0) return -1;
 
-    n = recv_packet(e, reply, sizeof reply, 0, 32);
+    n = recv_labeled(e, reply, sizeof reply, 0, 32, "[Keepalive1 answer recv]");
     if (n <= 0) return -1;
     if (reply[0] != 0x07) return -3;
     return 0;
@@ -209,9 +399,9 @@ static int keepalive_2(engine_t *e, int *counter, int first)
 
     if (first) {
         proto_build_keepalive2(*counter, 1, 1, NULL, packet);
-        if (send_packet(e, packet, sizeof packet) != 0) return -1;
+        if (send_labeled(e, packet, sizeof packet, "[Keepalive2_file sent]", 0, 0) != 0) return -1;
         (*counter)++;
-        int n = recv_packet(e, reply, sizeof reply, 0, 32);
+        int n = recv_labeled(e, reply, sizeof reply, 0, 32, "[Keepalive2_file recv]");
         if (n < 0) return -1;
         if (proto_parse_keepalive2(reply, (size_t)n, 1, &ka) != PROTO_OK) {
             if (n == 0 || reply[0] != 0x07) return -1;
@@ -219,18 +409,18 @@ static int keepalive_2(engine_t *e, int *counter, int first)
     }
 
     proto_build_keepalive2(*counter, 0, 1, NULL, packet);
-    if (send_packet(e, packet, sizeof packet) != 0) return -1;
+    if (send_labeled(e, packet, sizeof packet, "[Keepalive2_A sent]", 0, 0) != 0) return -1;
     (*counter)++;
-    int n = recv_packet(e, reply, sizeof reply, 0, 32);
+    int n = recv_labeled(e, reply, sizeof reply, 0, 32, "[Keepalive2_A recv]");
     if (n < 0) return -1;
     if (proto_parse_keepalive2(reply, (size_t)n, 0, &ka) != PROTO_OK || !ka.ok) return -1;
     uint8_t tail[4];
     memcpy(tail, ka.tail, 4);
 
     proto_build_keepalive2(*counter, 0, 3, tail, packet);
-    if (send_packet(e, packet, sizeof packet) != 0) return -1;
+    if (send_labeled(e, packet, sizeof packet, "[Keepalive2_C sent]", 0, 0) != 0) return -1;
     (*counter)++;
-    n = recv_packet(e, reply, sizeof reply, 0, 32);
+    n = recv_labeled(e, reply, sizeof reply, 0, 32, "[Keepalive2_C recv]");
     if (n < 0) return -1;
     if (proto_parse_keepalive2(reply, (size_t)n, 0, &ka) != PROTO_OK || !ka.ok) return -1;
     return 0;
@@ -310,10 +500,21 @@ static const char *authenticate(engine_t *e)
         emit(e, "error", "配置错误：账号或 MAC 格式不正确", NULL, -1);
         return "fatal";
     }
-    if (send_packet(e, packet, len) != 0) { e->consecutive_failures++; return "transient"; }
+    /* The dump covers the first 64 bytes, which is exactly where the ID and
+     * the MD5A digest live: blank [4, 20+account) so neither the account
+     * string nor the password-derived digest reaches the log file.  The
+     * salted-password section sits past byte 312 and is outside the dumped
+     * window anyway.  The MAC at [58:64] stays readable on purpose -- see
+     * send_labeled(). */
+    size_t account_end = 20 + strlen(e->cfg.account);
+    if (account_end > len) account_end = len;
+    if (send_labeled(e, packet, len, "[Login sent]", 4, account_end) != 0) {
+        e->consecutive_failures++;
+        return "transient";
+    }
 
     uint8_t reply[256];
-    int n = recv_packet(e, reply, sizeof reply, 0, 32);
+    int n = recv_labeled(e, reply, sizeof reply, 0, 32, "[Login recv]");
     if (n < 0) {
         InterlockedExchange(&e->reason, OFFLINE_TIMEOUT);
         set_state(e, ENGINE_STATE_RETRY_WAIT, "登录响应超时");
@@ -370,7 +571,7 @@ static const char *authenticate(engine_t *e)
 }
 
 /* ---------------------------------------------------------------- socket */
-static int bind_socket(engine_t *e)
+static int bind_socket(engine_t *e, const char *addr)
 {
     e->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (e->sock == INVALID_SOCKET) return -1;
@@ -382,8 +583,8 @@ static int bind_socket(engine_t *e)
     memset(&local, 0, sizeof local);
     local.sin_family = AF_INET;
     local.sin_port = htons((u_short)e->cfg.bind_port);
-    if (e->cfg.bind_address[0] && strcmp(e->cfg.bind_address, "0.0.0.0") != 0) {
-        if (InetPtonA(AF_INET, e->cfg.bind_address, &local.sin_addr) != 1) {
+    if (addr && addr[0] && strcmp(addr, "0.0.0.0") != 0) {
+        if (InetPtonA(AF_INET, addr, &local.sin_addr) != 1) {
             closesocket(e->sock); e->sock = INVALID_SOCKET;
             return -2;
         }
@@ -412,22 +613,60 @@ static int bind_socket(engine_t *e)
 static unsigned __stdcall engine_thread(void *arg)
 {
     engine_t *e = (engine_t *)arg;
+    /* Enumerated once per outer round rather than per attempt: adapters do not
+     * appear or vanish mid-session often enough to matter, and re-enumerating
+     * while walking the list would make "the next candidate" meaningless. */
+    char cands[MAX_BIND_CANDIDATES][16];
+    int cand_count = 0;
+    int cand_index = 0;
 
     emit(e, "started", "认证线程已启动", NULL, -1);
 
     while (WaitForSingleObject(e->stop_evt, 0) == WAIT_TIMEOUT) {
-        set_state(e, ENGINE_STATE_BINDING, "正在绑定端口");
-        int rc = bind_socket(e);
+        if (cand_count == 0) {
+            cand_count = build_bind_candidates(e, cands, MAX_BIND_CANDIDATES);
+            cand_index = 0;
+        }
+        if (cand_index >= cand_count) { cand_index = 0; cand_count = 0; continue; }
+
+        const char *addr = cands[cand_index];
+        const char *shown = (addr[0] && strcmp(addr, "0.0.0.0") != 0) ? addr : "0.0.0.0";
+        char msg[96];
+        snprintf(msg, sizeof msg, "正在绑定 %s", shown);
+        set_state(e, ENGINE_STATE_BINDING, msg);
+        if (cand_index > 0) {
+            /* Name the address we are leaving, not the first one: after the
+             * second attempt "上一次在 0.0.0.0 上" would be a lie. */
+            const char *prev = cands[cand_index - 1];
+            char note[128];
+            snprintf(note, sizeof note,
+                     "上一次在 %s 上收不到认证服务器响应，改用 %s 重试",
+                     (prev[0] && strcmp(prev, "0.0.0.0") != 0) ? prev : "0.0.0.0",
+                     shown);
+            emit(e, "bind_retry", note, NULL, -1);
+        }
+
+        int rc = bind_socket(e, addr);
         if (rc != 0) {
-            InterlockedExchange(&e->reason, OFFLINE_BIND_FAILED);
-            char detail[128];
+            char detail[160];
             snprintf(detail, sizeof detail,
                      "无法绑定 %s:%d（错误 %d）。端口可能被其它程序占用，"
-                     "或需要管理员权限。", e->cfg.bind_address[0] ? e->cfg.bind_address : "0.0.0.0",
-                     e->cfg.bind_port, rc);
-            set_state(e, ENGINE_STATE_RETRY_WAIT, "绑定失败");
-            emit(e, "bind_failed", "绑定端口失败", detail, rc);
-            e->consecutive_failures++;
+                     "或需要管理员权限。", shown, e->cfg.bind_port, rc);
+            /* A failure on the very first candidate is a genuine port conflict:
+             * every other address would fail the same way, so report it instead
+             * of burning through the list and blaming the adapters. */
+            if (cand_index == 0) {
+                InterlockedExchange(&e->reason, OFFLINE_BIND_FAILED);
+                set_state(e, ENGINE_STATE_RETRY_WAIT, "绑定失败");
+                emit(e, "bind_failed", "绑定端口失败", detail, rc);
+                e->consecutive_failures++;
+                cand_index = 0;
+                cand_count = 0;
+            } else {
+                emit(e, "bind_failed", "该地址绑定失败，试下一个", detail, rc);
+                cand_index++;
+                continue;
+            }
         } else {
             const char *result = authenticate(e);
             if (e->sock != INVALID_SOCKET) { closesocket(e->sock); e->sock = INVALID_SOCKET; }
@@ -436,6 +675,15 @@ static unsigned __stdcall engine_thread(void *arg)
                 set_state(e, ENGINE_STATE_FATAL, "需要人工处理");
                 goto done;
             }
+            /* Transient with candidates left: try the next local address at
+             * once.  The backoff is for "the network is flaky", not for "we
+             * may simply be shouting out of the wrong adapter". */
+            if (cand_index + 1 < cand_count) {
+                cand_index++;
+                continue;
+            }
+            cand_index = 0;
+            cand_count = 0;
         }
 
         if (!e->cfg.reconnect_enabled) {
@@ -451,7 +699,6 @@ static unsigned __stdcall engine_thread(void *arg)
         }
 
         double delay = next_backoff(e);
-        char msg[96];
         snprintf(msg, sizeof msg, "%.0f 秒后重试（第 %d 次失败）", delay, e->consecutive_failures);
         set_state(e, ENGINE_STATE_RETRY_WAIT, msg);
         emit(e, "retry_scheduled", msg, NULL, -1);
@@ -486,6 +733,9 @@ void engine_config_defaults(engine_config *cfg)
     cfg->factor = 2.0;
     cfg->jitter = 0.25;
     cfg->give_up_after = 8;
+    /* Off unless asked for: one extra ring entry per datagram would evict the
+     * state transitions that are the first thing anyone looks at. */
+    cfg->protocol_hex = 0;
 }
 
 engine_t *engine_create(const engine_config *cfg, engine_event_fn fn, void *user)
@@ -496,6 +746,7 @@ engine_t *engine_create(const engine_config *cfg, engine_event_fn fn, void *user
     e->fn = fn;
     e->user = user;
     e->sock = INVALID_SOCKET;
+    e->protocol_hex = cfg->protocol_hex ? 1 : 0;
     e->state = ENGINE_STATE_IDLE;
     e->reason = OFFLINE_NONE;
     InitializeSRWLock(&e->lock);
@@ -602,4 +853,15 @@ void engine_get_ip(engine_t *e, char out[16])
 int engine_get_consecutive_failures(engine_t *e)
 {
     return e ? e->consecutive_failures : 0;
+}
+
+void engine_set_protocol_hex(engine_t *e, int on)
+{
+    if (!e) return;
+    InterlockedExchange(&e->protocol_hex, on ? 1 : 0);
+    e->cfg.protocol_hex = on ? 1 : 0;
+    /* Say so in the ring: a dump that silently fails to start looks exactly
+     * like a client that has nothing to say, which is the confusion this whole
+     * fix exists to end. */
+    emit(e, "note", on ? "协议十六进制转储：开" : "协议十六进制转储：关", NULL, -1);
 }

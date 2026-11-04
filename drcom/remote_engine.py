@@ -381,12 +381,32 @@ class RemoteEngine:
         if len(lines) < self._last_log_count:
             self._last_log_count = 0          # ring buffer wrapped
         for line in lines[self._last_log_count:]:
+            stripped = line.lstrip()
+            # Packet dumps arrive already formatted ("packet  tx [Login sent]
+            # len=120 | 01 02 ..").  They must not go through the failure-token
+            # check below -- a hex body can contain the letters of a token by
+            # accident -- and they belong at PACKET level so the UI can colour
+            # them like the in-process engine's own dumps.
+            if stripped.startswith("packet "):
+                self.log.packet_line(stripped[len("packet "):].strip())
+                continue
             lowered = line.lower()
             if any(token in lowered for token in _CORE_FAILURE_TOKENS):
                 self.log.warning("core: %s", line)
             else:
                 self.log.debug("core: %s", line)
         self._last_log_count = len(lines)
+
+    def reload_config(self) -> bool:
+        """Tell the daemon to re-read config.json.
+
+        Only the diagnostics switches are applied (see ``/reload`` in
+        native/main.c): the session is very likely live, and silently swapping
+        the server address or credentials under it would be far worse than
+        making the user restart.
+        """
+        payload = _request(self.api_port, "/reload", method="POST", timeout=2.0)
+        return bool(payload and payload.get("ok"))
 
     @staticmethod
     def _state_text(state: EngineState) -> str:

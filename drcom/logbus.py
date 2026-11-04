@@ -275,6 +275,18 @@ class LogBus:
         """A human-facing protocol milestone, always shown."""
         self.logger.info("· %s", message)
 
+    def packet_line(self, text: str) -> None:
+        """Log an already-formatted dump line, e.g. one the native core wrote.
+
+        The native core (``drcomd.exe``) does its own hexdump and ships it back
+        through ``/logs`` as plain text; there are no bytes on this side to feed
+        :meth:`packet`, so this records the line at :data:`PACKET_LEVEL` instead
+        and keeps it behind the same ``protocol_hex`` switch.
+        """
+        if not self.protocol_hex:
+            return
+        self.logger.log(PACKET_LEVEL, "%s", text)
+
     # -- export ----------------------------------------------------------
     def export(self, destination: Path, *, since_seq: int = 0) -> Path:
         """Write the buffered lines to *destination* as a shareable report."""

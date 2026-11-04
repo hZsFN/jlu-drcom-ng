@@ -684,7 +684,21 @@ class DrcomApp:
             self.controller.log.protocol_hex = not self.controller.log.protocol_hex
             self.controller.config.logging.protocol_hex = self.controller.log.protocol_hex
             self.controller.store.save()
-            self._flash(f"协议十六进制转储：{'开' if self.controller.log.protocol_hex else '关'}", True)
+            state = "开" if self.controller.log.protocol_hex else "关"
+            # In native mode the datagrams are sent and received by drcomd.exe,
+            # which read its settings once at startup.  Flipping this side only
+            # changed a flag nobody was watching -- the switch did nothing at
+            # all.  Tell the daemon to re-read config.json; /reload applies only
+            # the diagnostics switches, so a live session is not disturbed.
+            reloader = getattr(self.controller.engine, "reload_config", None)
+            if callable(reloader):
+                ok = reloader()
+                if ok:
+                    self._flash(f"协议十六进制转储：{state}", True)
+                else:
+                    self._flash(f"协议十六进制转储：{state}（原生核心未响应，重启客户端后生效）", False)
+            else:
+                self._flash(f"协议十六进制转储：{state}", True)
 
         controls = ft.Row(
             [

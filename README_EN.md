@@ -105,7 +105,10 @@ features, without the memory win above.)
   client writes a stop marker when it is asked to quit, so a deliberate exit
   ends the supervisor too instead of being undone. Toggle with
   `--cli watchdog on|off|status`
-- **Log panel** with byte-level protocol dumps, one-click export, masked accounts
+- **Log panel** with byte-level protocol dumps, one-click export, masked accounts.
+  Under the native core the dump is written by `drcomd.exe` itself and the switch
+  applies **immediately**, no restart (in earlier builds this switch was dead in
+  native mode: the setting was parsed and then never read)
 - **Statistics** — today / this week / all-time uptime, disconnect count
 - **Network probe** — latency, loss, jitter, against real websites
   (`www.baidu.com`, `www.bing.com` by default) and timed as an actual HTTP

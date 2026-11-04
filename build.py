@@ -206,7 +206,9 @@ def build(*, onefile: bool = False, name: str = "JLU-DrCOM-NG", console: bool = 
             file=sys.stderr,
         )
 
-    for extra in ("README.md", "README_EN.md"):
+    # LICENSE is not optional for AGPL: the archive has to carry the licence text,
+    # not just a README line pointing at it.
+    for extra in ("README.md", "README_EN.md", "LICENSE"):
         path = ROOT / extra
         if path.exists():
             arguments += ["--add-data", f"{path}{';' if sys.platform == 'win32' else ':'}."]

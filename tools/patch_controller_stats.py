@@ -1,6 +1,6 @@
 from pathlib import Path
 
-p = Path(r"C:\Users\13941\.deepseek harness\jlu-drcom-ng\desktop\lib\controller.dart")
+p = Path(__file__).resolve().parent.parent / "desktop/lib/controller.dart"
 src = p.read_text(encoding="utf-8")
 orig = src
 

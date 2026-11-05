@@ -616,6 +616,28 @@ static DWORD iface_index_for_address(const char *addr)
     return index;
 }
 
+/* What a negative bind_socket() return actually means.
+ *
+ * All three used to be reported as "the port may be taken by another program",
+ * which is only true for one of them.  A user who pinned an address that this
+ * machine does not have (10049) was told to hunt for a port conflict that did
+ * not exist. */
+static const char *bind_error_hint(int rc)
+{
+    switch (-rc) {
+    case 10048:  /* WSAEADDRINUSE */
+        return "端口被其它程序占用。";
+    case 10049:  /* WSAEADDRNOTAVAIL */
+        return "这个地址不属于本机任何在用网卡：检查设置里的绑定地址。";
+    case 10013:  /* WSAEACCES */
+        return "端口落在系统保留区间或被安全软件拦住：换一个端口，或以管理员身份运行。";
+    case 10047:  /* WSAEAFNOSUPPORT */
+        return "该地址不是 IPv4 地址。";
+    default:
+        return "绑定失败。";
+    }
+}
+
 static int bind_socket(engine_t *e, const char *addr)
 {
     e->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -713,10 +735,10 @@ static unsigned __stdcall engine_thread(void *arg)
 
         int rc = bind_socket(e, addr);
         if (rc != 0) {
-            char detail[160];
+            char detail[200];
             snprintf(detail, sizeof detail,
-                     "无法绑定 %s:%d（错误 %d）。端口可能被其它程序占用，"
-                     "或需要管理员权限。", shown, e->cfg.bind_port, rc);
+                     "无法绑定 %s:%d（错误 %d）。%s",
+                     shown, e->cfg.bind_port, rc, bind_error_hint(rc));
             /* A failure on the very first candidate is a genuine port conflict:
              * every other address would fail the same way, so report it instead
              * of burning through the list and blaming the adapters. */

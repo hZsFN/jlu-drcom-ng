@@ -96,6 +96,24 @@ class LogRecordView:
         return time.strftime("%H:%M:%S", time.localtime(self.timestamp))
 
 
+class _MaskedFormatter(logging.Formatter):
+    """Formatter that redacts accounts before anything reaches disk.
+
+    The in-memory ring was always masked, but the file handler was not -- so the
+    one artefact users are told to attach to a bug report held the account
+    number in clear text while the UI promised it was masked.  Masking here
+    rather than at each call site means a future log statement cannot leak by
+    forgetting to ask.
+    """
+
+    def __init__(self, *args, mask_accounts: bool = True, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._mask = mask_accounts
+
+    def format(self, record: logging.LogRecord) -> str:
+        return mask_text(super().format(record), mask_accounts=self._mask)
+
+
 class _RingHandler(logging.Handler):
     """Feeds a bounded deque so the GUI can show recent lines instantly."""
 
@@ -174,7 +192,11 @@ class LogBus:
         )
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S")
+            _MaskedFormatter(
+                "%(asctime)s %(levelname)-7s %(message)s",
+                "%Y-%m-%d %H:%M:%S",
+                mask_accounts=self.mask_accounts,
+            )
         )
         self.logger.addHandler(file_handler)
 

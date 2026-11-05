@@ -276,7 +276,20 @@ static int send_packet(engine_t *e, const uint8_t *data, size_t len)
 {
     int rc = sendto(e->sock, (const char *)data, (int)len, 0,
                     (const struct sockaddr *)&e->peer, sizeof e->peer);
-    return rc == (int)len ? 0 : -1;
+    if (rc == (int)len) return 0;
+
+    /* A failed send and a sent-but-unanswered packet were indistinguishable
+     * before: both surfaced as "no reply" and the error code was dropped here.
+     * With a bind address pinned to an adapter the system does not route
+     * through, sendto fails with WSAENETUNREACH (10051) / WSAEADDRNOTAVAIL
+     * (10049) -- the difference between "wrong adapter" and "server silent",
+     * which is exactly the question a user reporting a hang cannot answer. */
+    int err = WSAGetLastError();
+    char detail[160];
+    snprintf(detail, sizeof detail, "sendto 失败：%s:%u，errno=%d",
+             e->cfg.server, (unsigned)e->cfg.port, err);
+    emit(e, "send_failed", "发包失败", detail, err);
+    return -1;
 }
 
 /*
@@ -571,6 +584,38 @@ static const char *authenticate(engine_t *e)
 }
 
 /* ---------------------------------------------------------------- socket */
+/* Interface index that owns *addr*, or 0 when no local adapter has it.
+ *
+ * Needed because binding a UDP socket to a source address does not decide the
+ * egress route: the system still picks one from its routing table.  On a laptop
+ * with a phone hotspot up as well, the route to the campus server can keep
+ * going out of the hotspot even though the socket is bound to the wired
+ * address, and sendto then fails with WSAENETUNREACH -- which reads like "the
+ * server is silent".  IP_UNICAST_IF pins the outgoing interface and makes the
+ * address the user picked actually mean something. */
+static DWORD iface_index_for_address(const char *addr)
+{
+    struct in_addr want;
+    if (!addr || InetPtonA(AF_INET, addr, &want) != 1) return 0;
+
+    ULONG size = 0;
+    if (GetIpAddrTable(NULL, &size, 0) != ERROR_INSUFFICIENT_BUFFER) return 0;
+    PMIB_IPADDRTABLE table = (PMIB_IPADDRTABLE)malloc(size);
+    if (!table) return 0;
+
+    DWORD index = 0;
+    if (GetIpAddrTable(table, &size, 0) == NO_ERROR) {
+        for (DWORD i = 0; i < table->dwNumEntries; i++) {
+            if (table->table[i].dwAddr == want.s_addr) {
+                index = table->table[i].dwIndex;
+                break;
+            }
+        }
+    }
+    free(table);
+    return index;
+}
+
 static int bind_socket(engine_t *e, const char *addr)
 {
     e->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -597,6 +642,26 @@ static int bind_socket(engine_t *e, const char *addr)
         closesocket(e->sock);
         e->sock = INVALID_SOCKET;
         return err ? -err : -3;
+    }
+
+    /* Only when the user pinned an address: 0.0.0.0 means "let the system
+     * decide", and that is a legitimate choice on a single-homed machine. */
+    if (local.sin_addr.s_addr != INADDR_ANY) {
+        DWORD idx = iface_index_for_address(addr);
+        if (idx == 0) {
+            emit(e, "bind_note", "指定地址不属于本机任何网卡", addr, -1);
+        } else {
+            /* Documented quirk: IP_UNICAST_IF takes the index in network byte
+             * order, unlike IP_ADD_MEMBERSHIP and friends. */
+            u_int be_index = htonl((u_long)idx);
+            if (setsockopt(e->sock, IPPROTO_IP, IP_UNICAST_IF,
+                           (const char *)&be_index, sizeof be_index) != 0) {
+                char detail[128];
+                snprintf(detail, sizeof detail, "接口 %lu，errno=%d",
+                         (unsigned long)idx, WSAGetLastError());
+                emit(e, "bind_note", "指定网卡未能锁定出口", detail, -1);
+            }
+        }
     }
 
     memset(&e->peer, 0, sizeof e->peer);

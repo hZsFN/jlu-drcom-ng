@@ -11,8 +11,10 @@ so neither has to poll the engine directly.
 
 from __future__ import annotations
 
+import platform
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -45,6 +47,19 @@ __all__ = ["AppController", "ControllerEvent"]
 
 #: How often the controller ticks (traffic sample, stats checkpoint, status file).
 TICK_INTERVAL = 1.0
+
+#: Lines taken from the tail of each on-disk log when exporting.  Six rotated
+#: files at 8 MB would make a 50 MB attachment; the tail is what diagnoses.
+EXPORT_TAIL_LINES = 4000
+
+
+def _tail_lines(path: Path, limit: int) -> list[str]:
+    """Last *limit* lines of *path*, tolerating a file another thread is writing."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            return [line.rstrip("\n") for line in deque(handle, maxlen=limit)]
+    except OSError as exc:
+        return [f"（无法读取 {path.name}：{exc}）"]
 
 
 @dataclass
@@ -357,7 +372,41 @@ class AppController:
         self.traffic.set_source_address(address)
         self.probe.set_source_address(address)
 
+    def _log_engine_event(self, event: EngineEvent) -> None:
+        """Mirror engine events into the log file.
+
+        The UI reacts to these events, so until now nothing wrote them down and
+        a failure left only ``last_error`` in memory.  A user reporting "it does
+        not work" could export a log that said "已开始认证" and stopped there --
+        the reason was nowhere on disk.  Failures are recorded at WARNING/ERROR
+        so they survive any log level the user picks.
+        """
+        kind = event.kind
+        detail = f"（{event.detail}）" if event.detail else ""
+        text = event.message or kind
+        if kind == "login_failed":
+            code = f" 错误码 0x{event.error_code:02X}" if event.error_code else ""
+            self.log.warning("认证失败：%s%s%s", text, code, detail)
+        elif kind in ("challenge_failed", "keepalive_failed", "login_timeout", "error"):
+            self.log.warning("%s%s", text, detail)
+        elif kind in ("bind_failed", "fatal"):
+            self.log.error("%s%s", text, detail)
+        elif kind in ("gave_up", "reconnect_disabled"):
+            self.log.warning("%s%s", text, detail)
+        elif kind in ("online", "healed"):
+            self.log.info("%s%s", text, f" IP {event.ip}" if event.ip else "")
+        elif kind == "retry_scheduled":
+            self.log.info("%s%s", text, detail)
+        elif kind == "stopped":
+            self.log.info("认证已停止（%s）", event.message or "用户或核心主动停止")
+        elif kind == "ip":
+            self.log.debug("本机 IP：%s", event.ip or text)
+        elif kind in ("state", "started"):
+            self.log.debug("%s", text)
+        # keepalive_ok fires every 20 s; writing it would bury everything else.
+
     def _on_engine_event(self, event: EngineEvent) -> None:
+        self._log_engine_event(event)
         if event.kind in ("ip", "online", "started"):
             self._bind_traffic_to_session()
         if event.kind == "login_failed":
@@ -632,8 +681,50 @@ class AppController:
         return autostart_command()
 
     def export_logs(self, destination: Path | None = None) -> Path:
-        destination = destination or (self.data_dir / "logs" / "export.log")
-        return self.log.export(Path(destination))
+        """Write one shareable report: header, in-memory buffer, every log file.
+
+        The buffer alone was not enough.  It holds the last 2000 lines, so a
+        failure from an hour earlier -- or anything the native core printed
+        before the window opened -- was missing from the file users attach to a
+        bug report, and the report read like nothing had happened at all.
+        """
+        destination = Path(destination) if destination else (self.data_dir / "logs" / "export.log")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        log_dir = self.data_dir / "logs"
+
+        lines: list[str] = [
+            "# JLU DrCOM NG 日志导出",
+            f"# 版本：{__version__}",
+            f"# 导出时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"# 系统：{platform.platform()}",
+            f"# Python：{platform.python_version()}",
+            f"# 当前状态：{self.state.value}  在线：{'是' if self.online else '否'}",
+            f"# 最后错误：{self.last_error or '（无）'}",
+            "# 账号已脱敏，密码从不记录；此文件可直接发给维护者。",
+            "",
+        ]
+
+        buffer = self.log.snapshot()
+        lines.append(f"===== 内存缓冲（最近 {len(buffer)} 行）=====")
+        for record in buffer:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(record.timestamp))
+            lines.append(f"{stamp} {record.level:<7} {record.message}")
+
+        for path in sorted(log_dir.glob("drcom-*.log*")):
+            if path.resolve() == destination.resolve():
+                continue
+            lines.append("")
+            lines.append(f"===== {path.name}（文件尾部 {EXPORT_TAIL_LINES} 行）=====")
+            lines.extend(_tail_lines(path, EXPORT_TAIL_LINES))
+
+        core_log = log_dir / "drcomd-core.log"
+        if core_log.exists():
+            lines.append("")
+            lines.append(f"===== {core_log.name}（原生核心自身输出）=====")
+            lines.extend(_tail_lines(core_log, EXPORT_TAIL_LINES))
+
+        destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return destination
 
     @property
     def uptime(self) -> float:

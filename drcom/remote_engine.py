@@ -324,13 +324,42 @@ class RemoteEngine:
         while not self._stop.is_set():
             payload = _request(self.api_port, "/status")
             if payload is None:
-                # The daemon died under us: that is fatal, not a retry.
+                # The daemon is gone.  Why it went decides what the window does
+                # next, so report the exit code rather than a generic "fatal":
+                # the tray menu is the daemon's own, and quitting from it means
+                # the whole program -- leaving this window behind is the
+                # "退出后还有残留" report.
+                exit_code = self._daemon_exit_code()
                 self.state = EngineState.FATAL
-                self._emit("fatal", "原生核心没有响应", detail="drcomd 可能已退出。")
+                self._emit(
+                    "core_gone",
+                    "原生核心已退出",
+                    detail=(
+                        "drcomd 从托盘菜单退出。" if exit_code == 0
+                        else f"drcomd 异常退出（退出码 {exit_code}）。" if exit_code is not None
+                        else "drcomd 已退出。"
+                    ),
+                    payload={"exit_code": exit_code},
+                )
                 return
             self._apply(payload)
             self._drain_logs()
             self._stop.wait(POLL_INTERVAL)
+
+    def _daemon_exit_code(self) -> int | None:
+        """The core's exit code, or None when we never started it ourselves.
+
+        A core that was already resident when the window opened belongs to
+        someone else's launch, so there is no return code to read -- and
+        "unknown" must not be mistaken for "crashed".
+        """
+        process = self._process
+        if process is None:
+            return None
+        try:
+            return process.poll()
+        except Exception:
+            return None
 
     def _apply(self, payload: dict) -> None:
         """Fold one /status document into our local state, emitting on change."""
@@ -423,7 +452,14 @@ class RemoteEngine:
 
     # -- events ----------------------------------------------------------
     def _emit(
-        self, kind: str, message: str = "", *, detail: str = "", advice: str = "", ip: str = ""
+        self,
+        kind: str,
+        message: str = "",
+        *,
+        detail: str = "",
+        advice: str = "",
+        ip: str = "",
+        payload: dict | None = None,
     ) -> None:
         event = EngineEvent(
             kind=kind,
@@ -432,6 +468,7 @@ class RemoteEngine:
             ip=ip or self.ip,
             advice=advice,
             detail=detail,
+            payload=dict(payload or {}),
         )
         with self._lock:
             listeners = list(self._listeners)

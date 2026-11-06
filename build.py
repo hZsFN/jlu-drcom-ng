@@ -213,6 +213,14 @@ def build(*, onefile: bool = False, name: str = "JLU-DrCOM-NG", console: bool = 
         if path.exists():
             arguments += ["--add-data", f"{path}{';' if sys.platform == 'win32' else ':'}."]
 
+    # The troubleshooting guide has to be on the failing machine: a client that
+    # cannot authenticate usually cannot reach the internet either, so the app
+    # renders the shipped copy instead of handing the user to a browser.
+    guide = ROOT / "docs" / "troubleshooting.md"
+    if guide.exists():
+        arguments += ["--add-data", f"{guide}{';' if sys.platform == 'win32' else ':'}docs"]
+        print(f"bundling troubleshooting guide: {guide.stat().st_size:,} bytes")
+
     arguments.append(str(ROOT / "main.py"))
 
     print("running PyInstaller ...")

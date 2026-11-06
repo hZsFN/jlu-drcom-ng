@@ -104,6 +104,7 @@ class DrcomApp:
         self._log_rows: list[ft.Control] = []
         self._log_paused = False
         self._pending_log_count = 0
+        self._selfcheck_running = False
         self._last_tooltip = ""
         self._last_status_snapshot = ""
 
@@ -1352,6 +1353,32 @@ class DrcomApp:
                     spacing=10,
                     wrap=True,
                 ),
+                self._panel(
+                    ft.Column(
+                        [
+                            self._text(
+                                "连不上、卡在获取挑战码、报端口被占——先跑一次自检，"
+                                "它会把账号、端口、路由、核心、自启、权限逐项查一遍；"
+                                "需要管理员权限的项目会明确标为「跳过」，不会假装通过。",
+                                color=self.palette.text_dim, size=self.hud.size_body,
+                            ),
+                            ft.Row(
+                                [
+                                    self._button("常见错误检测", self._on_selfcheck,
+                                                 accent=self.palette.amber, icon=ft.Icons.TROUBLESHOOT),
+                                    self._button("排障指南", self._on_open_guide,
+                                                 accent=self.palette.cyan, icon=ft.Icons.MENU_BOOK),
+                                    self._button("在线文档", self._on_open_guide_online,
+                                                 accent=self.palette.violet, icon=ft.Icons.PUBLIC),
+                                ],
+                                spacing=10,
+                                wrap=True,
+                            ),
+                        ],
+                        spacing=10,
+                    ),
+                    title="遇到问题",
+                ),
             ],
             spacing=self.hud.gap,
             scroll=ft.ScrollMode.AUTO,
@@ -1387,6 +1414,100 @@ class DrcomApp:
     def _on_export_logs(self, _event) -> None:
         path = self.controller.export_logs()
         self._flash(f"日志已导出到 {path}", True)
+
+    # -- troubleshooting entry points ------------------------------------
+    def _on_selfcheck(self, _event) -> None:
+        """Run every cheap check off the UI thread.
+
+        The probes shell out (netsh, Get-NetRoute) and a route query on a slow
+        machine takes seconds; doing that on the Flet thread freezes the window
+        and looks like a crash, which is the one impression a diagnostic tool
+        must never give.
+        """
+        if self._selfcheck_running:
+            return
+        self._selfcheck_running = True
+        self._flash("正在检测…（约需数秒）", True)
+        threading.Thread(target=self._selfcheck_worker, name="selfcheck", daemon=True).start()
+
+    def _selfcheck_worker(self) -> None:
+        from ..selfcheck import run_self_check
+
+        text = ""
+        try:
+            report = run_self_check(self.controller)
+            text = report.to_text()
+        except Exception as exc:
+            self.controller.log.error("常见错误检测失败：%r", exc)
+            text = f"检测未能完成：{exc!r}\n请导出日志反馈。"
+        finally:
+            self._selfcheck_running = False
+        if self.page is None:
+            return
+        try:
+            self.page.run_task(self._show_selfcheck, text)
+        except Exception:
+            pass
+
+    async def _show_selfcheck(self, text: str) -> None:
+        self._show_dialog("常见错误检测", text)
+
+    def _on_open_guide(self, _event) -> None:
+        """Show the guide inside the app.
+
+        A machine that cannot authenticate usually has no working network, so
+        the shipped copy has to render here rather than be handed to a browser.
+        """
+        from ..helpdocs import GUIDE_URL, read_guide
+        from ..single_instance import open_url
+
+        text = read_guide()
+        if not text:
+            self._show_dialog(
+                "排障指南",
+                "没有找到随包安装的 docs/troubleshooting.md。\n"
+                "可以用下面的「在线文档」在浏览器里打开，或从项目主页查看。\n"
+                f"{GUIDE_URL}",
+            )
+            return
+        if self.page is None:
+            return
+        try:
+            body = ft.Markdown(
+                text,
+                selectable=True,
+                extension_set=ft.MarkdownExtensionSet.GITHUB_FLAVORED,
+                code_theme=ft.MarkdownCodeTheme.A11Y_DARK,
+            )
+        except Exception:
+            body = ft.Column(
+                [self._text(line, color=self.palette.text_dim, size=self.hud.size_body, selectable=True)
+                 for line in text.splitlines()],
+                spacing=2,
+                scroll=ft.ScrollMode.AUTO,
+            )
+        dialog = ft.AlertDialog(
+            modal=False,
+            title=self._text("常见故障排障指南", color=self.palette.cyan, size=self.hud.size_title, mono=True),
+            content=ft.Container(
+                content=ft.Column([body], scroll=ft.ScrollMode.AUTO, expand=True),
+                width=820,
+                height=600,
+            ),
+            bgcolor=self.palette.panel,
+            actions=[
+                self._button("在线文档", lambda e: open_url(GUIDE_URL), accent=self.palette.violet),
+                self._button("知道了", lambda e: self._close_dialog(), accent=self.palette.cyan),
+            ],
+        )
+        self.page.show_dialog(dialog)
+
+    def _on_open_guide_online(self, _event) -> None:
+        from ..helpdocs import GUIDE_URL
+        from ..single_instance import open_url
+
+        open_url(GUIDE_URL)
+        self._flash("已在浏览器中打开在线文档", True)
 
     def _on_open_log_dir(self, _event) -> None:
         from ..single_instance import open_in_file_manager
@@ -1967,6 +2088,8 @@ class DrcomApp:
             self._notify_tray("需要处理", inner.message)
         elif inner.kind == "bind_failed":
             self._notify_tray("端口冲突", inner.message)
+        elif inner.kind == "core_gone":
+            self._notify_tray("原生核心已退出", inner.detail)
         try:
             self._update_tooltip(self._build_telemetry())
         except Exception:
@@ -1994,6 +2117,8 @@ class DrcomApp:
             elif inner.kind == "bind_failed":
                 self._set_alert(inner.message, inner.detail, color=self.palette.danger)
                 self._notify_tray("端口冲突", inner.message)
+            elif inner.kind == "core_gone":
+                self._on_core_gone(inner)
             elif inner.kind in ("challenge_failed", "keepalive_failed", "gave_up"):
                 self._set_alert(inner.message, inner.detail, color=self.palette.amber)
             elif inner.kind == "state" and inner.message:
@@ -2012,6 +2137,41 @@ class DrcomApp:
             self._on_reconnect(None)
         elif event.kind == "tray_quit":
             self._quit()
+
+    def _on_core_gone(self, inner) -> None:
+        """The native core is gone: follow it, or bring it back.
+
+        Quitting from the tray menu is the core's own gesture, and it means the
+        program -- the tray icon the user just dismissed *is* the whole window
+        in native mode, so leaving this process behind is precisely the
+        "托盘退出后还有 JLU-DrCOM-NG.exe 残留" report.  A core that died by
+        itself is a different event: nothing was asked for, so restart it, and
+        when that fails close *without* the stop marker so a watchdog can bring
+        the program back.
+        """
+        exit_code = (inner.payload or {}).get("exit_code")
+        if exit_code == 0:
+            self._flash("原生核心已从托盘退出，客户端一并关闭。", True)
+            self._quit()
+            return
+        engine = self.controller.engine
+        restart = getattr(engine, "restart_daemon", None)
+        restarted = False
+        if callable(restart):
+            try:
+                restart()
+                restarted = bool(getattr(engine, "is_running", False))
+            except Exception as exc:
+                self.controller.log.error("重启原生核心失败：%r", exc)
+        if restarted:
+            self._set_alert("原生核心已重新启动。", inner.detail, color=self.palette.amber)
+            return
+        self._set_alert(
+            inner.message,
+            f"{inner.detail} 客户端将随之退出，已设置看门狗时会自动重新拉起。",
+            color=self.palette.danger,
+        )
+        self._quit(deliberate=False)
 
     def _notify_tray(self, title: str, message: str) -> None:
         if self._tray is not None:
@@ -2323,7 +2483,7 @@ class DrcomApp:
         self.controller.shutdown()
         self._exit_now.set()
 
-    def _quit(self) -> None:
+    def _quit(self, deliberate: bool = True) -> None:
         # No window means nothing to tear down: hand the decision to the
         # run_gui loop, which is parked in wait_for_show() and can exit
         # without the os._exit hammer.
@@ -2334,13 +2494,16 @@ class DrcomApp:
 
         # Tell the watchdog this exit was asked for.  Without it, "退出" in the
         # tray menu would be answered by the supervisor starting the app right
-        # back up -- a fight the user cannot win.
-        try:
-            from ..watchdog import StopMarker
+        # back up -- a fight the user cannot win.  An exit forced by a core that
+        # died on its own is the opposite case: that one *wants* the restart,
+        # so the marker stays unwritten.
+        if deliberate:
+            try:
+                from ..watchdog import StopMarker
 
-            StopMarker(self.controller.data_dir).write()
-        except Exception:
-            pass
+                StopMarker(self.controller.data_dir).write()
+            except Exception:
+                pass
 
         if self._tray is not None:
             self._tray.stop()

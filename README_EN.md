@@ -154,11 +154,16 @@ Windows is the primary target. Python 3.10 or newer.
 
 ```bash
 python main.py --selftest     # MD4 vectors, packet sizes, crypto backends
-python main.py --doctor       # is port 61440 usable? if not, why?
+python main.py --doctor       # account / port / route / core / autostart / privilege
 ```
 
-Both are offline and safe. If `--doctor` reports a port problem it prints the
-actual cause and what to do about it.
+Both are offline and safe. `--doctor` prints the same report as the **常见错误检测**
+button on the app's About page (checks that a standard user cannot perform are
+marked 「跳过」, never 「通过」); a failure makes the exit code non-zero.
+
+When it does not connect, read docs/troubleshooting.md (the troubleshooting guide)
+first — it walks wired dorm port → egress interface → port 61440 → what the
+server actually answered, which locates most reports in two steps.
 
 ### 3. Configure
 

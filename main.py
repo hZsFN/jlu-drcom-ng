@@ -194,24 +194,23 @@ def _selftest() -> int:
 
 
 def _doctor(data_dir: Path | None) -> int:
+    """Print the same report the GUI's 「常见错误检测」 shows.
+
+    A machine that cannot authenticate is frequently the machine that cannot be
+    walked through a GUI over a chat window, so the terminal has to be able to
+    answer the same questions -- and with the same words, because a second,
+    divergent explanation is worse than none.
+    """
     from drcom.controller import AppController
+    from drcom.selfcheck import FAIL, run_self_check
 
     controller = AppController(data_dir=data_dir, log_level="WARNING")
-    data = controller.diagnostics()
-    print(f"版本            : {data['version']}")
-    print(f"数据目录        : {data['data_dir']}")
-    print(f"认证服务器      : {controller.config.auth.server}:{controller.config.auth.port}")
-    print(f"绑定端口        : {data['bind_port']}  ({'可用' if data['bind_free'] else '不可用'})")
-    print(f"本机路由 IP     : {data['local_ip']}")
-    if data["bind_error_code"]:
-        from drcom.binding import diagnose_bind_error
-
-        print()
-        print(diagnose_bind_error(data["bind_port"], data["bind_error_code"]).to_text())
-    print(f"\n排除端口区间（netsh）: {data['excluded_ranges'] or '（无 / 读不到）'}")
-    print(f"端口是否落在其中      : {data['excluded_covers_port']}")
-    controller.shutdown()
-    return 0 if data["bind_free"] else 1
+    try:
+        report = run_self_check(controller)
+        print(report.to_text())
+        return 1 if any(check.status == FAIL for check in report.checks) else 0
+    finally:
+        controller.shutdown()
 
 
 def _force_utf8_console() -> None:

@@ -20,6 +20,8 @@ __all__ = [
     "disable_autostart",
     "enable_autostart",
     "is_autostart_enabled",
+    "open_in_file_manager",
+    "open_url",
 ]
 
 IS_WINDOWS = sys.platform == "win32"
@@ -239,6 +241,25 @@ def disable_autostart() -> tuple[bool, str]:
         return True, "已取消开机自启"
     except OSError as exc:
         return False, f"删除 {path} 失败：{exc}"
+
+
+def open_url(url: str) -> None:
+    """Hand *url* to the user's default browser.
+
+    ``os.startfile`` routes through the shell association, which is what makes
+    the default browser (whatever it is) open instead of a hard-coded one.
+    """
+    if not url:
+        return
+    try:
+        if IS_WINDOWS:
+            os.startfile(url)                      # noqa: S606 - shell handler intended
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", url])
+        else:
+            subprocess.Popen(["xdg-open", url])
+    except OSError:
+        pass
 
 
 def open_in_file_manager(path: Path) -> None:

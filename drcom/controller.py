@@ -389,7 +389,7 @@ class AppController:
             self.log.warning("认证失败：%s%s%s", text, code, detail)
         elif kind in ("challenge_failed", "keepalive_failed", "login_timeout", "error"):
             self.log.warning("%s%s", text, detail)
-        elif kind in ("bind_failed", "fatal"):
+        elif kind in ("bind_failed", "fatal", "core_gone"):
             self.log.error("%s%s", text, detail)
         elif kind in ("gave_up", "reconnect_disabled"):
             self.log.warning("%s%s", text, detail)
@@ -446,18 +446,22 @@ class AppController:
                     detail=event.detail,
                 )
             )
-        elif event.kind == "fatal":
+        elif event.kind in ("fatal", "core_gone"):
             self.last_error = event.message
             self.last_advice = event.advice
-            self.notifier.notify(
-                NotificationEvent(
-                    kind="error",
-                    title="认证被中止，需要处理",
-                    body=event.message,
-                    detail=event.advice,
-                    error_code=event.error_code,
+            # A tray-menu quit is the user getting rid of the program, not a
+            # failure to report back to them: the window is already closing.
+            deliberate = event.kind == "core_gone" and event.payload.get("exit_code") == 0
+            if not deliberate:
+                self.notifier.notify(
+                    NotificationEvent(
+                        kind="error",
+                        title="原生核心已退出" if event.kind == "core_gone" else "认证被中止，需要处理",
+                        body=event.message,
+                        detail=event.detail or event.advice,
+                        error_code=event.error_code,
+                    )
                 )
-            )
         elif event.kind in ("challenge_failed", "keepalive_failed", "gave_up"):
             self.last_error = event.message
             if event.detail:
@@ -653,7 +657,17 @@ class AppController:
         """
         if enabled:
             ok, message = task_autostart.install_current(minimized=True)
-            if not ok:
+            if ok:
+                # The task wins, so the Run key has to go: it is only the
+                # fallback for machines where the task cannot be registered, and
+                # a leftover value from an earlier failed attempt would launch a
+                # *second* copy at logon alongside the task.  The two instances
+                # then fight over the single-instance mutex and the 61440 bind,
+                # which looks like a random startup failure.
+                if is_autostart_enabled():
+                    disable_autostart()
+                    message = f"{message}（已移除旧的注册表自启，避免开机拉起两份）"
+            else:
                 fallback_ok, fallback_message = enable_autostart(minimized=True)
                 if fallback_ok:
                     ok, message = True, f"{fallback_message}（计划任务注册失败：{message}）"

@@ -1,6 +1,6 @@
 CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -std=c99 -D_GNU_SOURCE
-VERSION := $(shell sed -n 's/^__version__ *= *"\([^"]*\)"/\1/p' ../drcom/__init__.py 2>/dev/null || echo 2.2.0)
+VERSION := $(shell sed -n 's/^__version__ *= *"\([^"]*\)"/\1/p' ../drcom/__init__.py 2>/dev/null || echo 2.2.1)
 CFLAGS  += -DDRCOMD_VERSION=\"$(VERSION)\"
 LDFLAGS ?= -lpthread -lcrypto
 

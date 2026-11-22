@@ -110,12 +110,12 @@
 本仓库的源码树里**不含**可直接双击运行的成品，`.exe` 只在 Releases 的 Assets 里。
 打开链接 → 拉到最下面 `Assets` → 点文件名下载。
 
-- `JLU-DrCOM-NG-2.2.0-setup.exe` —— Windows 安装版（推荐，支持安装后自动更新平滑替换）
-- `JLU-DrCOM-NG-2.2.0-windows-x64.zip` —— Windows 绿色便携版
-- `jlu-drcom-ng_2.2.0_amd64.deb` —— Debian / Ubuntu 系安装包（`sudo apt install ./jlu-drcom-ng_2.2.0_amd64.deb`）
-- `jlu-drcom-ng-2.2.0-1.x86_64.rpm` —— RedHat / Fedora / Rocky / Alma / openSUSE 系安装包（`sudo dnf install ./jlu-drcom-ng-2.2.0-1.x86_64.rpm`）
-- `jlu-drcom-ng-2.2.0-1-x86_64.pkg.tar.zst` —— Arch Linux 系安装包（`sudo pacman -U jlu-drcom-ng-2.2.0-1-x86_64.pkg.tar.zst`）
-- `JLU-DrCOM-NG-2.2.0-linux-x86_64.tar.gz` / `drcomd-2.2.0-linux-x86_64.tar.gz` —— Linux 通用桌面压缩包与纯原生无界面守护进程版
+- `JLU-DrCOM-NG-2.2.1-setup.exe` —— Windows 安装版（推荐，支持安装后自动更新平滑替换）
+- `JLU-DrCOM-NG-2.2.1-windows-x64.zip` —— Windows 绿色便携版
+- `jlu-drcom-ng_2.2.1_amd64.deb` —— Debian / Ubuntu 系安装包（`sudo apt install ./jlu-drcom-ng_2.2.1_amd64.deb`）
+- `jlu-drcom-ng-2.2.1-1.x86_64.rpm` —— RedHat / Fedora / Rocky / Alma / openSUSE 系安装包（`sudo dnf install ./jlu-drcom-ng-2.2.1-1.x86_64.rpm`）
+- `jlu-drcom-ng-2.2.1-1-x86_64.pkg.tar.zst` —— Arch Linux 系安装包（`sudo pacman -U jlu-drcom-ng-2.2.1-1-x86_64.pkg.tar.zst`）
+- `JLU-DrCOM-NG-2.2.1-linux-x86_64.tar.gz` / `drcomd-2.2.1-linux-x86_64.tar.gz` —— Linux 通用桌面压缩包与纯原生无界面守护进程版
 
 **双击装不上就右键「以管理员身份运行」。** 安装包要往 `C:\Program Files` 写文件，
 所以它会申请管理员权限；如果你用的账号关掉了 UAC 提示、或者双击后**窗口一闪就没了 /

@@ -26,7 +26,7 @@ if errorlevel 1 (
     exit /b 2
 )
 
-set "DRCOMD_VER=2.2.0"
+set "DRCOMD_VER=2.2.1"
 for /f "tokens=2 delims== " %%A in ('findstr /B "__version__" ..\drcom\__init__.py') do set "DRCOMD_VER=%%~A"
 
 set "CFLAGS=/nologo /Os /GL /Gy /MT /W3 /utf-8 /D_CRT_SECURE_NO_WARNINGS /DDRCOMD_VERSION=\"!DRCOMD_VER!\""

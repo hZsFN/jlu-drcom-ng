@@ -11,7 +11,7 @@
 #include "tray.h"
 
 #ifndef DRCOMD_VERSION
-#define DRCOMD_VERSION "2.2.0"
+#define DRCOMD_VERSION "2.2.1"
 #endif
 
 #ifdef _WIN32

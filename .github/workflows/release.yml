@@ -56,6 +56,17 @@ jobs:
           rpm -qp --requires release/*.rpm
           tar --zstd -tf release/*.pkg.tar.zst | head -n 30
 
+      - name: Upload Linux packages as workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: jlu-drcom-ng-linux-packages
+          path: |
+            release/*.tar.gz
+            release/*.deb
+            release/*.rpm
+            release/*.pkg.tar.zst
+            release/SHA256SUMS.txt
+
       - name: Upload Linux artefacts and merge SHA256SUMS.txt into GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -65,7 +76,7 @@ jobs:
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ -n "${TAG_INPUT}" ]; then
             TAG="${TAG_INPUT}"
           fi
-          gh release view "${TAG}" >/dev/null 2>&1 || gh release create "${TAG}" --title "${TAG}" --notes "power by 哈基米"
+          gh release view "${TAG}" >/dev/null 2>&1 || gh release create "${TAG}" --draft --title "${TAG}" --notes "power by 哈基米"
           # Preserve any existing Windows checksums in SHA256SUMS.txt
           gh release download "${TAG}" -p SHA256SUMS.txt -D release --clobber || true
           python tools/make_release.py --merge-checksums --skip-clean-check --tag-override "${TAG}"
@@ -73,3 +84,4 @@ jobs:
             [ -e "$f" ] || continue
             gh release upload "${TAG}" "$f" --clobber
           done
+          gh release edit "${TAG}" --draft=false --latest

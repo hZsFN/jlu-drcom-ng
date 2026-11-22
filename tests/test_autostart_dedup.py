@@ -28,6 +28,8 @@ def _patch(monkeypatch, *, task_ok: bool, run_present: bool) -> dict:
         calls["run_written"] += 1
         return True, "已写入开机自启"
 
+    monkeypatch.setattr(controller_module.sys, "platform", "win32")
+    monkeypatch.setattr(autostart, "IS_WINDOWS", True)
     monkeypatch.setattr(autostart, "install_current", fake_install_current)
     monkeypatch.setattr(controller_module, "is_autostart_enabled", fake_is_run)
     monkeypatch.setattr(controller_module, "disable_autostart", fake_disable_run)
@@ -71,6 +73,7 @@ def test_the_registration_overwrites_rather_than_appends(monkeypatch) -> None:
         captured["xml"] = Path(args[args.index("/XML") + 1]).read_text(encoding="utf-16")
         return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
+    monkeypatch.setattr(autostart, "IS_WINDOWS", True)
     monkeypatch.setattr(autostart, "_run", fake_run)
     ok, _ = autostart.install_task(r"C:\app.exe", "--watchdog", user_id="PC\\user")
     assert ok

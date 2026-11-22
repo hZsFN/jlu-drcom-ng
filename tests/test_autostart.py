@@ -94,6 +94,7 @@ def test_the_task_name_is_stable() -> None:
 def test_install_reports_a_failure_instead_of_raising(monkeypatch) -> None:
     from drcom import autostart
 
+    monkeypatch.setattr(autostart, "IS_WINDOWS", True)
     monkeypatch.setattr(
         autostart, "_run",
         lambda args: type("R", (), {"returncode": 1, "stdout": "", "stderr": "Access is denied."})(),
@@ -105,6 +106,7 @@ def test_install_reports_a_failure_instead_of_raising(monkeypatch) -> None:
 def test_install_hands_the_tool_a_readable_definition(monkeypatch) -> None:
     from drcom import autostart
 
+    monkeypatch.setattr(autostart, "IS_WINDOWS", True)
     captured: dict = {}
 
     def fake_run(args):
@@ -124,6 +126,7 @@ def test_install_hands_the_tool_a_readable_definition(monkeypatch) -> None:
 def test_a_missing_task_is_not_an_error_when_removing(monkeypatch) -> None:
     from drcom import autostart
 
+    monkeypatch.setattr(autostart, "IS_WINDOWS", True)
     monkeypatch.setattr(
         autostart, "_run",
         lambda args: type("R", (), {"returncode": 1, "stdout": "", "stderr": "ERROR: cannot find"})(),

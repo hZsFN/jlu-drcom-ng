@@ -53,8 +53,21 @@ def test_two_default_routes_are_called_out(controller, quiet_probes, monkeypatch
     """热点或 VPN 抢走默认路由，包根本到不了认证服务器。"""
     from drcom import selfcheck
 
-    routes = "12\t192.168.43.1\t55\n7\t49.140.193.254\t25\n"
-    monkeypatch.setattr(selfcheck, "_run", lambda cmd, **k: routes if "Get-NetRoute" in " ".join(cmd) else "")
+    win_routes = "12\t192.168.43.1\t55\n7\t49.140.193.254\t25\n"
+    linux_routes = (
+        "default via 192.168.43.1 dev wlan0 metric 55\n"
+        "default via 49.140.193.254 dev eth0 metric 25\n"
+    )
+
+    def fake_run(cmd, **k):
+        joined = " ".join(cmd)
+        if "Get-NetRoute" in joined:
+            return win_routes
+        if cmd and cmd[0] == "ip" and "route" in joined:
+            return linux_routes
+        return ""
+
+    monkeypatch.setattr(selfcheck, "_run", fake_run)
     report = selfcheck.run_self_check(controller)
     route = report.of("route")
     assert route.status == "warn"
@@ -65,8 +78,18 @@ def test_two_default_routes_are_called_out(controller, quiet_probes, monkeypatch
 def test_one_default_route_is_fine(controller, quiet_probes, monkeypatch) -> None:
     from drcom import selfcheck
 
-    routes = "7\t49.140.193.254\t25\n"
-    monkeypatch.setattr(selfcheck, "_run", lambda cmd, **k: routes if "Get-NetRoute" in " ".join(cmd) else "")
+    win_routes = "7\t49.140.193.254\t25\n"
+    linux_routes = "default via 49.140.193.254 dev eth0 metric 25\n"
+
+    def fake_run(cmd, **k):
+        joined = " ".join(cmd)
+        if "Get-NetRoute" in joined:
+            return win_routes
+        if cmd and cmd[0] == "ip" and "route" in joined:
+            return linux_routes
+        return ""
+
+    monkeypatch.setattr(selfcheck, "_run", fake_run)
     report = selfcheck.run_self_check(controller)
     assert report.of("route").status == "ok"
 
@@ -79,7 +102,7 @@ def test_a_reserved_port_is_a_failure_with_the_fix(controller, quiet_probes, mon
     reserved = report.of("reserved")
     assert reserved.status == "fail"
     assert "61000-62000" in reserved.detail
-    assert "dynamicport" in reserved.advice
+    assert "dynamicport" in reserved.advice or "sysctl" in reserved.advice
 
 
 def test_a_blocked_port_reports_alternatives(controller, quiet_probes, monkeypatch) -> None:

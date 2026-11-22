@@ -33,8 +33,12 @@ jobs:
       - name: Run Python test suite & offline selftest
         run: |
           python -m pytest -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python main.py --selftest
-          python main.py --doctor || echo "doctor exited with non-zero on CI runner as expected"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python main.py --doctor
+          Write-Host "doctor completed (exit $LASTEXITCODE)"
+          exit 0
 
   linux:
     runs-on: ubuntu-latest
@@ -63,7 +67,7 @@ jobs:
       - name: Build & test native C core (GCC)
         run: make -C native test
 
-      - name: Run Python test suite & offline selftest
+      - name: Run Python test suite & offline selftest (Linux)
         run: |
           python -m pytest -q
           python main.py --selftest

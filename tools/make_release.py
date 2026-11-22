@@ -48,8 +48,10 @@ def run(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
 
 def tag_version() -> str:
     """The version from the newest tag, e.g. ``v1.0.0`` -> ``1.0.0``."""
-    tag = run(["git", "describe", "--tags", "--abbrev=0"]).stdout.strip()
-    return tag.lstrip("v")
+    res = run(["git", "describe", "--tags", "--abbrev=0"], check=False)
+    if res.returncode != 0:
+        return ""
+    return res.stdout.strip().lstrip("v")
 
 
 def source_version() -> str:

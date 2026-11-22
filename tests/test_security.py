@@ -341,3 +341,32 @@ def test_netiface_has_no_unused_run_helper() -> None:
     import drcom.netiface as netiface
 
     assert not hasattr(netiface, "_run"), "the unused _run helper should be removed"
+
+
+def test_origin_is_same_site_blocks_prefix_and_host_spoofing() -> None:
+    from drcom.statusapi import _origin_is_same_site
+
+    assert _origin_is_same_site("http://127.0.0.1:8848", "127.0.0.1:8848")
+    assert _origin_is_same_site("http://localhost:3000", "127.0.0.1:8848")
+    assert _origin_is_same_site("http://[::1]:8848", "127.0.0.1:8848")
+    # Prefix spoof must be rejected (startswith bug in v2.1.1)
+    assert not _origin_is_same_site("http://127.0.0.1.evil.com", "127.0.0.1:8848")
+    assert not _origin_is_same_site("http://localhost.attacker.org:8848", "127.0.0.1:8848")
+    assert not _origin_is_same_site("http://127.0.0.1@evil.com", "127.0.0.1:8848")
+    assert not _origin_is_same_site("https://evil.example", "127.0.0.1:8848")
+
+
+def test_status_server_never_logs_plaintext_control_token(controller) -> None:
+    from drcom.statusapi import StatusServer
+
+    srv = StatusServer(controller, host="127.0.0.1", port=0, log=controller.log)
+    ok, _msg = srv.start()
+    try:
+        assert ok
+        token = srv.control_token
+        assert token
+        joined = "\n".join(r.message for r in controller.log.snapshot())
+        assert token not in joined
+    finally:
+        srv.stop()
+

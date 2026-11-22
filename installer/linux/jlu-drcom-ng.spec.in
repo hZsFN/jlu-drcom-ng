@@ -1,0 +1,45 @@
+%global debug_package %{nil}
+%global __os_install_post %{nil}
+%global __brp_strip %{nil}
+%global __brp_strip_comment_note %{nil}
+%global __brp_strip_static_archive %{nil}
+%global _build_id_links none
+AutoReqProv: no
+
+Name:           jlu-drcom-ng
+Version:        @VERSION@
+Release:        1%{?dist}
+Summary:        Jilin University Dr.COM campus network client (HUD GUI + native drcomd)
+
+License:        AGPL-3.0-only
+URL:            https://github.com/hZsFN/jlu-drcom-ng
+Requires:       openssl-libs, iproute
+
+%description
+JLU DrCOM NG campus network authenticator for Jilin University with HUD UI,
+native lightweight drcomd daemon, headless CLI, and systemd --user support.
+
+%install
+rm -rf %{buildroot}
+mkdir -p %{buildroot}
+cp -af @STAGE_DIR@/* %{buildroot}/
+
+%files
+/opt/jlu-drcom-ng
+/usr/bin/jlu-drcom-ng
+/usr/bin/drcomd
+/usr/lib/systemd/user/jlu-drcom-ng.service
+/usr/share/applications/jlu-drcom-ng.desktop
+/usr/share/icons/hicolor/256x256/apps/jlu-drcom-ng.png
+/usr/share/doc/jlu-drcom-ng
+/usr/share/licenses/jlu-drcom-ng
+
+%post
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || :
+fi
+
+%postun
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || :
+fi

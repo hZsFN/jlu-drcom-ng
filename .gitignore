@@ -39,6 +39,7 @@ tools/swap-readme-*.py
 native/obj/
 native/bin/
 native/*.obj
+native/drcomd
 native/drcomd.exe
 native/tests/*.exe
 native/tests/*.obj

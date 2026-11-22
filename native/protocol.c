@@ -53,6 +53,12 @@ int proto_password_padding(int pw_len, int *extra, int *jlu_padding)
     return PROTO_OK;
 }
 
+static void secure_wipe(void *ptr, size_t len)
+{
+    volatile uint8_t *p = (volatile uint8_t *)ptr;
+    while (len--) *p++ = 0;
+}
+
 /* --------------------------------------------------------------- MD5s */
 void proto_md5a(const uint8_t *pw, size_t pwlen, const uint8_t seed[4], uint8_t out[16])
 {
@@ -62,6 +68,7 @@ void proto_md5a(const uint8_t *pw, size_t pwlen, const uint8_t seed[4], uint8_t 
     memcpy(buf + 2, seed, 4);
     if (pwlen) memcpy(buf + 6, pw, pwlen);
     md5_digest(buf, 6 + pwlen, out);
+    secure_wipe(buf, 6 + pwlen);
 }
 
 void proto_md5b(const uint8_t *pw, size_t pwlen, const uint8_t seed[4], uint8_t out[16])
@@ -74,6 +81,7 @@ void proto_md5b(const uint8_t *pw, size_t pwlen, const uint8_t seed[4], uint8_t 
     if (pwlen) memcpy(buf + 1, pw, pwlen);
     memcpy(buf + 1 + pwlen, seed, 4);
     md5_digest(buf, 1 + pwlen + 4 + 4, out);
+    secure_wipe(buf, sizeof buf);
 }
 
 void proto_mac_xor_md5a(const uint8_t digest[16], const uint8_t mac[6], uint8_t out[6])
@@ -100,8 +108,12 @@ void proto_checksum1(const uint8_t *packet, uint8_t out[8])
 void proto_checksum2(const uint8_t *prefix, size_t prefix_len,
                      const uint8_t mac[6], uint8_t out[4])
 {
-    int counter = (int)prefix_len - 2;
     uint8_t buf[1 + 512];
+    if (!prefix || !mac || !out || prefix_len < 2 || prefix_len + 16 >= sizeof buf) {
+        if (out) memset(out, 0, 4);
+        return;
+    }
+    int counter = (int)prefix_len - 2;
     memset(buf, 0, sizeof buf);
     memcpy(buf, prefix, prefix_len);
     buf[counter + 2] = 0x01; buf[counter + 3] = 0x26; buf[counter + 4] = 0x07;
@@ -117,6 +129,7 @@ void proto_checksum2(const uint8_t *prefix, size_t prefix_len,
     acc = (uint32_t)(1968ull * acc);
     out[0] = (uint8_t)(acc); out[1] = (uint8_t)(acc >> 8);
     out[2] = (uint8_t)(acc >> 16); out[3] = (uint8_t)(acc >> 24);
+    secure_wipe(buf, sizeof buf);
 }
 
 int proto_gen_crc(const uint8_t seed[4], int encrypt_type, uint8_t out[8])
@@ -172,7 +185,8 @@ int proto_build_login(const char *account, const char *password, const char *mac
     size_t acctlen = strlen(account);
     uint8_t macb[6];
     if (proto_mac_to_bytes(mac, macb) != PROTO_OK) return PROTO_ERR_ARGS;
-    if (acctlen + 20 > 255) return PROTO_ERR_ARGS;
+    /* Account field sits at [20..56) before the fixed 0x20 0x03 marker. */
+    if (acctlen == 0 || acctlen > 36) return PROTO_ERR_ARGS;
 
     int extra = 0, jlu_padding = 0;
     proto_password_padding((int)pwlen, &extra, &jlu_padding);
@@ -238,6 +252,9 @@ int proto_build_login(const char *account, const char *password, const char *mac
     out[counter + ror_padding + 14] = 0x60;
     out[counter + ror_padding + 15] = 0xA2;
 
+    secure_wipe(digest_a, sizeof digest_a);
+    secure_wipe(digest_b, sizeof digest_b);
+    secure_wipe(xored, sizeof xored);
     if (out_len) *out_len = total;
     return PROTO_OK;
 }

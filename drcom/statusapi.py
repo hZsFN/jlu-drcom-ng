@@ -35,6 +35,25 @@ MAX_BODY = 4096
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", ""}
 
 
+def _origin_is_same_site(origin: str, _host: str = "") -> bool:
+    """Validate HTTP Origin header strictly by parsed URL scheme and hostname."""
+    val = (origin or "").strip()
+    if not val or val == "null":
+        return True
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit(val)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False
+    if parsed.username or parsed.password:
+        return False
+    host = (parsed.hostname or "").lower()
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
 def _prometheus_escape(value: str) -> str:
     """Escape a Prometheus label value (backslash, quote, newline)."""
     return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
@@ -205,9 +224,8 @@ class StatusServer:
 
         if self.log:
             self.log.info(
-                "状态接口控制令牌（POST 端点需要它，取值见 %s）：%s",
+                "状态接口控制令牌已写入 %s（POST 端点需通过 X-DrCOM-Token 头携带）",
                 self.controller.data_dir / "api-token.txt",
-                self.control_token,
             )
             if not self.is_loopback:
                 self.log.warning(
@@ -266,14 +284,7 @@ class StatusServer:
             def _origin_is_same_site(self) -> bool:
                 """Reject cross-site requests by Origin, when the browser sends one."""
                 origin = (self.headers.get("Origin") or "").strip()
-                if not origin or origin == "null":
-                    # A missing Origin is normal for non-browser clients; the
-                    # token requirement below still applies.
-                    return True
-                for prefix in ("http://127.0.0.1", "http://localhost", "http://[::1]"):
-                    if origin.startswith(prefix):
-                        return True
-                return False
+                return _origin_is_same_site(origin, self.headers.get("Host") or "")
 
             def _token_ok(self) -> bool:
                 supplied = self.headers.get("X-DrCOM-Token") or ""

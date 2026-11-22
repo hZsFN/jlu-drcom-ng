@@ -49,19 +49,23 @@
 再动手：在「协议参数」里把地址**填死**成想用的那块网卡（面板上有「查看本机可选地址」，
 会列出当前能用的地址），或者打开「改用本机各网卡地址重试」，让它挨个试到通为止。
 
-**密码绝不明文落盘** —— Windows DPAPI，绑定当前 Windows 账号。
+**密码绝不明文落盘** —— Windows 使用 DPAPI（绑定当前系统账号），Linux / macOS 使用 Fernet (`cryptography`) 加密存储；原生核心 `drcomd` 同步支持 `D1:` 与 `F1:`。
+
+**热更新配置** —— 修改账号、切换活跃账号、更改服务器/绑定地址、重连退避策略、延迟探测目标、本地状态接口开关与端口、协议转储等均支持即时生效，无需手动退出重开。
+
+**自动更新** —— 上线联网后自动检查 GitHub Releases 最新版（默认 24 小时一次，也可在「关于」页或 `--cli update` 手动检查；支持配置 HTTPS 镜像前缀），所有下载强制校验 `SHA-256` 校验和与 ZIP/tar 路径安全，支持 Windows 安装包/便携版及 Linux 打包版平滑更新。
 
 **关掉窗口，把整个界面还给系统** —— 界面不是画在主进程里的：Flet 的桌面窗口是一
-个**独立的 `flet.exe` 进程**，实测常驻 **100–190 MB**。绝大多数程序点关闭只是把窗口
+个**独立的 `flet.exe` 进程**（Windows），实测常驻 **100–190 MB**。绝大多数程序点关闭只是把窗口
 藏起来（`visible = False`），那部分内存**一 MB 都不会还给系统**，挂着认证一整天、
 窗口开了又关几十次，它就那么一直占着。
 
 本程序把「认证」和「界面」彻底拆开：
 
-- 认证跑在 **`drcomd.exe`** 里 —— 一个 268 KB 的原生核心，常驻**私有内存约 1 MB**。
-  它自己维持登录与保活，跟窗口没有任何关系，窗口从来不开它也在干活
-- **托盘图标也归它**。所以关闭窗口时整个界面进程（含 `flet.exe`）直接退出，那
-  100–190 MB 当场还给系统，认证一秒都没断 —— 后台不留下任何「等着重建窗口」的东西
+- 认证跑在 **`drcomd`**（Windows `drcomd.exe` / Linux `drcomd`）原生核心里，常驻**私有内存约 1 MB**。
+  它自己维持登录与保活，跟窗口没有任何关系，窗口重新打开时会**无缝接管**正在运行的会话，不中断在线也不丢日志
+- Windows 上**托盘图标也归它**。所以关闭窗口时整个界面进程（含 `flet.exe`）直接退出，那
+  100–190 MB 当场还给系统，认证一秒都没断
 - 想找回来就点托盘图标（或再点一次快捷方式），窗口重新连上正在跑的核心，状态、日志、
   流量立刻补齐 —— 不会因为「又重新登录一次」掉线
 - 托盘图标左下角那个点是状态：**绿＝在线，灰＝没在线**；右键菜单有「打开窗口 /
@@ -106,11 +110,18 @@
 本仓库的源码树里**不含**可直接双击运行的成品，`.exe` 只在 Releases 的 Assets 里。
 打开链接 → 拉到最下面 `Assets` → 点文件名下载。
 
-- `JLU-DrCOM-NG-2.0.0-setup.exe` —— Python + Flet 版，**功能最全**
+- `JLU-DrCOM-NG-2.2.0-setup.exe` —— Windows 安装版（推荐，支持安装后自动更新平滑替换）
+- `JLU-DrCOM-NG-2.2.0-windows-x64.zip` —— Windows 绿色便携版
+- `jlu-drcom-ng_2.2.0_amd64.deb` —— Debian / Ubuntu 系安装包（`sudo apt install ./jlu-drcom-ng_2.2.0_amd64.deb`）
+- `jlu-drcom-ng-2.2.0-1.x86_64.rpm` —— RedHat / Fedora / Rocky / Alma / openSUSE 系安装包（`sudo dnf install ./jlu-drcom-ng-2.2.0-1.x86_64.rpm`）
+- `jlu-drcom-ng-2.2.0-1-x86_64.pkg.tar.zst` —— Arch Linux 系安装包（`sudo pacman -U jlu-drcom-ng-2.2.0-1-x86_64.pkg.tar.zst`）
+- `JLU-DrCOM-NG-2.2.0-linux-x86_64.tar.gz` / `drcomd-2.2.0-linux-x86_64.tar.gz` —— Linux 通用桌面压缩包与纯原生无界面守护进程版
 
 **双击装不上就右键「以管理员身份运行」。** 安装包要往 `C:\Program Files` 写文件，
 所以它会申请管理员权限；如果你用的账号关掉了 UAC 提示、或者双击后**窗口一闪就没了 /
 什么都没发生**，右键 → 以管理员身份运行即可。
+
+**Linux 安装与自启**：解压 `tar.gz` 后运行 `./install.sh --systemd --desktop` 即可安装到 `~/.local` 并注册 `systemd --user` 用户服务（也支持仅 `drcomd` 无头服务器部署）。
 
 安装包没有做代码签名，首次启动会被 SmartScreen 拦一次（「Windows 已保护你的电脑 /
 发布者未知」），点「更多信息 → 仍要运行」就能过。原因和替代方案见
@@ -122,7 +133,7 @@
 pip install -r requirements.txt
 ```
 
-主要面向 Windows，Python 3.10 及以上。
+支持 Windows 与 Linux，Python 3.10 及以上；Linux 编译原生 `drcomd` 需先安装 `libssl-dev`（或 `openssl-devel`），再运行 `make -C native`。
 
 ### 2. 先离线自检
 
@@ -174,7 +185,9 @@ python main.py --cli login              # 前台认证并保持在线
 python main.py --cli status --json      # 查询状态（退出码 0=在线 1=离线）
 python main.py --cli diag               # 61440 被谁占了？
 python main.py --cli probe              # 延迟 / 丢包
+python main.py --cli update [--apply]   # 检查 GitHub Releases 最新版（可选下载校验后更新）
 python main.py --cli export-logs        # 导出日志
+python main.py --cli autostart status   # 开机自启方式（Windows 计划任务 / Linux systemd --user）
 python main.py --cli set --account 2023xxxxxxxx --mac AA:BB:CC:DD:EE:FF --password '***'
 ```
 
@@ -236,11 +249,11 @@ python build.py --onefile       # 单文件 exe
 
 - 「注销」不是真正的注销报文 —— 这个 Dr.COM 变体没有客户端注销包。
   它做的是停止保活并关闭套接字，服务端超时后释放会话。界面上是这么写的，不装。
-- 托盘图标由原生核心提供；退回 Python 引擎时依赖 `pystray`，没有它时程序是最小化而不是隐藏。
+- 托盘图标在 Windows 由 `drcomd.exe` 原生提供，在 Linux 由 Python `pystray` 提供；无托盘环境自动降级为最小化。
 - 关窗释放界面内存之后，重新打开需要重建窗口，约 1 秒；这段时间窗口不在，
   但认证和保活一直是连着的。
 - 界面只有深色主题（HUD 风格需要暗底），另提供高对比度模式。
-- 主要在 Windows 上开发测试；套接字层有 POSIX 分支但跑得少。
+- 同时支持 Windows 与 Linux（`sysfs`/`getifaddrs`、`ss`/`/proc`、`flock`、`systemd --user`、`notify-send`）；macOS 未实机验证。
 
 ---
 

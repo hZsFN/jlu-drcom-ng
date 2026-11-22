@@ -11,8 +11,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <windows.h>
 
+#include "../platform.h"
 #include "../engine.h"
 
 static int saw_online = 0;
@@ -92,16 +92,16 @@ int main(int argc, char **argv)
     if (engine_start(e) != 0) { printf("engine_start failed\n"); return 2; }
 
     for (int i = 0; i < seconds * 10; i++) {
-        Sleep(100);
+        plat_sleep_ms(100);
         if (saw_fatal) break;
     }
 
     printf("\nstopping...\n");
-    DWORD t0 = GetTickCount();
+    double t0 = plat_now_seconds();
     engine_stop(e);
     int joined = engine_join(e, 4000);
-    DWORD elapsed = GetTickCount() - t0;
-    printf("stop took %lu ms (joined=%d)\n\n", (unsigned long)elapsed, joined);
+    unsigned long elapsed = (unsigned long)((plat_now_seconds() - t0) * 1000.0);
+    printf("stop took %lu ms (joined=%d)\n\n", elapsed, joined);
 
     check(joined == 1, "engine thread joined within 4s");
     check(elapsed < 1500, "stop is immediate, not waiting for a 20s keepalive sleep");

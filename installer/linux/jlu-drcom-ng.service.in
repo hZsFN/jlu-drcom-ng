@@ -1,0 +1,14 @@
+[Unit]
+Description=JLU DrCOM NG Campus Network Client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@WORKING_DIR@
+ExecStart=@EXEC_START@
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

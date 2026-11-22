@@ -1,24 +1,44 @@
 /*
  * Loads the settings the Python build already wrote.
  *
- * The file is APPDATA\JLU-DrCOM-NG\config.json.  We do not need a general
- * JSON parser: four scalars per section and one account are enough, so a
- * small scanner that understands "find this key inside this section" keeps
- * the binary at ~150 KB and pulls in no dependency.
+ * The file is %APPDATA%\JLU-DrCOM-NG\config.json (Windows) or
+ * ~/.config/jlu-drcom-ng/config.json (Linux).  A small targeted JSON scanner
+ * keeps the binary tiny and dependency-free.
  *
- * The password is stored as Windows DPAPI ciphertext (tag "D1:" after a
- * Base64 envelope), produced by drcom/secrets_store.py.  CryptUnprotectData
- * reads it back for the same Windows user - no key file, no re-entry.
+ * Passwords:
+ *   - Windows: DPAPI ciphertext ("D1:" prefix), decrypted by CryptUnprotectData.
+ *   - Linux:   Fernet ciphertext ("F1:" prefix), decrypted using key.bin + libcrypto.
  */
+#include "platform.h"
 #include "config.h"
 
-#include <windows.h>
+#ifdef _WIN32
 #include <wincrypt.h>
+#pragma comment(lib, "crypt32.lib")
+#else
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/sha.h>
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#pragma comment(lib, "crypt32.lib")
+/* ---------------------------------------------------------------- file IO */
+static FILE *open_utf8_rb(const char *path)
+{
+#ifdef _WIN32
+    WCHAR wpath[MAX_PATH * 2];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, (int)(sizeof wpath / sizeof wpath[0])) > 0) {
+        return _wfopen(wpath, L"rb");
+    }
+    return fopen(path, "rb");
+#else
+    return fopen(path, "rb");
+#endif
+}
 
 /* ---------------------------------------------------------------- base64 */
 static int b64_val(char c)
@@ -26,18 +46,19 @@ static int b64_val(char c)
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a' + 26;
     if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+') return 62;
-    if (c == '/') return 63;
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
     return -1;
 }
 
-static int base64_decode(const char *in, uint8_t *out, size_t cap)
+static int base64_decode(const char *in, size_t in_len, uint8_t *out, size_t cap)
 {
     size_t n = 0;
     int acc = 0, bits = 0;
-    for (const char *p = in; *p; p++) {
-        if (*p == '=' || *p == '\n' || *p == '\r' || *p == ' ') continue;
-        int v = b64_val(*p);
+    for (size_t i = 0; i < in_len; i++) {
+        char ch = in[i];
+        if (ch == '=' || ch == '\n' || ch == '\r' || ch == ' ') continue;
+        int v = b64_val(ch);
         if (v < 0) return -1;
         acc = (acc << 6) | v;
         bits += 6;
@@ -50,7 +71,8 @@ static int base64_decode(const char *in, uint8_t *out, size_t cap)
     return (int)n;
 }
 
-/* ----------------------------------------------------------------- DPAPI */
+/* ---------------------------------------------------------------- crypto */
+#ifdef _WIN32
 static int dpapi_unprotect(const uint8_t *blob, size_t len, char *out, size_t cap)
 {
     DATA_BLOB in, res;
@@ -60,10 +82,94 @@ static int dpapi_unprotect(const uint8_t *blob, size_t len, char *out, size_t ca
     size_t n = res.cbData < cap - 1 ? res.cbData : cap - 1;
     memcpy(out, res.pbData, n);
     out[n] = '\0';
-    SecureZeroMemory(res.pbData, res.cbData);
+    plat_secure_zero(res.pbData, res.cbData);
     LocalFree(res.pbData);
     return 0;
 }
+#else
+static int fernet_unprotect(const uint8_t *token_b64, size_t token_b64_len,
+                            const char *key_path, char *out, size_t cap,
+                            char *err, size_t errcap)
+{
+    if (!key_path || !key_path[0]) {
+        snprintf(err, errcap, "缺少 key.bin，无法解密 Fernet 密码");
+        return -1;
+    }
+    FILE *kf = fopen(key_path, "rb");
+    if (!kf) {
+        snprintf(err, errcap, "无法打开密钥文件 %s", key_path);
+        return -1;
+    }
+    uint8_t raw_key[32];
+    size_t kgot = fread(raw_key, 1, sizeof raw_key, kf);
+    fclose(kf);
+    if (kgot < 32) {
+        plat_secure_zero(raw_key, sizeof raw_key);
+        snprintf(err, errcap, "密钥文件 key.bin 长度不足 32 字节");
+        return -1;
+    }
+
+    uint8_t fkey[32];
+    SHA256(raw_key, 32, fkey);
+    plat_secure_zero(raw_key, sizeof raw_key);
+
+    uint8_t tok[2048];
+    int tlen = base64_decode((const char *)token_b64, token_b64_len, tok, sizeof tok);
+    if (tlen < 1 + 8 + 16 + 16 + 32 || tok[0] != 0x80) {
+        plat_secure_zero(fkey, sizeof fkey);
+        plat_secure_zero(tok, sizeof tok);
+        snprintf(err, errcap, "Fernet 密文格式无效");
+        return -1;
+    }
+
+    size_t signed_len = (size_t)tlen - 32;
+    uint8_t mac[32];
+    unsigned int mac_len = 0;
+    if (!HMAC(EVP_sha256(), fkey, 16, tok, signed_len, mac, &mac_len) ||
+        mac_len != 32 ||
+        CRYPTO_memcmp(mac, tok + signed_len, 32) != 0) {
+        plat_secure_zero(fkey, sizeof fkey);
+        plat_secure_zero(tok, sizeof tok);
+        snprintf(err, errcap, "Fernet HMAC 校验失败（key.bin 不匹配或密文损坏）");
+        return -1;
+    }
+
+    const uint8_t *iv = tok + 9;
+    const uint8_t *ct = tok + 25;
+    int ct_len = (int)(signed_len - 25);
+    if (ct_len <= 0 || (ct_len % 16) != 0 || (size_t)ct_len >= cap + 16) {
+        plat_secure_zero(fkey, sizeof fkey);
+        plat_secure_zero(tok, sizeof tok);
+        snprintf(err, errcap, "Fernet 密文长度异常");
+        return -1;
+    }
+
+    uint8_t plain[1024];
+    int outl = 0, finl = 0;
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    int ok = 0;
+    if (ctx &&
+        EVP_DecryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, fkey + 16, iv) == 1 &&
+        EVP_DecryptUpdate(ctx, plain, &outl, ct, ct_len) == 1 &&
+        EVP_DecryptFinal_ex(ctx, plain + outl, &finl) == 1) {
+        size_t plen = (size_t)(outl + finl);
+        if (plen < cap) {
+            memcpy(out, plain, plen);
+            out[plen] = '\0';
+            ok = 1;
+        }
+    }
+    if (ctx) EVP_CIPHER_CTX_free(ctx);
+    plat_secure_zero(plain, sizeof plain);
+    plat_secure_zero(fkey, sizeof fkey);
+    plat_secure_zero(tok, sizeof tok);
+    if (!ok) {
+        snprintf(err, errcap, "Fernet 解密失败");
+        return -1;
+    }
+    return 0;
+}
+#endif
 
 /* ----------------------------------------------------------- tiny scanner */
 static const char *skip_ws(const char *p)
@@ -143,6 +249,7 @@ static int get_str(const char *beg, const char *end, const char *key, char *out,
         out[n] = '\0';
         ok = 0;
     }
+    plat_secure_zero(scope, (size_t)(end - beg) + 1);
     free(scope);
     return ok;
 }
@@ -167,13 +274,26 @@ static int get_bool(const char *beg, const char *end, const char *key, int *out)
     return -1;
 }
 
+static void sibling_key_path(const char *config_path, char *out, size_t cap)
+{
+    snprintf(out, cap, "%s", config_path);
+    char *sep1 = strrchr(out, '\\');
+    char *sep2 = strrchr(out, '/');
+    char *sep = sep1 > sep2 ? sep1 : sep2;
+    if (sep) {
+        snprintf(sep + 1, cap - (size_t)(sep + 1 - out), "key.bin");
+    } else {
+        snprintf(out, cap, "key.bin");
+    }
+}
+
 /* ------------------------------------------------------------------- load */
 int drcom_config_load(const char *path, engine_config *cfg, char *err, size_t errcap,
                       int *api_port_out)
 {
     if (api_port_out) *api_port_out = 0;
 
-    FILE *f = fopen(path, "rb");
+    FILE *f = open_utf8_rb(path);
     if (!f) {
         snprintf(err, errcap, "打不开配置文件：%s", path);
         return -1;
@@ -224,105 +344,152 @@ int drcom_config_load(const char *path, engine_config *cfg, char *err, size_t er
 
     if (api_port_out && find_object(json, "api", &s, &e) == 0) {
         if (get_num(s, e, "port", &num) == 0) *api_port_out = (int)num;
-        char host[64];
-        if (get_str(s, e, "host", host, sizeof host) != 0) host[0] = '\0';
     }
 
-    /* ---- logging ----
-     * The UI has always written logging.protocol_hex here; nothing read it, so
-     * the "协议转储开关" was a no-op in native mode.  Read it now.  Anything
-     * missing leaves the default (off) in place, so an old config.json that
-     * predates the field keeps working unchanged. */
     if (find_object(json, "logging", &s, &e) == 0) {
         int b = 0;
         if (get_bool(s, e, "protocol_hex", &b) == 0) cfg->protocol_hex = b;
     }
 
-    /* ---- first account that actually has a password ----
-     * accounts is an array (not an object), so find_object does not apply;
-     * walk the array and take the first entry whose password decrypts. */
+    char active_id[64] = {0};
+    get_str(json, json + got, "active_account_id", active_id, sizeof active_id);
+
+    char key_path[1024];
+    sibling_key_path(path, key_path, sizeof key_path);
+
+    /* ---- select active_account_id, falling back to first decryptable ---- */
     {
         const char *p = find_key(json, "accounts");
         if (!p || *p != '[') {
             snprintf(err, errcap, "配置里没有 accounts 列表");
+            plat_secure_zero(json, got + 1);
             free(json);
             return -1;
         }
-        const char *q = p;
-        int in_str = 0, esc = 0, depth = 0;
-        const char *acct_begin = NULL;
+
         int found = 0;
-        for (; *q; q++) {
-            char c = *q;
-            if (in_str) {
-                if (esc) esc = 0;
-                else if (c == '\\') esc = 1;
-                else if (c == '"') in_str = 0;
-                continue;
-            }
-            if (c == '"') { in_str = 1; continue; }
-            if (c == '{') {
-                if (depth == 0) acct_begin = q;
-                depth++;
-            } else if (c == '}') {
-                depth--;
-                if (depth == 0 && acct_begin) {
-                    char pw[1024];
-                    if (get_str(acct_begin, q + 1, "password_protected", pw, sizeof pw) == 0 && pw[0]) {
-                        char acc[128], mac[64];
-                        acc[0] = mac[0] = '\0';
-                        get_str(acct_begin, q + 1, "account", acc, sizeof acc);
-                        get_str(acct_begin, q + 1, "mac", mac, sizeof mac);
-                        if (decrypt_password(pw, cfg->password, sizeof cfg->password, err, errcap) == 0) {
-                            snprintf(cfg->account, sizeof cfg->account, "%s", acc);
-                            snprintf(cfg->mac, sizeof cfg->mac, "%s", mac);
-                            found = 1;
-                            break;
-                        }
-                    }
-                    acct_begin = NULL;
+        int matched_active = 0;
+        for (int pass = 0; pass < 2 && !found && !matched_active; pass++) {
+            const char *q = p;
+            int in_str = 0, esc = 0, depth = 0;
+            const char *acct_begin = NULL;
+            for (; *q; q++) {
+                char c = *q;
+                if (in_str) {
+                    if (esc) esc = 0;
+                    else if (c == '\\') esc = 1;
+                    else if (c == '"') in_str = 0;
+                    continue;
                 }
-            } else if (c == ']' && depth == 0) {
-                break;
+                if (c == '"') { in_str = 1; continue; }
+                if (c == '{') {
+                    if (depth == 0) acct_begin = q;
+                    depth++;
+                } else if (c == '}') {
+                    depth--;
+                    if (depth == 0 && acct_begin) {
+                        char id[64] = {0};
+                        get_str(acct_begin, q + 1, "id", id, sizeof id);
+                        int want_this = (pass == 0)
+                            ? (active_id[0] && strcmp(id, active_id) == 0)
+                            : 1;
+                        if (want_this) {
+                            if (pass == 0) matched_active = 1;
+                            char pw[1024];
+                            pw[0] = '\0';
+                            if (get_str(acct_begin, q + 1, "password_protected", pw, sizeof pw) == 0 && pw[0]) {
+                                char acc[128], mac[64];
+                                acc[0] = mac[0] = '\0';
+                                get_str(acct_begin, q + 1, "account", acc, sizeof acc);
+                                get_str(acct_begin, q + 1, "mac", mac, sizeof mac);
+                                if (decrypt_password_with_key(pw, key_path, cfg->password,
+                                                              sizeof cfg->password, err, errcap) == 0) {
+                                    snprintf(cfg->account, sizeof cfg->account, "%s", acc);
+                                    snprintf(cfg->mac, sizeof cfg->mac, "%s", mac);
+                                    found = 1;
+                                }
+                            } else if (pass == 0) {
+                                snprintf(err, errcap, "当前激活账号未设置密码");
+                            }
+                            plat_secure_zero(pw, sizeof pw);
+                            if (found || pass == 0) break;
+                        }
+                        acct_begin = NULL;
+                    }
+                } else if (c == ']' && depth == 0) {
+                    break;
+                }
             }
         }
         if (!found) {
             if (!err[0]) snprintf(err, errcap, "配置里没有可用的账号（或密码无法解密）");
+            plat_secure_zero(json, got + 1);
             free(json);
             return -1;
         }
     }
 
+    plat_secure_zero(json, got + 1);
     free(json);
     return 0;
 }
 
-int decrypt_password(const char *stored, char *out, size_t cap, char *err, size_t errcap)
+int decrypt_password_with_key(const char *stored, const char *key_path,
+                              char *out, size_t cap, char *err, size_t errcap)
 {
     if (!stored || !stored[0]) {
         snprintf(err, errcap, "密码字段为空");
         return -1;
     }
     uint8_t blob[2048];
-    int len = base64_decode(stored, blob, sizeof blob);
+    int len = base64_decode(stored, strlen(stored), blob, sizeof blob);
     if (len < 4) {
         snprintf(err, errcap, "密码字段不是合法的 Base64");
         return -1;
     }
-    if (blob[0] == 'D' && blob[1] == '1' && blob[2] == ':')
-        return dpapi_unprotect(blob + 3, (size_t)len - 3, out, cap) == 0
-                   ? 0
-                   : (snprintf(err, errcap, "DPAPI 解密失败（换过 Windows 账号？）"), -1);
-    if (blob[0] == 'F' && blob[1] == '1' && blob[2] == ':') {
-        snprintf(err, errcap, "该密码由 Fernet 加密，原生核心暂不支持");
+    if (blob[0] == 'D' && blob[1] == '1' && blob[2] == ':') {
+#ifdef _WIN32
+        int rc = dpapi_unprotect(blob + 3, (size_t)len - 3, out, cap);
+        plat_secure_zero(blob, sizeof blob);
+        if (rc == 0) return 0;
+        snprintf(err, errcap, "DPAPI 解密失败（换过 Windows 账号？）");
         return -1;
+#else
+        plat_secure_zero(blob, sizeof blob);
+        snprintf(err, errcap, "该密码由 Windows DPAPI 加密，Linux 无法解密");
+        return -1;
+#endif
+    }
+    if (blob[0] == 'F' && blob[1] == '1' && blob[2] == ':') {
+#ifdef _WIN32
+        (void)key_path;
+        plat_secure_zero(blob, sizeof blob);
+        snprintf(err, errcap, "该密码由 Fernet 加密，Windows 原生核心仅支持 DPAPI");
+        return -1;
+#else
+        int rc = fernet_unprotect(blob + 3, (size_t)len - 3, key_path, out, cap, err, errcap);
+        plat_secure_zero(blob, sizeof blob);
+        return rc;
+#endif
     }
     if (blob[0] == 'X' && blob[1] == '1' && blob[2] == ':') {
+        plat_secure_zero(blob, sizeof blob);
         snprintf(err, errcap, "该密码是降级混淆存储，原生核心暂不支持");
         return -1;
     }
+#ifdef _WIN32
     /* Legacy: a bare DPAPI blob with no tag. */
-    return dpapi_unprotect(blob, (size_t)len, out, cap) == 0
-               ? 0
-               : (snprintf(err, errcap, "DPAPI 解密失败"), -1);
+    int rc = dpapi_unprotect(blob, (size_t)len, out, cap);
+    plat_secure_zero(blob, sizeof blob);
+    if (rc == 0) return 0;
+#else
+    plat_secure_zero(blob, sizeof blob);
+#endif
+    snprintf(err, errcap, "DPAPI 解密失败");
+    return -1;
+}
+
+int decrypt_password(const char *stored, char *out, size_t cap, char *err, size_t errcap)
+{
+    return decrypt_password_with_key(stored, NULL, out, cap, err, errcap);
 }

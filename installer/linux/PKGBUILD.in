@@ -1,0 +1,19 @@
+# Maintainer: hZsFN <https://github.com/hZsFN/jlu-drcom-ng>
+pkgname=jlu-drcom-ng
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Jilin University Dr.COM campus network client (HUD GUI + native drcomd)"
+arch=('@ARCH@')
+url="https://github.com/hZsFN/jlu-drcom-ng"
+license=('AGPL-3.0-only')
+depends=('glibc' 'openssl' 'iproute2')
+optdepends=(
+  'gtk3: Flet desktop GUI support'
+  'libnotify: desktop notifications'
+)
+options=('!strip' '!debug')
+
+package() {
+  mkdir -p "${pkgdir}"
+  cp -af "@STAGE_DIR@/." "${pkgdir}/"
+}

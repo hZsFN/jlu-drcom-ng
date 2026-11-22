@@ -79,6 +79,32 @@ def build_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------
 def _cmd_status(controller: AppController, args) -> int:
     payload = build_status_payload(controller)
+    if controller.config.auth.native_core:
+        from .remote_engine import DEFAULT_API_PORT, daemon_status
+
+        st = daemon_status(DEFAULT_API_PORT, timeout=0.4)
+        if isinstance(st, dict):
+            state = str(st.get("state") or "idle")
+            payload["state"] = state
+            payload["online"] = state == "online"
+            payload["ip"] = str(st.get("ip") or payload.get("ip") or "")
+            payload["uptime_seconds"] = round(float(st.get("uptime_seconds") or 0.0), 1)
+            payload["last_error"] = str(st.get("last_error") or "")
+            if st.get("account"):
+                payload["account"] = str(st["account"])
+            if "session_rx" in st and "session_tx" in st:
+                traffic = dict(payload.get("traffic") or {})
+                traffic["session_rx"] = int(st.get("session_rx") or 0)
+                traffic["session_tx"] = int(st.get("session_tx") or 0)
+                payload["traffic"] = traffic
+            payload["native_core"] = True
+    elif controller.status_writer.path.exists():
+        try:
+            raw = json.loads(controller.status_writer.path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and (time.time() - float(raw.get("timestamp", 0.0))) < 15.0:
+                payload.update(raw)
+        except Exception:
+            pass
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
@@ -298,11 +324,46 @@ def _cmd_watchdog(controller: AppController, args) -> int:
 #: Sub-commands that accept one bare word after them ("--cli watchdog on").
 
 def _cmd_autostart(controller: AppController, args) -> int:
-    """Choose how the app starts at boot: scheduled task, Run key, or nothing."""
+    """Choose how the app starts at boot (Task Scheduler/Run key on Windows, systemd/XDG on Linux)."""
     from . import single_instance
     from . import autostart as task_autostart
 
     action = (getattr(args, "command_action", "") or "status").lower()
+    is_win = sys.platform == "win32"
+
+    if not is_win:
+        desktop_cmd = single_instance.current_autostart_command()
+        has_systemd = task_autostart.systemd_service_exists()
+        if action in ("status", ""):
+            print(f"systemd 用户服务「{task_autostart.SYSTEMD_UNIT}」：{'已启用' if has_systemd else '无'}")
+            if has_systemd:
+                print(f"    {task_autostart.systemd_service_command()}")
+            print(f"XDG autostart (.desktop)：{desktop_cmd or '无'}")
+            print()
+            print("用法：")
+            print("  jlu-drcom-ng --cli autostart systemd   启用 systemd --user 服务（推荐）")
+            print("  jlu-drcom-ng --cli autostart desktop   启用桌面 XDG autostart")
+            print("  jlu-drcom-ng --cli autostart off       全部移除")
+            return 0
+        if action == "off":
+            ok_sys, msg_sys = task_autostart.remove_systemd_service()
+            ok_desk, msg_desk = single_instance.disable_autostart()
+            print(msg_sys if ok_sys else f"失败：{msg_sys}")
+            print(msg_desk if ok_desk else f"失败：{msg_desk}")
+            return 0 if (ok_sys and ok_desk) else 1
+        if action in ("systemd", "task"):
+            single_instance.disable_autostart()
+            ok, message = task_autostart.install_systemd_service(minimized=True, with_watchdog=True)
+            print(message if ok else f"失败：{message}")
+            return 0 if ok else 1
+        if action in ("desktop", "runkey"):
+            task_autostart.remove_systemd_service()
+            ok, message = single_instance.enable_autostart(minimized=True, with_watchdog=True)
+            print(message if ok else f"失败：{message}")
+            return 0 if ok else 1
+        print(f"未知参数 {action!r}，可用：systemd / desktop / off / status")
+        return 2
+
     run_key = single_instance.current_autostart_command()
     has_task = task_autostart.task_exists()
 
@@ -321,10 +382,6 @@ def _cmd_autostart(controller: AppController, args) -> int:
         print("  jlu-drcom-ng --cli autostart off      两者都取消")
         return 0
 
-    exe = str(Path(sys.executable).resolve())
-    if not getattr(sys, "frozen", False):
-        exe = f'"{sys.executable}" "{Path(__file__).resolve().parent.parent / "main.py"}"'
-
     if action == "off":
         ok_task, msg_task = task_autostart.remove_task()
         ok_key, msg_key = single_instance.disable_autostart()
@@ -335,8 +392,11 @@ def _cmd_autostart(controller: AppController, args) -> int:
     if action == "task":
         # Both would start the program twice; the task wins.
         single_instance.disable_autostart()
+        cmd, launch_args, workdir = task_autostart.launch_target(
+            minimized=True, with_watchdog=True
+        )
         ok, message = task_autostart.install_task(
-            exe, "--watchdog --autostart --minimized", working_dir=str(Path(sys.executable).parent)
+            cmd, launch_args, working_dir=workdir
         )
         print(message if ok else f"失败：{message}")
         if ok:
@@ -355,9 +415,62 @@ def _cmd_autostart(controller: AppController, args) -> int:
     return 2
 
 
+def _cmd_update(controller: AppController, args) -> int:
+    """Check GitHub Releases (and optionally apply when --apply is passed)."""
+    from . import updater
+
+    try:
+        has_update, info = updater.check_latest_release(
+            current_version=controller.version,
+            mirror_prefix=controller.config.update.mirror_prefix,
+        )
+    except Exception as exc:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2))
+        else:
+            print(f"检查更新失败：{exc}", file=sys.stderr)
+        return _EXIT_OFFLINE
+
+    asset = updater.select_asset(info)
+    apply_result = None
+    if getattr(args, "apply", False) and has_update:
+        if asset is None:
+            print("没有找到匹配当前平台的更新包。", file=sys.stderr)
+            return _EXIT_OFFLINE
+        apply_result = controller.download_and_apply_update(info, restart=False)
+
+    if args.json:
+        payload = {
+            "ok": True,
+            "current": controller.version,
+            "latest": info.version,
+            "tag": info.tag,
+            "has_update": has_update,
+            "install_kind": updater.detect_install_kind(),
+            "asset": asset.name if asset else None,
+            "sha256": asset.sha256 if asset else None,
+            "url": asset.url if asset else None,
+            "html_url": info.html_url,
+            "apply_result": apply_result,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(f"当前版本：{controller.version}")
+        print(f"最新版本：{info.version} ({info.tag})")
+        if has_update:
+            print(f"发布页面：{info.html_url}")
+            if asset:
+                print(f"匹配资产：{asset.name} (sha256={asset.sha256[:16]}…)" if asset.sha256 else f"匹配资产：{asset.name}")
+            if apply_result:
+                print(apply_result.get("message", ""))
+        else:
+            print("当前已是最新版本。")
+    return 0
+
+
 _COMMAND_ACTIONS = {
     "watchdog": ("on", "off", "status"),
-    "autostart": ("task", "runkey", "off", "status"),
+    "autostart": ("task", "runkey", "systemd", "desktop", "off", "status"),
 }
 
 _COMMANDS = {
@@ -369,6 +482,7 @@ _COMMANDS = {
     "export-logs": _cmd_export_logs,
     "watchdog": _cmd_watchdog,
     "autostart": _cmd_autostart,
+    "update": _cmd_update,
 }
 
 
@@ -455,7 +569,11 @@ def run_cli(argv: list[str]) -> int:
         print(f"未知命令：{command!r}，可用：{', '.join(_COMMANDS)}", file=sys.stderr)
         return _EXIT_USAGE
 
-    controller = AppController(data_dir=args.data_dir, log_level=args.log_level)
+    controller = AppController(
+        data_dir=args.data_dir,
+        log_level=args.log_level,
+        log_to_file=command not in ("status", "diag", "update"),
+    )
     if args.verbose:
         controller.log.protocol_hex = True
 

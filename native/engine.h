@@ -97,4 +97,14 @@ int            engine_get_consecutive_failures(engine_t *e);
  * startup, so without this the setting only took effect after a restart. */
 void           engine_set_protocol_hex(engine_t *e, int on);
 
+/* Replace full engine config (call when worker is stopped before engine_start). */
+void           engine_update_config(engine_t *e, const engine_config *fresh);
+
+/* Hot-update non-disruptive parameters (diagnostics & reconnect policy) while running. */
+void           engine_update_live_policy(engine_t *e, const engine_config *fresh);
+
+/* Thread-safe copy of account & server for /status snapshots. */
+void           engine_get_identity(engine_t *e, char *account_out, size_t account_cap,
+                                   char *server_out, size_t server_cap);
+
 #endif

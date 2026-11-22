@@ -310,6 +310,17 @@ class ScheduleConfig:
     max_session_minutes: int = 0
 
 
+@dataclass
+class UpdateConfig:
+    """Automatic update check and download preferences (GitHub Releases)."""
+
+    auto_check: bool = True
+    check_interval_hours: int = 24
+    skipped_version: str = ""
+    mirror_prefix: str = ""
+    last_check_at: float = 0.0
+
+
 # --------------------------------------------------------------------------
 # Root config
 # --------------------------------------------------------------------------
@@ -327,6 +338,7 @@ class AppConfig:
     probe: ProbeConfig = field(default_factory=ProbeConfig)
     traffic: TrafficConfig = field(default_factory=TrafficConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+    update: UpdateConfig = field(default_factory=UpdateConfig)
 
     # -- convenience ---------------------------------------------------
     def active_account(self) -> Account | None:

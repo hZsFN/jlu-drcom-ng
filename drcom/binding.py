@@ -24,6 +24,7 @@ So this module:
 from __future__ import annotations
 
 import errno
+import os
 import re
 import socket
 import subprocess
@@ -86,6 +87,10 @@ _KNOWN_SUSPECTS: tuple[tuple[str, str], ...] = (
     ("sing-box", "sing-box（TUN 模式）"),
     ("v2ray", "v2ray"),
     ("xray", "Xray"),
+    ("dockerd", "Docker 守护进程"),
+    ("tailscaled", "Tailscale 守护进程"),
+    ("wg-quick", "WireGuard"),
+    ("clash-meta", "Clash Meta / mihomo"),
 )
 
 
@@ -274,10 +279,72 @@ def _run_hidden(cmd: list[str], timeout: float = 6.0) -> str:
         return ""
 
 
-def find_port_holders(port: int) -> list[str]:
-    """Best-effort: which process is holding *port* (Windows)."""
-    if not IS_WINDOWS:
+def _find_port_holders_posix(port: int) -> list[str]:
+    out = _run_hidden(["ss", "-ulnp"])
+    holders: list[str] = []
+    seen_pids: set[str] = set()
+    needle = f":{port}"
+    if out:
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            local_addr = parts[3] if parts[0].upper() in ("UNCONN", "ESTAB", "CLOSE") else parts[4]
+            if not any(tok.endswith(needle) for tok in parts[:6]):
+                continue
+            for m in re.finditer(r'\("([^"]+)",pid=(\d+)', line):
+                name, pid = m.group(1), m.group(2)
+                if pid not in seen_pids:
+                    seen_pids.add(pid)
+                    holders.append(f"PID {pid} — {name}")
+        if holders:
+            return holders
+
+    # Fallback: match /proc/net/udp inode -> /proc/<pid>/fd/*
+    hex_port = f":{port:04X}"
+    inodes: set[str] = set()
+    try:
+        with open("/proc/net/udp", "r", encoding="utf-8") as f:
+            for line in f.readlines()[1:]:
+                cols = line.split()
+                if len(cols) >= 10 and cols[1].endswith(hex_port):
+                    if cols[9].isdigit() and cols[9] != "0":
+                        inodes.add(f"socket:[{cols[9]}]")
+    except OSError:
         return []
+    if not inodes:
+        return []
+
+    proc_root = Path("/proc")
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        fd_dir = entry / "fd"
+        try:
+            for fd in fd_dir.iterdir():
+                try:
+                    target = os.readlink(fd)
+                except OSError:
+                    continue
+                if target in inodes:
+                    pid = entry.name
+                    if pid in seen_pids:
+                        continue
+                    seen_pids.add(pid)
+                    try:
+                        comm = (entry / "comm").read_text(encoding="utf-8", errors="replace").strip()
+                    except OSError:
+                        comm = "?"
+                    holders.append(f"PID {pid} — {comm}" if comm and comm != "?" else f"PID {pid}")
+        except OSError:
+            continue
+    return holders
+
+
+def find_port_holders(port: int) -> list[str]:
+    """Best-effort: which process is holding *port*."""
+    if not IS_WINDOWS:
+        return _find_port_holders_posix(port)
     output = _run_hidden(["netstat", "-ano", "-p", "udp"])
     pids: set[str] = set()
     needle = f":{port}"
@@ -301,10 +368,32 @@ def find_port_holders(port: int) -> list[str]:
     return holders
 
 
+def _detect_conflict_suspects_posix() -> list[str]:
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return []
+    chunks: list[str] = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            comm = (entry / "comm").read_text(encoding="utf-8", errors="replace").strip()
+            if comm:
+                chunks.append(comm)
+        except OSError:
+            continue
+    blob = "\n".join(chunks).lower()
+    found: list[str] = []
+    for needle, description in _KNOWN_SUSPECTS:
+        if needle.lower() in blob and description not in found:
+            found.append(description)
+    return found
+
+
 def detect_conflict_suspects() -> list[str]:
     """List running processes known to reserve port ranges."""
     if not IS_WINDOWS:
-        return []
+        return _detect_conflict_suspects_posix()
     output = _run_hidden(["tasklist", "/FO", "CSV", "/NH"])
     if not output:
         return []
@@ -316,14 +405,38 @@ def detect_conflict_suspects() -> list[str]:
     return found
 
 
-def read_excluded_port_ranges() -> list[tuple[int, int]]:
-    """Parse ``netsh int ipv4 show excludedportrange``.
+def _parse_linux_reserved_ports(raw: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    for token in raw.replace("\n", ",").split(","):
+        part = token.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo_s, _, hi_s = part.partition("-")
+            if lo_s.isdigit() and hi_s.isdigit():
+                lo, hi = int(lo_s), int(hi_s)
+                if 0 < lo <= hi <= 65535:
+                    ranges.append((lo, hi))
+        elif part.isdigit():
+            val = int(part)
+            if 0 < val <= 65535:
+                ranges.append((val, val))
+    return ranges
 
-    Note: this is advisory only.  Per spec 6.1 the ranges created by TUN
-    adapters do *not* appear here, which is exactly why we also probe.
+
+def read_excluded_port_ranges() -> list[tuple[int, int]]:
+    """Parse system excluded/reserved port ranges.
+
+    Note: on Windows this reads ``netsh int ipv4 show excludedportrange``
+    (advisory; TUN ranges do not appear there).  On Linux this reads
+    ``/proc/sys/net/ipv4/ip_local_reserved_ports``.
     """
     if not IS_WINDOWS:
-        return []
+        try:
+            raw = Path("/proc/sys/net/ipv4/ip_local_reserved_ports").read_text(encoding="utf-8")
+        except OSError:
+            return []
+        return _parse_linux_reserved_ports(raw)
     ranges: list[tuple[int, int]] = []
     for proto in ("udp", "tcp"):
         out = _run_hidden(
@@ -354,12 +467,13 @@ def _classify(code: int) -> tuple[str, str, str]:
             "  (b) **另一个程序以独占方式绑定了这个端口** —— Windows 的独占绑定会让后续 "
             "SO_REUSEADDR 绑定返回 10013 而不是 10048，最常见的就是原版 Dr.COM 客户端还在后台运行。",
         )
-    if code == WSAEADDRINUSE:
+    if code in (WSAEADDRINUSE, errno.EADDRINUSE):
+        code_name = "WSAEADDRINUSE" if code == WSAEADDRINUSE else "EADDRINUSE"
         return (
             BindKind.IN_USE,
-            f"端口已被其它程序占用（错误码 {WSAEADDRINUSE} = WSAEADDRINUSE）",
+            f"端口已被其它程序占用（错误码 {code} = {code_name}）",
             "确实有另一个程序绑定着 61440。最常见的原因是**本程序已经在运行**"
-            "（重复启动会抢同一个端口），其次是原版 Dr.COM 客户端没有退出干净。",
+            "（重复启动会抢同一个端口），其次是另一个认证客户端/服务尚未退出。",
         )
     if code in (errno.EACCES, errno.EPERM, 13, 1):
         return (
@@ -458,10 +572,21 @@ def diagnose_bind_error(
             "「用管理员身份运行」和「net stop winnat」对本问题无效 —— 请不要再浪费时间尝试。"
         )
     elif kind == BindKind.IN_USE:
-        if diagnosis.holders:
-            advice.append("先结束上面的进程，或用任务管理器按 PID 结束。")
-        advice.append("本程序同一时间只能运行一个实例；如果你没看到窗口，检查一下系统托盘。")
-        advice.append("也可以确认一下「原版 Dr.COM 客户端」是否还在后台运行，退出后重试。")
+        if IS_WINDOWS:
+            if diagnosis.holders:
+                advice.append("先结束上面的进程，或用任务管理器按 PID 结束。")
+            advice.append("本程序同一时间只能运行一个实例；如果你没看到窗口，检查一下系统托盘。")
+            advice.append("也可以确认一下「原版 Dr.COM 客户端」是否还在后台运行，退出后重试。")
+        else:
+            if diagnosis.holders:
+                advice.append("先用 `kill <PID>` 结束上面的进程，或执行 `ss -ulnp | grep 61440` 确认占用者。")
+            else:
+                advice.append("请执行 `ss -ulnp | grep 61440`（必要时加 `sudo`）排查占用 UDP 61440 的进程，并用 `kill <PID>` 结束。")
+            advice.append("本程序同一时间只能运行一个实例；如果你没看到窗口，检查一下系统托盘。")
+            advice.append("如后台还跑着 drcomd 或其它认证脚本，请先 `systemctl --user stop jlu-drcom-ng` 后重试。")
+    elif kind == BindKind.PERMISSION:
+        if not IS_WINDOWS:
+            advice.append("请检查 SELinux/AppArmor 或内核参数 `net.ipv4.ip_local_reserved_ports` 是否限制了该端口。")
     elif kind == BindKind.ADDRESS:
         advice.append("把「绑定地址」改回 0.0.0.0（默认值）。")
     else:

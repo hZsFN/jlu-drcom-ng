@@ -204,7 +204,8 @@ def _doctor(data_dir: Path | None) -> int:
     from drcom.controller import AppController
     from drcom.selfcheck import FAIL, run_self_check
 
-    controller = AppController(data_dir=data_dir, log_level="WARNING")
+    controller = AppController(data_dir=data_dir, log_level="WARNING", log_to_file=False)
+    controller._doctor_mode = True
     try:
         report = run_self_check(controller)
         print(report.to_text())
@@ -276,6 +277,50 @@ def _run_watchdog(argv: list[str], args) -> int:
         return 0
 
 
+def _try_fast_native_autostart(args) -> int | None:
+    """Fast-boot path for ``--autostart --minimized`` when native core owns tray.
+
+    Starts ``drcomd`` (with its Win32 tray icon on Windows, or headless when
+    ``--no-tray`` on Linux) and exits immediately without importing Flet/Flutter.
+    """
+    if not (args.autostart and args.minimized and not args.web):
+        return None
+    if sys.platform != "win32" and not args.no_tray:
+        # On Linux the Python side (pystray) still owns the tray icon unless --no-tray.
+        return None
+    from drcom.config import ConfigStore, default_data_dir
+    from drcom.logbus import LogBus
+    from drcom.remote_engine import DEFAULT_API_PORT, RemoteEngine, daemon_is_up, daemon_path
+
+    data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
+    cfg = ConfigStore(data_dir).load()
+    if not cfg.auth.native_core or not getattr(cfg.ui, "auto_login_on_launch", True):
+        return None
+    acc = cfg.active_account()
+    if acc is None or not acc.auto_login or not acc.has_password():
+        return None
+    if daemon_path() is None:
+        return None
+
+    log = LogBus(log_dir=data_dir / "logs", level=cfg.logging.level, file_logging=False)
+    try:
+        if daemon_is_up(DEFAULT_API_PORT):
+            return 0
+        engine = RemoteEngine(
+            config=cfg,
+            account=acc,
+            password="",
+            log=log,
+            config_path=data_dir / "config.json",
+            enable_tray=not args.no_tray,
+        )
+        ok = engine._ensure_daemon()
+        engine._close_daemon_log()
+        return 0 if ok else None
+    finally:
+        log.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     _raise_priority()
     _force_utf8_console()
@@ -324,6 +369,10 @@ def main(argv: list[str] | None = None) -> int:
             return 3
 
     try:
+        fast_rc = _try_fast_native_autostart(args)
+        if fast_rc is not None:
+            return fast_rc
+
         from drcom.controller import AppController
         from drcom.ui import run_gui
 

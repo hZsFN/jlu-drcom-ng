@@ -13,10 +13,14 @@ the user.  :class:`TrayIcon.available` tells the UI which mode it is in.
 
 from __future__ import annotations
 
+import os
+import sys
 import threading
 from typing import Callable
 
 __all__ = ["TrayIcon", "tray_available"]
+
+_ICON_IMAGE_CACHE: dict[tuple[str, int], object] = {}
 
 
 def tray_available() -> bool:
@@ -29,13 +33,17 @@ def tray_available() -> bool:
         from PIL import Image  # noqa: F401
     except Exception:
         return False
-    import sys
-
-    return sys.platform in ("win32", "darwin") or bool(__import__("os").environ.get("DISPLAY"))
+    return sys.platform in ("win32", "darwin") or bool(
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    )
 
 
 def _make_icon_image(color: str = "#86FF86", size: int = 64):
-    """Draw the app icon: a HUD-style FPV reticle on a dark disc."""
+    """Draw the app icon (cached per ``(color, size)`` to avoid allocating RGBA bitmaps)."""
+    key = (color, size)
+    cached = _ICON_IMAGE_CACHE.get(key)
+    if cached is not None:
+        return cached
     from PIL import Image, ImageDraw
 
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -60,6 +68,7 @@ def _make_icon_image(color: str = "#86FF86", size: int = 64):
     draw.line([centre - size * 0.34, centre, centre - radius - 2, centre], fill=stroke, width=width)
     draw.line([centre + radius + 2, centre, centre + size * 0.34, centre], fill=stroke, width=width)
     draw.ellipse([centre - 2, centre - 2, centre + 2, centre + 2], fill=stroke)
+    _ICON_IMAGE_CACHE[key] = image
     return image
 
 
@@ -88,6 +97,8 @@ class TrayIcon:
         self.status_provider = status_provider
         self._icon = None
         self._thread: threading.Thread | None = None
+        self._last_color: str = ""
+        self._last_tooltip: str = ""
 
     @property
     def available(self) -> bool:
@@ -148,17 +159,21 @@ class TrayIcon:
 
     def update(self, *, tooltip: str | None = None, color: str | None = None,
                online: bool | None = None) -> None:
-        """Refresh the icon appearance / hover text."""
+        """Refresh the icon appearance / hover text (only mutates on actual change)."""
         if self._icon is None:
             return
         if tooltip is not None:
-            try:
-                self._icon.title = tooltip[:127]
-            except Exception:
-                pass
-        if color is not None:
+            trimmed = tooltip[:127]
+            if trimmed != self._last_tooltip:
+                try:
+                    self._icon.title = trimmed
+                    self._last_tooltip = trimmed
+                except Exception:
+                    pass
+        if color is not None and color != self._last_color:
             try:
                 self._icon.icon = _make_icon_image(color)
+                self._last_color = color
             except Exception:
                 pass
         del online

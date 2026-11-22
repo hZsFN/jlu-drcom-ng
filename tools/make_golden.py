@@ -205,9 +205,9 @@ def main() -> int:
         "#endif",
         "",
     ]
-    (out / "golden.h").write_text("\n".join(lines), encoding="utf-8")
+    (out / "golden.h").write_text("\n".join(lines), encoding="utf-8", newline="\n")
     (out / "golden_cases.json").write_text(
-        json.dumps(CASES, ensure_ascii=False, indent=1), encoding="utf-8")
+        json.dumps(CASES, ensure_ascii=False, indent=1), encoding="utf-8", newline="\n")
     print(f"{len(CASES)} cases -> native/tests/golden.h")
     return 0
 

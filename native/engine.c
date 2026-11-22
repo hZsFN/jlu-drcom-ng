@@ -16,67 +16,60 @@
  * the user, because retrying identical credentials forever is the "疯狂重试"
  * behaviour the brief asks us to avoid.
  */
+#include "platform.h"
 #include "engine.h"
 #include "protocol.h"
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
+#ifdef _WIN32
 #include <iphlpapi.h>
+#pragma comment(lib, "iphlpapi.lib")
+#else
+#include <ifaddrs.h>
+#include <net/if.h>
+#endif
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <process.h>
-
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "iphlpapi.lib")
 
 struct engine {
     engine_config cfg;
     engine_event_fn fn;
     void *user;
 
-    HANDLE      thread;
-    HANDLE      stop_evt;
-    SRWLOCK     lock;
-    volatile LONG state;
-    volatile LONG reason;
+    plat_thread_t thread;
+    plat_event_t  stop_evt;
+    plat_rwlock_t lock;
+    plat_atomic_t state;
+    plat_atomic_t reason;
 
-    SOCKET      sock;
+    plat_socket_t sock;
     struct sockaddr_in peer;
 
-    int         consecutive_failures;
+    plat_atomic_t consecutive_failures;
     double      online_since;      /* 0 when offline */
     double      started_at;
     char        ip[16];
     uint8_t     auth_info[16];
-    volatile LONG running;
+    plat_atomic_t running;
     int         ws_ready;
     /* Live copy of cfg.protocol_hex: the UI can flip the switch while a
      * session is up, and the setting must not require a restart to apply. */
-    volatile LONG protocol_hex;
+    plat_atomic_t protocol_hex;
 };
 
 /* ----------------------------------------------------------------- utils */
 static double now_seconds(void)
 {
-    LARGE_INTEGER freq, counter;
-    static LARGE_INTEGER cached_freq;
-    if (cached_freq.QuadPart == 0) {
-        QueryPerformanceFrequency(&freq);
-        cached_freq = freq;
-    }
-    QueryPerformanceCounter(&counter);
-    return (double)counter.QuadPart / (double)cached_freq.QuadPart;
+    return plat_now_seconds();
 }
 
 /* Sleep that a stop request can cut short.  Returns 0 when stopping. */
 static int engine_wait(engine_t *e, double seconds)
 {
-    DWORD ms = (DWORD)(seconds * 1000.0);
-    if (ms == 0) ms = 1;
-    DWORD rc = WaitForSingleObject(e->stop_evt, ms);
-    return rc == WAIT_TIMEOUT;
+    int ms = (int)(seconds * 1000.0);
+    if (ms <= 0) ms = 1;
+    return plat_event_wait_ms(&e->stop_evt, ms) == 0 ? 1 : 0;
 }
 
 static void emit(engine_t *e, const char *kind, const char *message,
@@ -127,7 +120,7 @@ static void dump_packet(engine_t *e, const char *dir, const char *label,
                         const uint8_t *data, size_t len,
                         size_t redact_from, size_t redact_to)
 {
-    if (!InterlockedCompareExchange(&e->protocol_hex, 0, 0)) return;
+    if (!plat_atomic_load(&e->protocol_hex)) return;
     char hex[DUMP_BYTES * 4 + 96];
     hex_encode(data, len, DUMP_BYTES, redact_from, redact_to, hex, sizeof hex);
     char head[96];
@@ -137,7 +130,7 @@ static void dump_packet(engine_t *e, const char *dir, const char *label,
 
 static void set_state(engine_t *e, engine_state st, const char *message)
 {
-    InterlockedExchange(&e->state, (LONG)st);
+    plat_atomic_store(&e->state, (long)st);
     emit(e, "state", message ? message : "", NULL, -1);
 }
 
@@ -150,15 +143,17 @@ static int in_quiet_hours(int unused)
 
 static double next_backoff(engine_t *e)
 {
-    const engine_config *c = &e->cfg;
-    int exponent = e->consecutive_failures - 1;
+    plat_rwlock_rdlock(&e->lock);
+    engine_config c = e->cfg;
+    plat_rwlock_rdunlock(&e->lock);
+    int exponent = (int)plat_atomic_load(&e->consecutive_failures) - 1;
     if (exponent < 0) exponent = 0;
-    double delay = c->min_delay;
-    for (int i = 0; i < exponent && delay < c->max_delay; i++) delay *= c->factor;
-    if (delay > c->max_delay) delay = c->max_delay;
-    if (c->jitter > 0.0) {
+    double delay = c.min_delay;
+    for (int i = 0; i < exponent && delay < c.max_delay; i++) delay *= c.factor;
+    if (delay > c.max_delay) delay = c.max_delay;
+    if (c.jitter > 0.0) {
         double r = (double)rand() / (double)RAND_MAX;      /* 0..1 */
-        delay *= 1.0 + (r * 2.0 - 1.0) * c->jitter;
+        delay *= 1.0 + (r * 2.0 - 1.0) * c.jitter;
     }
     if (delay < 1.0) delay = 1.0;
     if (in_quiet_hours(0) && delay < 300.0) delay = 300.0;
@@ -166,30 +161,11 @@ static double next_backoff(engine_t *e)
 }
 
 /* ------------------------------------------------------- bind candidates */
-/*
- * Which local addresses to try, in order.
- *
- * Two modes, one field -- the same contract the Python engine has had since
- * the beginning, and the reason this file grew a candidate list at all:
- *
- *  * `bind_address` holds a concrete IP -> use exactly that one.  That is the
- *    "pinned" mode for a machine that always logs in over the same link.
- *  * `bind_address` is empty (or 0.0.0.0) -> bind the wildcard and let the
- *    kernel pick the exit.  Correct whenever there is a single uplink, which
- *    is the normal case.  With several uplinks the wildcard follows the
- *    *default route*, which on a laptop with Wi-Fi up is the Wi-Fi -- so the
- *    auth datagram leaves over the wrong adapter and the server never answers.
- *    `auto_interface_fallback` (off by default) adds every concrete adapter
- *    address as an extra attempt, which is what makes a plugged-in cable win
- *    over a live Wi-Fi association.
- *
- * The old core parsed `auto_interface_fallback` out of config.json and then
- * never looked at it again, so the switch silently did nothing.
- */
 #define MAX_BIND_CANDIDATES 8
 
 static int collect_local_ipv4(char out[][16], int cap)
 {
+#ifdef _WIN32
     ULONG size = 16 * 1024;
     IP_ADAPTER_ADDRESSES *addrs = (IP_ADAPTER_ADDRESSES *)malloc(size);
     if (!addrs) return 0;
@@ -212,7 +188,7 @@ static int collect_local_ipv4(char out[][16], int cap)
             if (u->Address.lpSockaddr->sa_family != AF_INET) continue;
             struct sockaddr_in *sa = (struct sockaddr_in *)u->Address.lpSockaddr;
             char buf[16];
-            if (!InetNtopA(AF_INET, &sa->sin_addr, buf, (DWORD)sizeof buf)) continue;
+            if (!inet_ntop(AF_INET, &sa->sin_addr, buf, (socklen_t)sizeof buf)) continue;
             /* 169.254/16 is what Windows invents when DHCP failed: binding to
              * it can never reach the campus server. */
             if (strncmp(buf, "169.254.", 8) == 0) continue;
@@ -224,6 +200,26 @@ static int collect_local_ipv4(char out[][16], int cap)
     }
     free(addrs);
     return n;
+#else
+    struct ifaddrs *ifaddr = NULL;
+    if (getifaddrs(&ifaddr) != 0) return 0;
+    int n = 0;
+    for (struct ifaddrs *ifa = ifaddr; ifa && n < cap; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (ifa->ifa_flags & IFF_LOOPBACK) continue;
+        if (!(ifa->ifa_flags & IFF_UP)) continue;
+        struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+        char buf[16];
+        if (!inet_ntop(AF_INET, &sa->sin_addr, buf, (socklen_t)sizeof buf)) continue;
+        if (strncmp(buf, "169.254.", 8) == 0 || strcmp(buf, "127.0.0.1") == 0 ||
+            strcmp(buf, "0.0.0.0") == 0) continue;
+        int dup = 0;
+        for (int i = 0; i < n; i++) if (strcmp(out[i], buf) == 0) { dup = 1; break; }
+        if (!dup) snprintf(out[n++], 16, "%s", buf);
+    }
+    freeifaddrs(ifaddr);
+    return n;
+#endif
 }
 
 /* The address the OS would use to reach the server.  Asked the only way that
@@ -231,25 +227,32 @@ static int collect_local_ipv4(char out[][16], int cap)
 static void default_route_ip(const char *server, int port, char out[16])
 {
     out[0] = '\0';
-    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s == INVALID_SOCKET) return;
+    plat_socket_t s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == PLAT_INVALID_SOCKET) return;
     struct sockaddr_in to;
     memset(&to, 0, sizeof to);
     to.sin_family = AF_INET;
-    to.sin_port = htons((u_short)port);
-    if (InetPtonA(AF_INET, server, &to.sin_addr) == 1 && connect(s, (struct sockaddr *)&to, sizeof to) == 0) {
+    to.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, server, &to.sin_addr) == 1 && connect(s, (struct sockaddr *)&to, sizeof to) == 0) {
         struct sockaddr_in me;
-        int me_len = sizeof me;
+        socklen_t me_len = (socklen_t)sizeof me;
         if (getsockname(s, (struct sockaddr *)&me, &me_len) == 0) {
-            InetNtopA(AF_INET, &me.sin_addr, out, 16);
+            inet_ntop(AF_INET, &me.sin_addr, out, 16);
         }
     }
-    closesocket(s);
+    plat_closesocket(s);
 }
 
 static int build_bind_candidates(engine_t *e, char out[][16], int cap)
 {
-    const char *pinned = e->cfg.bind_address;
+    plat_rwlock_rdlock(&e->lock);
+    char pinned[64], server[64];
+    snprintf(pinned, sizeof pinned, "%s", e->cfg.bind_address);
+    snprintf(server, sizeof server, "%s", e->cfg.server);
+    int port = e->cfg.port;
+    int fallback = e->cfg.auto_interface_fallback;
+    plat_rwlock_rdunlock(&e->lock);
+
     if (pinned[0] && strcmp(pinned, "0.0.0.0") != 0) {
         snprintf(out[0], 16, "%s", pinned);
         return 1;
@@ -257,13 +260,10 @@ static int build_bind_candidates(engine_t *e, char out[][16], int cap)
 
     int n = 0;
     snprintf(out[n++], 16, "0.0.0.0");
-    if (!e->cfg.auto_interface_fallback || n >= cap) return n;
+    if (!fallback || n >= cap) return n;
 
-    /* Put the default-route address first among the concrete ones: when the
-     * wildcard failed, that is the one most likely to be the *other* uplink
-     * the user meant. */
     char routed[16];
-    default_route_ip(e->cfg.server, e->cfg.port, routed);
+    default_route_ip(server, port, routed);
     if (routed[0] && strcmp(routed, "0.0.0.0") != 0) {
         snprintf(out[n++], 16, "%s", routed);
     }
@@ -274,17 +274,11 @@ static int build_bind_candidates(engine_t *e, char out[][16], int cap)
 /* -------------------------------------------------------------- socket IO */
 static int send_packet(engine_t *e, const uint8_t *data, size_t len)
 {
-    int rc = sendto(e->sock, (const char *)data, (int)len, 0,
-                    (const struct sockaddr *)&e->peer, sizeof e->peer);
+    int rc = (int)sendto(e->sock, (const char *)data, (int)len, 0,
+                         (const struct sockaddr *)&e->peer, sizeof e->peer);
     if (rc == (int)len) return 0;
 
-    /* A failed send and a sent-but-unanswered packet were indistinguishable
-     * before: both surfaced as "no reply" and the error code was dropped here.
-     * With a bind address pinned to an adapter the system does not route
-     * through, sendto fails with WSAENETUNREACH (10051) / WSAEADDRNOTAVAIL
-     * (10049) -- the difference between "wrong adapter" and "server silent",
-     * which is exactly the question a user reporting a hang cannot answer. */
-    int err = WSAGetLastError();
+    int err = plat_last_sock_err();
     char detail[160];
     snprintf(detail, sizeof detail, "sendto 失败：%s:%u，errno=%d",
              e->cfg.server, (unsigned)e->cfg.port, err);
@@ -320,11 +314,11 @@ static int recv_packet(engine_t *e, uint8_t *buf, size_t cap, int skip_notificat
                        int max_packets)
 {
     for (int i = 0; i < max_packets; i++) {
-        if (WaitForSingleObject(e->stop_evt, 0) == WAIT_OBJECT_0) return -1;
+        if (plat_event_is_set(&e->stop_evt)) return -1;
         struct sockaddr_in from;
-        int fromlen = sizeof from;
-        int n = recvfrom(e->sock, (char *)buf, (int)cap, 0,
-                         (struct sockaddr *)&from, &fromlen);
+        socklen_t fromlen = (socklen_t)sizeof from;
+        int n = (int)recvfrom(e->sock, (char *)buf, (int)cap, 0,
+                              (struct sockaddr *)&from, &fromlen);
         if (n <= 0) return -1;                       /* timeout or error */
         if (from.sin_addr.s_addr != e->peer.sin_addr.s_addr) continue;
         if (skip_notifications && proto_looks_like_notification(buf, (size_t)n)) continue;
@@ -372,7 +366,7 @@ static int obtain_challenge(engine_t *e, uint8_t seed[4], char ip_out[16])
     for (int attempt = 1; attempt <= retries; attempt++) {
         int rc = do_challenge(e, seed, ip_out);
         if (rc == 0) return 0;
-        if (WaitForSingleObject(e->stop_evt, 0) == WAIT_OBJECT_0) return -1;
+        if (plat_event_is_set(&e->stop_evt)) return -1;
         if (attempt < retries && !engine_wait(e, 0.5)) return -1;
     }
     return -1;
@@ -446,7 +440,7 @@ static offline_reason keepalive_loop(engine_t *e)
     int consecutive_ka2_failures = 0;
     double interval = e->cfg.keepalive_interval;
 
-    while (WaitForSingleObject(e->stop_evt, 0) == WAIT_TIMEOUT) {
+    while (!plat_event_is_set(&e->stop_evt)) {
         if (keepalive_1(e) != 0) {
             emit(e, "keepalive_failed", "保活失败（keepalive1）", "keepalive1 未通过", -1);
             return OFFLINE_TIMEOUT;
@@ -468,7 +462,7 @@ static offline_reason keepalive_loop(engine_t *e)
         consecutive_ka2_failures = 0;
         /* A full round went through: the session really is healthy, so the
          * backoff counter can safely start over. */
-        e->consecutive_failures = 0;
+        plat_atomic_store(&e->consecutive_failures, 0);
         emit(e, "keepalive_ok", "保活正常", NULL, -1);
         if (!engine_wait(e, interval)) return OFFLINE_USER_LOGOUT;
     }
@@ -488,18 +482,15 @@ static const char *authenticate(engine_t *e)
         const char *detail = "服务器没有在超时时间内回应，或响应格式不对。\n"
                              "常见原因：网线未连接 / 未接入校园网 / 服务器暂时不可用。";
         emit(e, "challenge_failed", "获取挑战码失败", detail, -1);
-        InterlockedExchange(&e->reason, OFFLINE_CHALLENGE_FAILED);
+        plat_atomic_store(&e->reason, OFFLINE_CHALLENGE_FAILED);
         set_state(e, ENGINE_STATE_RETRY_WAIT, "挑战失败");
-        e->consecutive_failures++;
+        plat_atomic_store(&e->consecutive_failures, plat_atomic_load(&e->consecutive_failures) + 1);
         return "transient";
     }
 
-    /* Guard the IP string: /status may otherwise read it mid-write, and a
-     * half-updated address is exactly the kind of bug that shows up once a month
-     * and never reproduces. */
-    AcquireSRWLockExclusive(&e->lock);
+    plat_rwlock_wrlock(&e->lock);
     snprintf(e->ip, sizeof e->ip, "%s", ip);
-    ReleaseSRWLockExclusive(&e->lock);
+    plat_rwlock_wrunlock(&e->lock);
     emit(e, "ip", ip, NULL, -1);
 
     if (!engine_wait(e, e->cfg.post_login_delay)) return "transient";
@@ -508,43 +499,39 @@ static const char *authenticate(engine_t *e)
     int rc = proto_build_login(e->cfg.account, e->cfg.password, e->cfg.mac,
                                seed, packet, sizeof packet, &len);
     if (rc != PROTO_OK) {
-        InterlockedExchange(&e->reason, OFFLINE_LOGIN_FAILED);
+        plat_atomic_store(&e->reason, OFFLINE_LOGIN_FAILED);
         set_state(e, ENGINE_STATE_FATAL, "配置不完整");
         emit(e, "error", "配置错误：账号或 MAC 格式不正确", NULL, -1);
         return "fatal";
     }
-    /* The dump covers the first 64 bytes, which is exactly where the ID and
-     * the MD5A digest live: blank [4, 20+account) so neither the account
-     * string nor the password-derived digest reaches the log file.  The
-     * salted-password section sits past byte 312 and is outside the dumped
-     * window anyway.  The MAC at [58:64] stays readable on purpose -- see
-     * send_labeled(). */
     size_t account_end = 20 + strlen(e->cfg.account);
     if (account_end > len) account_end = len;
     if (send_labeled(e, packet, len, "[Login sent]", 4, account_end) != 0) {
-        e->consecutive_failures++;
+        plat_secure_zero(packet, len);
+        plat_atomic_store(&e->consecutive_failures, plat_atomic_load(&e->consecutive_failures) + 1);
         return "transient";
     }
+    plat_secure_zero(packet, len);
 
     uint8_t reply[256];
     int n = recv_labeled(e, reply, sizeof reply, 0, 32, "[Login recv]");
     if (n < 0) {
-        InterlockedExchange(&e->reason, OFFLINE_TIMEOUT);
+        plat_atomic_store(&e->reason, OFFLINE_TIMEOUT);
         set_state(e, ENGINE_STATE_RETRY_WAIT, "登录响应超时");
         emit(e, "login_failed", "登录响应超时", "服务器未在超时时间内回复登录请求。", -1);
-        e->consecutive_failures++;
+        plat_atomic_store(&e->consecutive_failures, plat_atomic_load(&e->consecutive_failures) + 1);
         return "transient";
     }
 
     proto_login_t lo;
     if (proto_parse_login(reply, (size_t)n, &lo) != PROTO_OK) {
-        e->consecutive_failures++;
+        plat_atomic_store(&e->consecutive_failures, plat_atomic_load(&e->consecutive_failures) + 1);
         set_state(e, ENGINE_STATE_RETRY_WAIT, "登录响应格式异常");
         return "transient";
     }
 
     if (!lo.success) {
-        InterlockedExchange(&e->reason, OFFLINE_LOGIN_FAILED);
+        plat_atomic_store(&e->reason, OFFLINE_LOGIN_FAILED);
         const char *name = proto_login_error_text(lo.error_code);
         char detail[96];
         snprintf(detail, sizeof detail, "服务端返回错误码 0x%02X (%s)",
@@ -556,29 +543,26 @@ static const char *authenticate(engine_t *e)
                  lo.error_code);
             return "fatal";
         }
-        e->consecutive_failures++;
+        plat_atomic_store(&e->consecutive_failures, plat_atomic_load(&e->consecutive_failures) + 1);
         set_state(e, ENGINE_STATE_RETRY_WAIT, name);
         return "transient";
     }
 
     /* online */
     memcpy(e->auth_info, lo.auth, 16);
+    plat_rwlock_wrlock(&e->lock);
     e->online_since = now_seconds();
-    /* NB: no counter reset here.  "The server accepted our login" is not proof
-     * that the session survives - a network that eats keepalive packets will
-     * accept every login and drop every keepalive.  If we cleared the counter
-     * here, that case would retry at min_delay forever and never reach
-     * give_up_after; keepalive_loop clears it once a round actually succeeds. */
+    plat_rwlock_wrunlock(&e->lock);
     set_state(e, ENGINE_STATE_ONLINE, "已上线");
     emit(e, "online", ip, NULL, -1);
 
     offline_reason why = keepalive_loop(e);
+    plat_rwlock_wrlock(&e->lock);
     e->online_since = 0.0;
-    InterlockedExchange(&e->reason, why);
+    plat_rwlock_wrunlock(&e->lock);
+    plat_atomic_store(&e->reason, why);
     if (why != OFFLINE_USER_LOGOUT) {
-        /* Back off on keepalive failures too, otherwise a session that keeps
-         * dying re-authenticates every few seconds, for days. */
-        e->consecutive_failures++;
+        plat_atomic_store(&e->consecutive_failures, plat_atomic_load(&e->consecutive_failures) + 1);
     }
     return "transient";
 }
@@ -593,10 +577,11 @@ static const char *authenticate(engine_t *e)
  * address, and sendto then fails with WSAENETUNREACH -- which reads like "the
  * server is silent".  IP_UNICAST_IF pins the outgoing interface and makes the
  * address the user picked actually mean something. */
+#ifdef _WIN32
 static DWORD iface_index_for_address(const char *addr)
 {
     struct in_addr want;
-    if (!addr || InetPtonA(AF_INET, addr, &want) != 1) return 0;
+    if (!addr || inet_pton(AF_INET, addr, &want) != 1) return 0;
 
     ULONG size = 0;
     if (GetIpAddrTable(NULL, &size, 0) != ERROR_INSUFFICIENT_BUFFER) return 0;
@@ -615,16 +600,33 @@ static DWORD iface_index_for_address(const char *addr)
     free(table);
     return index;
 }
+#else
+static int iface_name_for_address(const char *addr, char *out, size_t cap)
+{
+    struct in_addr want;
+    if (!addr || inet_pton(AF_INET, addr, &want) != 1) return 0;
+    struct ifaddrs *ifaddr = NULL;
+    if (getifaddrs(&ifaddr) != 0) return 0;
+    int found = 0;
+    for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET || !ifa->ifa_name) continue;
+        struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+        if (sa->sin_addr.s_addr == want.s_addr) {
+            snprintf(out, cap, "%s", ifa->ifa_name);
+            found = 1;
+            break;
+        }
+    }
+    freeifaddrs(ifaddr);
+    return found;
+}
+#endif
 
-/* What a negative bind_socket() return actually means.
- *
- * All three used to be reported as "the port may be taken by another program",
- * which is only true for one of them.  A user who pinned an address that this
- * machine does not have (10049) was told to hunt for a port conflict that did
- * not exist. */
 static const char *bind_error_hint(int rc)
 {
-    switch (-rc) {
+    int code = -rc;
+#ifdef _WIN32
+    switch (code) {
     case 10048:  /* WSAEADDRINUSE */
         return "端口被其它程序占用。";
     case 10049:  /* WSAEADDRNOTAVAIL */
@@ -636,23 +638,37 @@ static const char *bind_error_hint(int rc)
     default:
         return "绑定失败。";
     }
+#else
+    switch (code) {
+    case EADDRINUSE:
+        return "端口被其它程序占用（可用 ss -ulnp | grep 61440 查看）。";
+    case EADDRNOTAVAIL:
+        return "这个地址不属于本机任何在用网卡：检查设置里的绑定地址。";
+    case EACCES:
+    case EPERM:
+        return "没有权限绑定该端口或被防火墙/策略拦截。";
+    case EAFNOSUPPORT:
+        return "该地址不是 IPv4 地址。";
+    default:
+        return "绑定失败。";
+    }
+#endif
 }
 
 static int bind_socket(engine_t *e, const char *addr)
 {
     e->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (e->sock == INVALID_SOCKET) return -1;
+    if (e->sock == PLAT_INVALID_SOCKET) return -1;
 
-    DWORD timeout = (DWORD)e->cfg.timeout_ms;
-    setsockopt(e->sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof timeout);
+    plat_set_sock_timeout(e->sock, e->cfg.timeout_ms);
 
     struct sockaddr_in local;
     memset(&local, 0, sizeof local);
     local.sin_family = AF_INET;
-    local.sin_port = htons((u_short)e->cfg.bind_port);
+    local.sin_port = htons((uint16_t)e->cfg.bind_port);
     if (addr && addr[0] && strcmp(addr, "0.0.0.0") != 0) {
-        if (InetPtonA(AF_INET, addr, &local.sin_addr) != 1) {
-            closesocket(e->sock); e->sock = INVALID_SOCKET;
+        if (inet_pton(AF_INET, addr, &local.sin_addr) != 1) {
+            plat_closesocket(e->sock); e->sock = PLAT_INVALID_SOCKET;
             return -2;
         }
     } else {
@@ -660,56 +676,71 @@ static int bind_socket(engine_t *e, const char *addr)
     }
 
     if (bind(e->sock, (struct sockaddr *)&local, sizeof local) != 0) {
-        int err = WSAGetLastError();
-        closesocket(e->sock);
-        e->sock = INVALID_SOCKET;
+        int err = plat_last_sock_err();
+        plat_closesocket(e->sock);
+        e->sock = PLAT_INVALID_SOCKET;
         return err ? -err : -3;
     }
 
-    /* Only when the user pinned an address: 0.0.0.0 means "let the system
-     * decide", and that is a legitimate choice on a single-homed machine. */
     if (local.sin_addr.s_addr != INADDR_ANY) {
+#ifdef _WIN32
         DWORD idx = iface_index_for_address(addr);
         if (idx == 0) {
             emit(e, "bind_note", "指定地址不属于本机任何网卡", addr, -1);
         } else {
-            /* Documented quirk: IP_UNICAST_IF takes the index in network byte
-             * order, unlike IP_ADD_MEMBERSHIP and friends. */
             u_int be_index = htonl((u_long)idx);
             if (setsockopt(e->sock, IPPROTO_IP, IP_UNICAST_IF,
                            (const char *)&be_index, sizeof be_index) != 0) {
                 char detail[128];
                 snprintf(detail, sizeof detail, "接口 %lu，errno=%d",
-                         (unsigned long)idx, WSAGetLastError());
+                         (unsigned long)idx, plat_last_sock_err());
                 emit(e, "bind_note", "指定网卡未能锁定出口", detail, -1);
             }
         }
+#else
+        char ifname[64] = {0};
+        if (!iface_name_for_address(addr, ifname, sizeof ifname)) {
+            emit(e, "bind_note", "指定地址不属于本机任何网卡", addr, -1);
+        } else {
+#ifdef SO_BINDTODEVICE
+            if (setsockopt(e->sock, SOL_SOCKET, SO_BINDTODEVICE,
+                           ifname, (socklen_t)strlen(ifname) + 1) != 0) {
+                /* Non-root processes often get EPERM on SO_BINDTODEVICE; source
+                 * IP binding still remains active. */
+                if (errno != EPERM && errno != EACCES) {
+                    emit(e, "bind_note", "未能按接口名锁定出口", ifname, errno);
+                }
+            }
+#endif
+        }
+#endif
     }
 
     memset(&e->peer, 0, sizeof e->peer);
     e->peer.sin_family = AF_INET;
-    e->peer.sin_port = htons((u_short)e->cfg.port);
-    if (InetPtonA(AF_INET, e->cfg.server, &e->peer.sin_addr) != 1) {
-        closesocket(e->sock); e->sock = INVALID_SOCKET;
+    e->peer.sin_port = htons((uint16_t)e->cfg.port);
+    if (inet_pton(AF_INET, e->cfg.server, &e->peer.sin_addr) != 1) {
+        plat_closesocket(e->sock); e->sock = PLAT_INVALID_SOCKET;
         return -4;
     }
     return 0;
 }
 
 /* ------------------------------------------------------------------ loop */
-static unsigned __stdcall engine_thread(void *arg)
+static unsigned
+#ifdef _WIN32
+__stdcall
+#endif
+engine_thread(void *arg)
 {
     engine_t *e = (engine_t *)arg;
-    /* Enumerated once per outer round rather than per attempt: adapters do not
-     * appear or vanish mid-session often enough to matter, and re-enumerating
-     * while walking the list would make "the next candidate" meaningless. */
     char cands[MAX_BIND_CANDIDATES][16];
     int cand_count = 0;
     int cand_index = 0;
 
     emit(e, "started", "认证线程已启动", NULL, -1);
 
-    while (WaitForSingleObject(e->stop_evt, 0) == WAIT_TIMEOUT) {
+    while (!plat_event_is_set(&e->stop_evt)) {
         if (cand_count == 0) {
             cand_count = build_bind_candidates(e, cands, MAX_BIND_CANDIDATES);
             cand_index = 0;
@@ -722,8 +753,6 @@ static unsigned __stdcall engine_thread(void *arg)
         snprintf(msg, sizeof msg, "正在绑定 %s", shown);
         set_state(e, ENGINE_STATE_BINDING, msg);
         if (cand_index > 0) {
-            /* Name the address we are leaving, not the first one: after the
-             * second attempt "上一次在 0.0.0.0 上" would be a lie. */
             const char *prev = cands[cand_index - 1];
             char note[128];
             snprintf(note, sizeof note,
@@ -739,14 +768,11 @@ static unsigned __stdcall engine_thread(void *arg)
             snprintf(detail, sizeof detail,
                      "无法绑定 %s:%d（错误 %d）。%s",
                      shown, e->cfg.bind_port, rc, bind_error_hint(rc));
-            /* A failure on the very first candidate is a genuine port conflict:
-             * every other address would fail the same way, so report it instead
-             * of burning through the list and blaming the adapters. */
             if (cand_index == 0) {
-                InterlockedExchange(&e->reason, OFFLINE_BIND_FAILED);
+                plat_atomic_store(&e->reason, OFFLINE_BIND_FAILED);
                 set_state(e, ENGINE_STATE_RETRY_WAIT, "绑定失败");
                 emit(e, "bind_failed", "绑定端口失败", detail, rc);
-                e->consecutive_failures++;
+                plat_atomic_store(&e->consecutive_failures, plat_atomic_load(&e->consecutive_failures) + 1);
                 cand_index = 0;
                 cand_count = 0;
             } else {
@@ -756,15 +782,15 @@ static unsigned __stdcall engine_thread(void *arg)
             }
         } else {
             const char *result = authenticate(e);
-            if (e->sock != INVALID_SOCKET) { closesocket(e->sock); e->sock = INVALID_SOCKET; }
-            if (WaitForSingleObject(e->stop_evt, 0) == WAIT_OBJECT_0) break;
+            if (e->sock != PLAT_INVALID_SOCKET) {
+                plat_closesocket(e->sock);
+                e->sock = PLAT_INVALID_SOCKET;
+            }
+            if (plat_event_is_set(&e->stop_evt)) break;
             if (strcmp(result, "fatal") == 0) {
                 set_state(e, ENGINE_STATE_FATAL, "需要人工处理");
                 goto done;
             }
-            /* Transient with candidates left: try the next local address at
-             * once.  The backoff is for "the network is flaky", not for "we
-             * may simply be shouting out of the wrong adapter". */
             if (cand_index + 1 < cand_count) {
                 cand_index++;
                 continue;
@@ -773,12 +799,18 @@ static unsigned __stdcall engine_thread(void *arg)
             cand_count = 0;
         }
 
-        if (!e->cfg.reconnect_enabled) {
+        plat_rwlock_rdlock(&e->lock);
+        int reconnect_enabled = e->cfg.reconnect_enabled;
+        int give_up_after = e->cfg.give_up_after;
+        plat_rwlock_rdunlock(&e->lock);
+
+        if (!reconnect_enabled) {
             emit(e, "reconnect_disabled", "自动重连已关闭，请手动登录", NULL, -1);
             set_state(e, ENGINE_STATE_FATAL, "自动重连已关闭");
             goto done;
         }
-        if (e->cfg.give_up_after > 0 && e->consecutive_failures >= e->cfg.give_up_after) {
+        int failures = (int)plat_atomic_load(&e->consecutive_failures);
+        if (give_up_after > 0 && failures >= give_up_after) {
             emit(e, "gave_up", "连续失败次数过多，已暂停自动重连",
                  "问题多半不在网络抖动，而在配置或环境。", -1);
             set_state(e, ENGINE_STATE_FATAL, "已暂停自动重连");
@@ -786,19 +818,21 @@ static unsigned __stdcall engine_thread(void *arg)
         }
 
         double delay = next_backoff(e);
-        snprintf(msg, sizeof msg, "%.0f 秒后重试（第 %d 次失败）", delay, e->consecutive_failures);
+        snprintf(msg, sizeof msg, "%.0f 秒后重试（第 %d 次失败）", delay, failures);
         set_state(e, ENGINE_STATE_RETRY_WAIT, msg);
         emit(e, "retry_scheduled", msg, NULL, -1);
         if (!engine_wait(e, delay)) break;
     }
 
 done:
-    if (e->sock != INVALID_SOCKET) { closesocket(e->sock); e->sock = INVALID_SOCKET; }
-    if (InterlockedCompareExchange(&e->state, ENGINE_STATE_STOPPED, ENGINE_STATE_STOPPED)
-        != ENGINE_STATE_FATAL) {
+    if (e->sock != PLAT_INVALID_SOCKET) {
+        plat_closesocket(e->sock);
+        e->sock = PLAT_INVALID_SOCKET;
+    }
+    if ((engine_state)plat_atomic_load(&e->state) != ENGINE_STATE_FATAL) {
         set_state(e, ENGINE_STATE_STOPPED, "已停止");
     }
-    InterlockedExchange(&e->running, 0);
+    plat_atomic_store(&e->running, 0);
     emit(e, "stopped", "认证已停止", NULL, -1);
     return 0;
 }
@@ -820,8 +854,6 @@ void engine_config_defaults(engine_config *cfg)
     cfg->factor = 2.0;
     cfg->jitter = 0.25;
     cfg->give_up_after = 8;
-    /* Off unless asked for: one extra ring entry per datagram would evict the
-     * state transitions that are the first thing anyone looks at. */
     cfg->protocol_hex = 0;
 }
 
@@ -832,59 +864,56 @@ engine_t *engine_create(const engine_config *cfg, engine_event_fn fn, void *user
     e->cfg = *cfg;
     e->fn = fn;
     e->user = user;
-    e->sock = INVALID_SOCKET;
-    e->protocol_hex = cfg->protocol_hex ? 1 : 0;
-    e->state = ENGINE_STATE_IDLE;
-    e->reason = OFFLINE_NONE;
-    InitializeSRWLock(&e->lock);
-    e->stop_evt = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (!e->stop_evt) { free(e); return NULL; }
+    e->sock = PLAT_INVALID_SOCKET;
+    plat_atomic_store(&e->protocol_hex, cfg->protocol_hex ? 1 : 0);
+    plat_atomic_store(&e->state, ENGINE_STATE_IDLE);
+    plat_atomic_store(&e->reason, OFFLINE_NONE);
+    plat_rwlock_init(&e->lock);
+    if (plat_event_create(&e->stop_evt) != 0) {
+        plat_rwlock_destroy(&e->lock);
+        free(e);
+        return NULL;
+    }
 
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) e->ws_ready = 1;
-    /* GetTickCount wraps every 49 days; this process is meant to stay up for
-     * months, so seed from the 64-bit counter instead. */
-    srand((unsigned)GetTickCount64());
+    plat_net_init();
+    e->ws_ready = 1;
+    srand((unsigned)plat_rand_seed());
     return e;
 }
 
 int engine_start(engine_t *e)
 {
     if (!e) return -1;
-    /* A finished worker leaves its handle behind; reclaim it so the engine can
-     * be started again after FATAL or after /logout + /login. */
     if (e->thread) {
-        if (WaitForSingleObject(e->thread, 0) != WAIT_OBJECT_0) return -1;
-        CloseHandle(e->thread);
-        e->thread = NULL;
+        if (plat_thread_is_alive(e->thread)) return -1;
+        plat_thread_join(&e->thread, -1);
     }
-    InterlockedExchange(&e->running, 0);
-    ResetEvent(e->stop_evt);
-    e->consecutive_failures = 0;
+    plat_atomic_store(&e->running, 0);
+    plat_event_reset(&e->stop_evt);
+    plat_atomic_store(&e->consecutive_failures, 0);
+    plat_rwlock_wrlock(&e->lock);
     e->online_since = 0.0;
     e->ip[0] = '\0';
+    plat_rwlock_wrunlock(&e->lock);
     e->started_at = now_seconds();
-    InterlockedExchange(&e->state, ENGINE_STATE_IDLE);
-    InterlockedExchange(&e->reason, OFFLINE_NONE);
-    e->thread = (HANDLE)_beginthreadex(NULL, 0, engine_thread, e, 0, NULL);
-    if (!e->thread) return -1;
-    InterlockedExchange(&e->running, 1);
+    plat_atomic_store(&e->state, ENGINE_STATE_IDLE);
+    plat_atomic_store(&e->reason, OFFLINE_NONE);
+    if (plat_thread_create(&e->thread, engine_thread, e) != 0) return -1;
+    plat_atomic_store(&e->running, 1);
     return 0;
 }
 
 void engine_stop(engine_t *e)
 {
     if (!e) return;
-    InterlockedExchange(&e->reason, OFFLINE_USER_LOGOUT);
-    SetEvent(e->stop_evt);
+    plat_atomic_store(&e->reason, OFFLINE_USER_LOGOUT);
+    plat_event_set(&e->stop_evt);
 }
 
 int engine_join(engine_t *e, int timeout_ms)
 {
     if (!e || !e->thread) return 1;
-    DWORD rc = WaitForSingleObject(e->thread, (DWORD)timeout_ms);
-    if (rc == WAIT_OBJECT_0) return 1;
-    return 0;
+    return plat_thread_join(&e->thread, timeout_ms);
 }
 
 void engine_destroy(engine_t *e)
@@ -892,24 +921,28 @@ void engine_destroy(engine_t *e)
     if (!e) return;
     engine_stop(e);
     if (e->thread) {
-        WaitForSingleObject(e->thread, 5000);
-        CloseHandle(e->thread);
-        e->thread = NULL;
+        plat_thread_join(&e->thread, 5000);
     }
-    if (e->sock != INVALID_SOCKET) { closesocket(e->sock); e->sock = INVALID_SOCKET; }
-    if (e->stop_evt) { CloseHandle(e->stop_evt); e->stop_evt = NULL; }
-    if (e->ws_ready) { WSACleanup(); e->ws_ready = 0; }
+    if (e->sock != PLAT_INVALID_SOCKET) {
+        plat_closesocket(e->sock);
+        e->sock = PLAT_INVALID_SOCKET;
+    }
+    plat_event_destroy(&e->stop_evt);
+    plat_rwlock_destroy(&e->lock);
+    if (e->ws_ready) { plat_net_cleanup(); e->ws_ready = 0; }
+    plat_secure_zero(&e->cfg.password, sizeof e->cfg.password);
+    plat_secure_zero(e->auth_info, sizeof e->auth_info);
     free(e);
 }
 
 engine_state engine_get_state(engine_t *e)
 {
-    return e ? (engine_state)InterlockedCompareExchange(&e->state, 0, 0) : ENGINE_STATE_IDLE;
+    return e ? (engine_state)plat_atomic_load(&e->state) : ENGINE_STATE_IDLE;
 }
 
 offline_reason engine_get_reason(engine_t *e)
 {
-    return e ? (offline_reason)InterlockedCompareExchange(&e->reason, 0, 0) : OFFLINE_NONE;
+    return e ? (offline_reason)plat_atomic_load(&e->reason) : OFFLINE_NONE;
 }
 
 int engine_is_online(engine_t *e)
@@ -920,35 +953,79 @@ int engine_is_online(engine_t *e)
 int engine_is_running(engine_t *e)
 {
     if (!e || !e->thread) return 0;
-    return WaitForSingleObject(e->thread, 0) == WAIT_TIMEOUT;
+    return plat_thread_is_alive(e->thread);
 }
 
 double engine_uptime(engine_t *e)
 {
-    if (!e || e->online_since <= 0.0) return 0.0;
-    return now_seconds() - e->online_since;
+    if (!e) return 0.0;
+    plat_rwlock_rdlock(&e->lock);
+    double since = e->online_since;
+    plat_rwlock_rdunlock(&e->lock);
+    if (since <= 0.0) return 0.0;
+    return now_seconds() - since;
 }
 
 void engine_get_ip(engine_t *e, char out[16])
 {
     if (!e || !out) return;
-    AcquireSRWLockShared(&e->lock);
+    plat_rwlock_rdlock(&e->lock);
     snprintf(out, 16, "%s", e->ip);
-    ReleaseSRWLockShared(&e->lock);
+    plat_rwlock_rdunlock(&e->lock);
 }
 
 int engine_get_consecutive_failures(engine_t *e)
 {
-    return e ? e->consecutive_failures : 0;
+    return e ? (int)plat_atomic_load(&e->consecutive_failures) : 0;
 }
 
 void engine_set_protocol_hex(engine_t *e, int on)
 {
     if (!e) return;
-    InterlockedExchange(&e->protocol_hex, on ? 1 : 0);
+    plat_atomic_store(&e->protocol_hex, on ? 1 : 0);
+    plat_rwlock_wrlock(&e->lock);
     e->cfg.protocol_hex = on ? 1 : 0;
-    /* Say so in the ring: a dump that silently fails to start looks exactly
-     * like a client that has nothing to say, which is the confusion this whole
-     * fix exists to end. */
+    plat_rwlock_wrunlock(&e->lock);
     emit(e, "note", on ? "协议十六进制转储：开" : "协议十六进制转储：关", NULL, -1);
+}
+
+void engine_update_config(engine_t *e, const engine_config *fresh)
+{
+    if (!e || !fresh) return;
+    plat_rwlock_wrlock(&e->lock);
+    plat_secure_zero(e->cfg.password, sizeof e->cfg.password);
+    e->cfg = *fresh;
+    plat_rwlock_wrunlock(&e->lock);
+    plat_atomic_store(&e->protocol_hex, fresh->protocol_hex ? 1 : 0);
+}
+
+void engine_update_live_policy(engine_t *e, const engine_config *fresh)
+{
+    if (!e || !fresh) return;
+    int hex_changed = 0;
+    plat_rwlock_wrlock(&e->lock);
+    hex_changed = (e->cfg.protocol_hex != (fresh->protocol_hex ? 1 : 0));
+    e->cfg.protocol_hex = fresh->protocol_hex ? 1 : 0;
+    e->cfg.reconnect_enabled = fresh->reconnect_enabled;
+    e->cfg.min_delay = fresh->min_delay;
+    e->cfg.max_delay = fresh->max_delay;
+    e->cfg.factor = fresh->factor;
+    e->cfg.jitter = fresh->jitter;
+    e->cfg.give_up_after = fresh->give_up_after;
+    plat_rwlock_wrunlock(&e->lock);
+    plat_atomic_store(&e->protocol_hex, fresh->protocol_hex ? 1 : 0);
+    if (hex_changed) {
+        emit(e, "note", fresh->protocol_hex ? "协议十六进制转储：开" : "协议十六进制转储：关",
+             NULL, -1);
+    }
+}
+
+void engine_get_identity(engine_t *e, char *account_out, size_t account_cap,
+                         char *server_out, size_t server_cap)
+{
+    if (!e) return;
+    plat_rwlock_rdlock(&e->lock);
+    if (account_out && account_cap) snprintf(account_out, account_cap, "%s", e->cfg.account);
+    if (server_out && server_cap) snprintf(server_out, server_cap, "%s", e->cfg.server);
+    plat_rwlock_rdunlock(&e->lock);
 }

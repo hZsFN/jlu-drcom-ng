@@ -1,13 +1,14 @@
 # drcomd —— 原生认证核心
 
-认证与保活的原生实现，用 C 写，编译出约 268 KB 的 `drcomd.exe`。界面（Python +
-Flet）只是这个进程的客户端，关掉窗口不影响登录。
+认证与保活的原生实现，用 C 写，跨平台支持 Windows (`drcomd.exe`) 与 Linux (`drcomd`)。界面（Python + Flet）只是这个进程的客户端，关掉窗口不影响登录，重新打开窗口会无缝接管。
 
 **为什么要有它**：原来认证跑在 Python 主进程里，主进程又拖着 Flet 前端（`flet.exe`
 常驻 100–190 MB），所以「关掉窗口」只能隐藏，内存一分不还。把认证拆出来以后，界面可以
 真的退出，常驻的只剩这个进程——**私有内存约 1 MB**。
 
 ## 构建
+
+### Windows (MSVC)
 
 ```bat
 native\build.bat          :: 编译 drcomd.exe 和测试程序
@@ -23,29 +24,38 @@ native\build.bat test     :: 顺便跑离线测试
 也可以在 Visual Studio 里打开 `native\drcomd.sln`：项目开了 `/analyze`（PREfast）+
 C++ Core Check + `AllRules.ruleset`，构建时就把静态分析跑一遍。
 
+### Linux (GCC / Clang + OpenSSL)
+
+```bash
+sudo apt install build-essential libssl-dev   # Debian/Ubuntu；RHEL/Fedora 为 openssl-devel
+make -C native          # 编译 native/drcomd
+make -C native test     # 运行哈希向量与协议 golden 测试
+```
+
 ## 运行
 
 ```bat
-drcomd.exe --config "%APPDATA%\JLU-DrCOM-NG\config.json" --api-port 61441
-drcomd.exe --dry-run      :: 只读配置并打印，不联网
-drcomd.exe --once         :: 认证一次就退出（调试用）
-drcomd.exe --verbose      :: 连保活心跳一起打
+drcomd --config "%APPDATA%\JLU-DrCOM-NG\config.json" --api-port 61441
+drcomd --dry-run      :: 只读配置并打印，不联网
+drcomd --once         :: 认证一次就退出（调试用）
+drcomd --verbose      :: 连保活心跳一起打
 ```
 
-它读**和 Python 版同一份** `config.json`，密码由 Windows DPAPI 解密，不需要重新输入。
+它读**和 Python 版同一份** `config.json`（按 `active_account_id` 选择活跃账号）：Windows 使用 DPAPI (`D1:`)，Linux 使用 OpenSSL 配合同目录 `key.bin` 解密 Fernet (`F1:`)，不需要重新输入。
 
 ## HTTP 接口
 
-只监听 `127.0.0.1`，非环回连接一律 403。
+只监听 `127.0.0.1`，非环回连接与非法 `Host`/`Origin` 一律 403；所有写操作 (`POST`) 与 `GET /logs` 需要 `X-DrCOM-Token` 控制令牌（每次启动生成并写入同目录 `core-token.txt`）。`OPTIONS` 预检一律返回 `405 Method Not Allowed`。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/status` | 状态快照（字段与 Python 版 `StatusServer` 对齐） |
 | GET | `/health` | `{"online":bool,"state":"..."}` |
-| GET | `/logs` | 最近 40 条事件 |
-| POST | `/login` | 开始/重新开始认证 |
+| GET | `/logs[?since=N]` | 增量日志游标查询（动态扩容缓冲区，`next_seq`） |
+| POST | `/login` | 启动认证（运行中幂等返回，不打断会话；已停止时重载配置） |
 | POST | `/logout` | 停止保活，进程继续常驻 |
-| POST | `/reconnect` | 停 + 起 |
+| POST | `/reconnect` | 停止当前会话并从 `config.json` 重载全部配置与活跃账号后重连 |
+| POST | `/reload` | 热重载重连策略与协议转储开关，不中断在线会话 |
 | POST | `/shutdown` | 退出进程 |
 
 `--api-port` 优先于配置文件里的 `api.port`（界面必须知道自己该连哪里）。
@@ -87,8 +97,7 @@ native\tests\test_engine.exe 51440 51441 5
 
 ## 已知限制
 
-- 只支持 Windows（DPAPI、`WS2_32`）
-- 密码格式支持 DPAPI（`D1:`）；Fernet（`F1:`）与降级混淆（`X1:`）会明确报错并要求改回
-  DPAPI，不做静默降级
+- 支持 Windows（DPAPI `D1:` + Win32 原生托盘）与 Linux（`libcrypto` 解密 Fernet `F1:`，桌面托盘由 Python `pystray` 承担）；macOS 未内置 `drcomd` 支持
+- 降级混淆（`X1:`）会被原生核心拒绝，不做静默降级
 - `auto_interface_fallback`（多网卡时逐个源地址重试）尚未在原生侧实现，目前只用配置里
-  的绑定地址或通配地址
+  的绑定地址（Linux 下通过 `SO_BINDTODEVICE` / 绑定 IP）或通配地址

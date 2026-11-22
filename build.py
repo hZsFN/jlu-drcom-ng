@@ -38,9 +38,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 VENDOR = ROOT / "vendor"
+IS_WINDOWS = sys.platform == "win32"
 
 #: Where the vendored Flet client archive lives.
-FLET_ARCHIVE = VENDOR / "flet-windows.zip"
+FLET_ARCHIVE = VENDOR / ("flet-windows.zip" if IS_WINDOWS else "flet-linux-amd64.tar.gz")
 
 # Runtime-dynamic imports that static analysis cannot see.
 HIDDEN_IMPORTS = [
@@ -58,6 +59,8 @@ HIDDEN_IMPORTS = [
     "flet_desktop",
     "drcom",
 ]
+if not IS_WINDOWS:
+    HIDDEN_IMPORTS += ["cryptography", "cryptography.fernet"]
 
 # Keep the bundle lean: none of these are used, and several are enormous.
 EXCLUDES = [
@@ -165,17 +168,21 @@ def build(*, onefile: bool = False, name: str = "JLU-DrCOM-NG", console: bool = 
     # Ship the Flet runtime inside the package so no download is needed.
     runtime = FLET_ARCHIVE if FLET_ARCHIVE.exists() else None
     if runtime is None:
-        for candidate in VENDOR.glob("flet-*.zip"):
-            runtime = candidate
-            break
+        patterns = ("flet-*.zip",) if IS_WINDOWS else ("flet-*.tar.gz", "flet-*.zip")
+        for pat in patterns:
+            for candidate in VENDOR.glob(pat):
+                runtime = candidate
+                break
+            if runtime is not None:
+                break
     if runtime is not None:
         write_fingerprint_sidecar(runtime)
-        arguments += ["--add-data", f"{runtime}{';' if sys.platform == 'win32' else ':'}flet_desktop/app"]
+        arguments += ["--add-data", f"{runtime}{';' if IS_WINDOWS else ':'}flet_desktop/app"]
         sidecar = runtime.with_name(runtime.name + ".sha256")
         if sidecar.exists():
             arguments += [
                 "--add-data",
-                f"{sidecar}{';' if sys.platform == 'win32' else ':'}flet_desktop/app",
+                f"{sidecar}{';' if IS_WINDOWS else ':'}flet_desktop/app",
             ]
         print(f"bundling Flet runtime: {runtime.name} ({runtime.stat().st_size / 1048576:.1f} MB)")
     else:
@@ -188,20 +195,21 @@ def build(*, onefile: bool = False, name: str = "JLU-DrCOM-NG", console: bool = 
         )
 
     icon = ROOT / "assets" / "app.ico"
-    if icon.exists():
+    if IS_WINDOWS and icon.exists():
         arguments += ["--icon", str(icon)]
 
-    # The resident core.  It lives in _internal/ next to everything else, which
-    # is where drcom/remote_engine.py::daemon_path() looks for it.  Without it the
-    # app still runs, just with the fatter in-process Python engine.
-    native_core = ROOT / "native" / "drcomd.exe"
+    # The resident core.  It lives in _internal/ (or next to the executable),
+    # which is where drcom/remote_engine.py::daemon_path() looks for it.
+    core_name = "drcomd.exe" if IS_WINDOWS else "drcomd"
+    native_core = ROOT / "native" / core_name
     if native_core.exists():
-        separator = ";" if sys.platform == "win32" else ":"
+        separator = ";" if IS_WINDOWS else ":"
         arguments += ["--add-binary", f"{native_core}{separator}."]
-        print(f"bundling native core: drcomd.exe ({native_core.stat().st_size / 1024:.0f} KB)")
+        print(f"bundling native core: {core_name} ({native_core.stat().st_size / 1024:.0f} KB)")
     else:
+        build_hint = "native/build.bat" if IS_WINDOWS else "make -C native"
         print(
-            "WARNING: native/drcomd.exe is missing (run native/build.bat).\n"
+            f"WARNING: native/{core_name} is missing (run {build_hint}).\n"
             "         The app will fall back to the in-process Python core.",
             file=sys.stderr,
         )

@@ -27,11 +27,21 @@ def temp_data_dir(tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _isolate_from_live_daemon(monkeypatch) -> None:
+    """Prevent unit tests from touching a real drcomd daemon running on the host."""
+    import drcom.remote_engine as remote_engine
+
+    monkeypatch.setattr(remote_engine, "daemon_status", lambda *_a, **_kw: None)
+    monkeypatch.setattr(remote_engine, "daemon_is_up", lambda *_a, **_kw: False)
+
+
 @pytest.fixture
 def controller(temp_data_dir: Path):
     """A controller wired to a throwaway data directory."""
     from drcom.controller import AppController
 
     instance = AppController(data_dir=temp_data_dir, log_level="WARNING")
+    instance.config.notify.desktop = False
     yield instance
     instance.shutdown()

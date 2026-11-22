@@ -78,7 +78,8 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--cli autostart task"; Flags: runhidden waituntilterminated; Tasks: autostart; StatusMsg: "正在注册开机自启（计划任务）…"
-Filename: "{app}\{#MyAppExeName}"; Description: "立即启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "立即启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent; Check: not IsSilentRelaunch
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait; Check: IsSilentRelaunch
 
 [UninstallRun]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--cli autostart off"; Flags: runhidden; RunOnceId: "RemoveAutostart"
@@ -87,6 +88,33 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "--cli autostart off"; Flags: run
 Type: filesandordirs; Name: "{app}\__pycache__"
 
 [Code]
+function IsSilentRelaunch(): Boolean;
+begin
+  Result := ExpandConstant('{param:relaunch|0}') = '1';
+end;
+
+procedure StopRunningProcesses(IncludeClient: Boolean);
+var
+  ResultCode: Integer;
+begin
+  Exec('taskkill.exe', '/F /T /IM drcomd.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if IncludeClient then
+    Exec('taskkill.exe', '/F /IM {#MyAppExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(400);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  StopRunningProcesses(WizardSilent());
+  Result := '';
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  StopRunningProcesses(True);
+  Result := True;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   AppData: String;

@@ -482,7 +482,6 @@ class AuthEngine:
         # --- online ------------------------------------------------------
         self.auth_information = outcome.auth_information
         self.online_since = time.time()
-        self.consecutive_failures = 0
         self.attempt += 1
         if self.stats:
             self.stats.open_session(ip=self.ip, account=self.account.masked_account)
@@ -498,9 +497,11 @@ class AuthEngine:
         reason = self._keepalive_loop(sock, bound)
         if self.online_since:
             if self.stats:
-                self.stats.close_session()
+                self.stats.close_session(drop=(reason is not OfflineReason.USER_LOGOUT))
             self.online_since = None
         self.reason = reason
+        if reason is not OfflineReason.USER_LOGOUT:
+            self.consecutive_failures += 1
         return "transient"
 
     # -- keepalive --------------------------------------------------------
@@ -561,6 +562,7 @@ class AuthEngine:
                 continue
 
             consecutive_ka2_failures = 0
+            self.consecutive_failures = 0
             self.log.debug("keepalive 正常，%ss 后进入下一轮", f"{interval:g}")
             self._emit("keepalive_ok", message="保活正常", payload={"uptime": self.uptime_seconds()})
             if not self._sleep(interval):

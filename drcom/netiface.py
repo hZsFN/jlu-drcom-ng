@@ -11,16 +11,19 @@ reason to fail authentication.
 from __future__ import annotations
 
 import ctypes
-import ctypes.wintypes as wintypes
+import ctypes.util
+import os
 import socket
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 __all__ = [
     "InterfaceInfo",
     "candidate_bind_addresses",
     "get_default_route_ip",
+    "get_interface_by_index",
     "list_interfaces",
     "pick_relevant_interface",
 ]
@@ -204,33 +207,199 @@ def _windows_if_table() -> list[_MIB_IF_ROW2]:
 
 
 # --------------------------------------------------------------------------
-# POSIX fallback
+# POSIX / Linux counters & per-index lookup
 # --------------------------------------------------------------------------
-def _posix_if_counters() -> list[InterfaceInfo]:
-    out: list[InterfaceInfo] = []
+def _read_proc_net_dev() -> dict[str, tuple[int, int, int, int, int, int]]:
+    stats: dict[str, tuple[int, int, int, int, int, int]] = {}
     try:
         with open("/proc/net/dev", "r", encoding="utf-8") as handle:
             lines = handle.readlines()[2:]
     except OSError:
-        return out
+        return stats
     for line in lines:
         name, _, rest = line.partition(":")
         parts = rest.split()
         if len(parts) < 16:
             continue
+        stats[name.strip()] = (
+            int(parts[0]),
+            int(parts[1]),
+            int(parts[2]),
+            int(parts[8]),
+            int(parts[9]),
+            int(parts[10]),
+        )
+    return stats
+
+
+def _read_sysfs_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def _read_sysfs_int(path: Path, default: int = 0) -> int:
+    raw = _read_sysfs_text(path)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _linux_if_from_sysfs(
+    if_dir: Path,
+    proc_row: tuple[int, int, int, int, int, int] | None = None,
+) -> InterfaceInfo:
+    name = if_dir.name
+    index = _read_sysfs_int(if_dir / "ifindex", 0)
+    mtu = _read_sysfs_int(if_dir / "mtu", 0)
+    speed_mbps = _read_sysfs_int(if_dir / "speed", -1)
+    speed_bps = speed_mbps * 1_000_000 if speed_mbps > 0 else 0
+
+    raw_mac = _read_sysfs_text(if_dir / "address").upper()
+    mac = "" if not raw_mac or raw_mac == "00:00:00:00:00:00" else raw_mac
+
+    oper = _read_sysfs_text(if_dir / "operstate").lower()
+    is_up = oper == "up"
+    oper_status = 1 if is_up else 2
+
+    arp_type = _read_sysfs_int(if_dir / "type", -1)
+    if name == "lo" or arp_type == 772:
+        if_type = _IF_TYPE_SOFTWARE_LOOPBACK
+    elif (if_dir / "wireless").exists() or (if_dir / "phy80211").exists():
+        if_type = _IF_TYPE_IEEE80211
+    elif arp_type == 65534 or (if_dir / "tun_flags").exists() or name.startswith(("tun", "tap", "wg", "tailscale")):
+        if_type = _IF_TYPE_TUNNEL
+    elif arp_type == 1:
+        if_type = _IF_TYPE_ETHERNET_CSMACD
+    else:
+        if_type = 0
+
+    stat_dir = if_dir / "statistics"
+    if stat_dir.is_dir():
+        rx_bytes = _read_sysfs_int(stat_dir / "rx_bytes", 0)
+        rx_pkts = _read_sysfs_int(stat_dir / "rx_packets", 0)
+        rx_errs = _read_sysfs_int(stat_dir / "rx_errors", 0)
+        tx_bytes = _read_sysfs_int(stat_dir / "tx_bytes", 0)
+        tx_pkts = _read_sysfs_int(stat_dir / "tx_packets", 0)
+        tx_errs = _read_sysfs_int(stat_dir / "tx_errors", 0)
+    elif proc_row is not None:
+        rx_bytes, rx_pkts, rx_errs, tx_bytes, tx_pkts, tx_errs = proc_row
+    else:
+        rx_bytes = rx_pkts = rx_errs = tx_bytes = tx_pkts = tx_errs = 0
+
+    return InterfaceInfo(
+        name=name,
+        description=name,
+        index=index,
+        mtu=mtu,
+        speed_bps=speed_bps,
+        if_type=if_type,
+        oper_status=oper_status,
+        mac=mac,
+        bytes_in=rx_bytes,
+        bytes_out=tx_bytes,
+        packets_in=rx_pkts,
+        packets_out=tx_pkts,
+        errors_in=rx_errs,
+        errors_out=tx_errs,
+        is_up=is_up,
+    )
+
+
+def _posix_if_counters() -> list[InterfaceInfo]:
+    proc_stats = _read_proc_net_dev()
+    sys_net = Path("/sys/class/net")
+    if sys_net.is_dir():
+        out: list[InterfaceInfo] = []
+        try:
+            entries = sorted(sys_net.iterdir(), key=lambda p: p.name)
+        except OSError:
+            entries = []
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            out.append(_linux_if_from_sysfs(entry, proc_stats.get(entry.name)))
+        if out:
+            return out
+
+    out = []
+    for name, (rx_b, rx_p, rx_e, tx_b, tx_p, tx_e) in proc_stats.items():
         out.append(
             InterfaceInfo(
-                name=name.strip(),
-                bytes_in=int(parts[0]),
-                packets_in=int(parts[1]),
-                errors_in=int(parts[2]),
-                bytes_out=int(parts[8]),
-                packets_out=int(parts[9]),
-                errors_out=int(parts[10]),
+                name=name,
+                bytes_in=rx_b,
+                packets_in=rx_p,
+                errors_in=rx_e,
+                bytes_out=tx_b,
+                packets_out=tx_p,
+                errors_out=tx_e,
                 is_up=True,
             )
         )
     return out
+
+
+def _row_to_interface_info(row: _MIB_IF_ROW2) -> InterfaceInfo:
+    length = min(int(row.PhysicalAddressLength), IF_MAX_PHYS_ADDRESS_LENGTH)
+    mac = (
+        ":".join(f"{row.PhysicalAddress[i]:02X}" for i in range(length))
+        if 0 < length <= IF_MAX_PHYS_ADDRESS_LENGTH
+        else ""
+    )
+    return InterfaceInfo(
+        name=str(row.Alias or ""),
+        description=str(row.Description or ""),
+        index=int(row.InterfaceIndex),
+        mtu=int(row.Mtu),
+        speed_bps=int(row.ReceiveLinkSpeed or row.TransmitLinkSpeed),
+        if_type=int(row.Type),
+        oper_status=int(row.OperStatus),
+        mac=mac,
+        bytes_in=int(row.InOctets),
+        bytes_out=int(row.OutOctets),
+        packets_in=int(row.InUcastPkts + row.InNUcastPkts),
+        packets_out=int(row.OutUcastPkts + row.OutNUcastPkts),
+        errors_in=int(row.InErrors),
+        errors_out=int(row.OutErrors),
+        is_up=int(row.OperStatus) == 1,
+    )
+
+
+def get_interface_by_index(index: int) -> InterfaceInfo | None:
+    """O(1) single-interface lookup when the OS index is already known."""
+    if index <= 0:
+        return None
+    if IS_WINDOWS:
+        if _windows_api_ok is False:
+            return None
+        try:
+            iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
+            get_entry = iphlpapi.GetIfEntry2
+            get_entry.argtypes = [ctypes.POINTER(_MIB_IF_ROW2)]
+            get_entry.restype = ctypes.c_ulong
+        except (OSError, AttributeError):
+            return None
+        row = _MIB_IF_ROW2()
+        row.InterfaceIndex = index
+        if get_entry(ctypes.byref(row)) != 0 or not row.Alias:
+            return None
+        return _row_to_interface_info(row)
+
+    sys_net = Path("/sys/class/net")
+    if sys_net.is_dir():
+        try:
+            for entry in sys_net.iterdir():
+                if not entry.is_dir():
+                    continue
+                if _read_sysfs_int(entry / "ifindex", -1) == index:
+                    return _linux_if_from_sysfs(entry)
+        except OSError:
+            return None
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -240,35 +409,8 @@ def list_interfaces() -> list[InterfaceInfo]:
     """Every interface the OS will tell us about, with counters."""
     if IS_WINDOWS:
         rows = _windows_if_table()
-        out: list[InterfaceInfo] = []
-        for row in rows:
-            length = min(int(row.PhysicalAddressLength), IF_MAX_PHYS_ADDRESS_LENGTH)
-            mac = (
-                ":".join(f"{row.PhysicalAddress[i]:02X}" for i in range(length))
-                if 0 < length <= IF_MAX_PHYS_ADDRESS_LENGTH
-                else ""
-            )
-            out.append(
-                InterfaceInfo(
-                    name=str(row.Alias or ""),
-                    description=str(row.Description or ""),
-                    index=int(row.InterfaceIndex),
-                    mtu=int(row.Mtu),
-                    speed_bps=int(row.ReceiveLinkSpeed or row.TransmitLinkSpeed),
-                    if_type=int(row.Type),
-                    oper_status=int(row.OperStatus),
-                    mac=mac,
-                    bytes_in=int(row.InOctets),
-                    bytes_out=int(row.OutOctets),
-                    packets_in=int(row.InUcastPkts + row.InNUcastPkts),
-                    packets_out=int(row.OutUcastPkts + row.OutNUcastPkts),
-                    errors_in=int(row.InErrors),
-                    errors_out=int(row.OutErrors),
-                    is_up=int(row.OperStatus) == 1,
-                )
-            )
-        if out:
-            return out
+        if rows:
+            return [_row_to_interface_info(row) for row in rows]
     return _posix_if_counters()
 
 
@@ -292,6 +434,7 @@ _VIRTUAL_HINTS = (
     "native wifi filter", "mac layer", "lightweight filter", "vswitch",
     "vethernet", "hyper-v", "loopback", "teredo", "isatap", "bluetooth",
     "tap-", "tun ", "wintun", "kaspersky", "miniport", "wan miniport",
+    "docker", "veth", "virbr", "br-",
 )
 
 
@@ -430,62 +573,152 @@ def candidate_bind_addresses(
     return ordered
 
 
+class _SOCKADDR_IN(ctypes.Structure):
+    _fields_ = [
+        ("sin_family", ctypes.c_ushort),
+        ("sin_port", ctypes.c_ushort),
+        ("sin_addr", ctypes.c_ubyte * 4),
+        ("sin_zero", ctypes.c_char * 8),
+    ]
+
+
+class _SOCKET_ADDRESS(ctypes.Structure):
+    _fields_ = [("lpSockaddr", ctypes.c_void_p), ("iSockaddrLength", ctypes.c_int)]
+
+
+class _IP_ADAPTER_ADDRESSES(ctypes.Structure):
+    pass
+
+
+_IP_ADAPTER_ADDRESSES._fields_ = [
+    ("Length", ctypes.c_ulong),
+    ("IfIndex", ctypes.c_ulong),
+    ("Next", ctypes.POINTER(_IP_ADAPTER_ADDRESSES)),
+    ("AdapterName", ctypes.c_char_p),
+    ("FirstUnicastAddress", ctypes.c_void_p),
+    ("FirstAnycastAddress", ctypes.c_void_p),
+    ("FirstMulticastAddress", ctypes.c_void_p),
+    ("FirstDnsServerAddress", ctypes.c_void_p),
+    ("DnsSuffix", ctypes.c_wchar_p),
+    ("Description", ctypes.c_wchar_p),
+    ("FriendlyName", ctypes.c_wchar_p),
+    ("PhysicalAddress", ctypes.c_ubyte * 8),
+    ("PhysicalAddressLength", ctypes.c_ulong),
+    ("Flags", ctypes.c_ulong),
+    ("Mtu", ctypes.c_ulong),
+    ("IfType", ctypes.c_ulong),
+    ("OperStatus", ctypes.c_ulong),
+    ("Ipv6IfIndex", ctypes.c_ulong),
+    ("ZoneIndices", ctypes.c_ulong * 16),
+    ("FirstPrefix", ctypes.c_void_p),
+]
+
+
+class _IP_ADAPTER_UNICAST_ADDRESS(ctypes.Structure):
+    pass
+
+
+_IP_ADAPTER_UNICAST_ADDRESS._fields_ = [
+    ("Length", ctypes.c_ulong),
+    ("Flags", ctypes.c_ulong),
+    ("Next", ctypes.POINTER(_IP_ADAPTER_UNICAST_ADDRESS)),
+    ("Address", _SOCKET_ADDRESS),
+]
+
+
+class _POSIX_IFADDRS(ctypes.Structure):
+    pass
+
+
+_POSIX_IFADDRS._fields_ = [
+    ("ifa_next", ctypes.POINTER(_POSIX_IFADDRS)),
+    ("ifa_name", ctypes.c_char_p),
+    ("ifa_flags", ctypes.c_uint),
+    ("ifa_addr", ctypes.c_void_p),
+    ("ifa_netmask", ctypes.c_void_p),
+    ("ifa_ifu", ctypes.c_void_p),
+    ("ifa_data", ctypes.c_void_p),
+]
+
+
+def _posix_interface_addresses() -> dict[int, list[str]]:
+    mapping: dict[int, list[str]] = {}
+    libc_name = ctypes.util.find_library("c") or "libc.so.6"
+    try:
+        libc = ctypes.CDLL(libc_name, use_last_error=True)
+        getifaddrs = libc.getifaddrs
+        getifaddrs.argtypes = [ctypes.POINTER(ctypes.POINTER(_POSIX_IFADDRS))]
+        getifaddrs.restype = ctypes.c_int
+        freeifaddrs = libc.freeifaddrs
+        freeifaddrs.argtypes = [ctypes.POINTER(_POSIX_IFADDRS)]
+        freeifaddrs.restype = None
+        if_nametoindex = libc.if_nametoindex
+        if_nametoindex.argtypes = [ctypes.c_char_p]
+        if_nametoindex.restype = ctypes.c_uint
+
+        head = ctypes.POINTER(_POSIX_IFADDRS)()
+        if getifaddrs(ctypes.byref(head)) == 0 and head:
+            try:
+                cur = head
+                guard = 0
+                while cur and guard < 4096:
+                    guard += 1
+                    entry = cur.contents
+                    if entry.ifa_name and entry.ifa_addr:
+                        sa = ctypes.cast(entry.ifa_addr, ctypes.POINTER(_SOCKADDR_IN))
+                        if sa.contents.sin_family == socket.AF_INET:
+                            idx = int(if_nametoindex(entry.ifa_name))
+                            if idx > 0:
+                                ip = ".".join(str(b) for b in sa.contents.sin_addr)
+                                mapping.setdefault(idx, [])
+                                if ip not in mapping[idx]:
+                                    mapping[idx].append(ip)
+                    cur = entry.ifa_next
+            finally:
+                freeifaddrs(head)
+            if mapping:
+                return mapping
+    except (OSError, AttributeError, ValueError):
+        pass
+
+    # Fallback: parse `ip -4 -o addr show`
+    try:
+        res = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3.0,
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                parts = line.split()
+                # Format: `2: eth0    inet 10.0.0.2/24 brd ...`
+                if len(parts) < 4 or parts[2] != "inet":
+                    continue
+                idx_str = parts[0].rstrip(":")
+                if not idx_str.isdigit():
+                    continue
+                idx = int(idx_str)
+                ip = parts[3].split("/", 1)[0]
+                mapping.setdefault(idx, [])
+                if ip not in mapping[idx]:
+                    mapping[idx].append(ip)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return mapping
+
+
 def _interface_addresses() -> dict[int, list[str]]:
-    """Map interface index → IPv4 addresses (Windows)."""
+    """Map interface index → IPv4 addresses."""
     mapping: dict[int, list[str]] = {}
     if not IS_WINDOWS:
-        return mapping
+        return _posix_interface_addresses()
     try:
         iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
     except OSError:
         return mapping
-
-    class _SOCKADDR_IN(ctypes.Structure):
-        _fields_ = [
-            ("sin_family", ctypes.c_ushort),
-            ("sin_port", ctypes.c_ushort),
-            ("sin_addr", ctypes.c_ubyte * 4),
-            ("sin_zero", ctypes.c_char * 8),
-        ]
-
-    class _SOCKET_ADDRESS(ctypes.Structure):
-        _fields_ = [("lpSockaddr", ctypes.c_void_p), ("iSockaddrLength", ctypes.c_int)]
-
-    class _IP_ADAPTER_ADDRESSES(ctypes.Structure):
-        pass
-
-    _IP_ADAPTER_ADDRESSES._fields_ = [
-        ("Length", ctypes.c_ulong),
-        ("IfIndex", ctypes.c_ulong),
-        ("Next", ctypes.POINTER(_IP_ADAPTER_ADDRESSES)),
-        ("AdapterName", ctypes.c_char_p),
-        ("FirstUnicastAddress", ctypes.c_void_p),
-        ("FirstAnycastAddress", ctypes.c_void_p),
-        ("FirstMulticastAddress", ctypes.c_void_p),
-        ("FirstDnsServerAddress", ctypes.c_void_p),
-        ("DnsSuffix", ctypes.c_wchar_p),
-        ("Description", ctypes.c_wchar_p),
-        ("FriendlyName", ctypes.c_wchar_p),
-        ("PhysicalAddress", ctypes.c_ubyte * 8),
-        ("PhysicalAddressLength", ctypes.c_ulong),
-        ("Flags", ctypes.c_ulong),
-        ("Mtu", ctypes.c_ulong),
-        ("IfType", ctypes.c_ulong),
-        ("OperStatus", ctypes.c_ulong),
-        ("Ipv6IfIndex", ctypes.c_ulong),
-        ("ZoneIndices", ctypes.c_ulong * 16),
-        ("FirstPrefix", ctypes.c_void_p),
-    ]
-
-    class _IP_ADAPTER_UNICAST_ADDRESS(ctypes.Structure):
-        pass
-
-    _IP_ADAPTER_UNICAST_ADDRESS._fields_ = [
-        ("Length", ctypes.c_ulong),
-        ("Flags", ctypes.c_ulong),
-        ("Next", ctypes.POINTER(_IP_ADAPTER_UNICAST_ADDRESS)),
-        ("Address", _SOCKET_ADDRESS),
-    ]
 
     # Set the prototype before calling.  Without argtypes ctypes guesses, and a
     # 64-bit pointer marshalled as a 32-bit int is silently truncated -- that is
@@ -500,8 +733,8 @@ def _interface_addresses() -> dict[int, list[str]]:
     ]
     get_addrs.restype = ctypes.c_ulong
 
-    ERROR_BUFFER_OVERFLOW = 111
-    flags = 0x0080  # GAA_FLAG_SKIP_ANYCAST | SKIP_MULTICAST | SKIP_DNS_SERVER
+    # GAA_FLAG_SKIP_ANYCAST (0x02) | SKIP_MULTICAST (0x04) | SKIP_DNS_SERVER (0x10)
+    flags = 0x0016
 
     # Ask for the size first, then allocate what it says.  The old code used a
     # fixed 16 KiB, which on this machine fits by exactly one byte (the API

@@ -14,11 +14,14 @@ from dataclasses import dataclass
 from .netiface import (
     InterfaceInfo,
     _interface_addresses,
+    get_interface_by_index,
     list_interfaces,
     pick_relevant_interface,
 )
 
 __all__ = ["TrafficMeter", "TrafficSnapshot"]
+
+_ORIG_LIST_INTERFACES = list_interfaces
 
 
 @dataclass(frozen=True)
@@ -71,6 +74,7 @@ class TrafficMeter:
         self._lock = threading.RLock()
         self._iface: InterfaceInfo | None = None
         self._last: tuple[int, int, float] | None = None
+        self._baseline: tuple[int, int, int] | None = None
         self._totals = [0, 0]
         self._snapshot = TrafficSnapshot(timestamp=time.time())
         self._server = server
@@ -84,6 +88,22 @@ class TrafficMeter:
         self.source_address = ""
 
     @property
+    def server(self) -> str:
+        return self._server
+
+    @server.setter
+    def server(self, value: str) -> None:
+        self._server = value
+
+    @property
+    def port(self) -> int:
+        return self._port
+
+    @port.setter
+    def port(self, value: int) -> None:
+        self._port = value
+
+    @property
     def snapshot(self) -> TrafficSnapshot:
         with self._lock:
             return self._snapshot
@@ -91,6 +111,7 @@ class TrafficMeter:
     def reset_totals(self) -> None:
         with self._lock:
             self._totals = [0, 0]
+            self._baseline = None
 
     def set_source_address(self, address: str) -> None:
         """Pin accounting to the interface that owns *address*."""
@@ -100,7 +121,83 @@ class TrafficMeter:
                 self.source_address = address
                 self._iface = None
                 self._last = None
+                self._baseline = None
                 self._misses = 0
+
+    def sync_baseline(
+        self,
+        *,
+        if_index: int = 0,
+        rx_base: int | None = None,
+        tx_base: int | None = None,
+        session_rx: int | None = None,
+        session_tx: int | None = None,
+    ) -> None:
+        """Align session totals to a resident core's OS NIC counter baseline.
+
+        When the GUI closes and later re-attaches to ``drcomd``, the daemon
+        already recorded the interface byte counters at login time.  Syncing to
+        that baseline immediately restores all bytes transferred while the UI
+        was closed without any polling inside ``drcomd``.
+        """
+        with self._lock:
+            now = time.time()
+            iface: InterfaceInfo | None = None
+            if if_index and if_index > 0:
+                if list_interfaces is _ORIG_LIST_INTERFACES:
+                    iface = get_interface_by_index(int(if_index))
+                else:
+                    for item in list_interfaces():
+                        if item.index == int(if_index):
+                            iface = item
+                            break
+                if iface is not None:
+                    self._iface = iface
+                    self._misses = 0
+
+            if (
+                if_index
+                and if_index > 0
+                and rx_base is not None
+                and tx_base is not None
+                and int(rx_base) >= 0
+                and int(tx_base) >= 0
+            ):
+                base_idx = int(if_index)
+                base_rx = int(rx_base)
+                base_tx = int(tx_base)
+                self._baseline = (base_idx, base_rx, base_tx)
+                if iface is not None and iface.bytes_in >= base_rx and iface.bytes_out >= base_tx:
+                    total_rx = iface.bytes_in - base_rx
+                    total_tx = iface.bytes_out - base_tx
+                    self._totals = [total_rx, total_tx]
+                    self._last = (iface.bytes_in, iface.bytes_out, now)
+                    self._snapshot = TrafficSnapshot(
+                        interface=iface.label,
+                        rx_bytes=iface.bytes_in,
+                        tx_bytes=iface.bytes_out,
+                        rx_rate=self._snapshot.rx_rate,
+                        tx_rate=self._snapshot.tx_rate,
+                        total_rx=total_rx,
+                        total_tx=total_tx,
+                        timestamp=now,
+                    )
+                    return
+
+            if session_rx is not None and session_tx is not None:
+                total_rx = max(0, int(session_rx))
+                total_tx = max(0, int(session_tx))
+                self._totals = [total_rx, total_tx]
+                self._snapshot = TrafficSnapshot(
+                    interface=iface.label if iface is not None else self._snapshot.interface,
+                    rx_bytes=iface.bytes_in if iface is not None else self._snapshot.rx_bytes,
+                    tx_bytes=iface.bytes_out if iface is not None else self._snapshot.tx_bytes,
+                    rx_rate=self._snapshot.rx_rate,
+                    tx_rate=self._snapshot.tx_rate,
+                    total_rx=total_rx,
+                    total_tx=total_tx,
+                    timestamp=now,
+                )
 
     def sample(self) -> TrafficSnapshot:
         """Take a reading and return the updated snapshot (thread-safe)."""
@@ -118,6 +215,8 @@ class TrafficMeter:
 
         rx, tx = iface.bytes_in, iface.bytes_out
         rx_rate = tx_rate = 0.0
+        delta_rx = delta_tx = 0
+        had_last = self._last is not None
         if self._last is not None:
             last_rx, last_tx, last_at = self._last
             elapsed = now - last_at
@@ -134,6 +233,18 @@ class TrafficMeter:
                     self.log.debug("网卡计数器回绕/重置，已重新同步")
             rx_rate = delta_rx / elapsed
             tx_rate = delta_tx / elapsed
+
+        used_baseline = False
+        if self._baseline is not None:
+            base_idx, base_rx, base_tx = self._baseline
+            if iface.index == base_idx:
+                if rx >= base_rx and tx >= base_tx:
+                    self._totals[0] = rx - base_rx
+                    self._totals[1] = tx - base_tx
+                    used_baseline = True
+                else:
+                    self._baseline = None
+        if not used_baseline and had_last:
             self._totals[0] += max(0, delta_rx)
             self._totals[1] += max(0, delta_tx)
 
@@ -160,11 +271,18 @@ class TrafficMeter:
         """
         if self._iface is not None:
             wanted_index = self._iface.index
-            for candidate in list_interfaces():
-                if candidate.index == wanted_index:
-                    self._iface = candidate
-                    self._misses = 0
-                    return candidate
+            candidate: InterfaceInfo | None = None
+            if list_interfaces is _ORIG_LIST_INTERFACES and wanted_index > 0:
+                candidate = get_interface_by_index(wanted_index)
+            else:
+                for item in list_interfaces():
+                    if item.index == wanted_index:
+                        candidate = item
+                        break
+            if candidate is not None:
+                self._iface = candidate
+                self._misses = 0
+                return candidate
             # A single missed lookup happens while an adapter renegotiates
             # (link up/down, DHCP renew).  Only give up on the cached adapter
             # once it stays missing across several consecutive samples.

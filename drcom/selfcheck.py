@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import ctypes
 import os
+import shutil
+import socket
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -159,17 +161,49 @@ def _run(cmd: list[str], timeout: float = 8.0) -> str:
         return ""
 
 
-def _default_routes() -> list[tuple[str, str, str]]:
-    """``(destination, interface address, metric)`` for every default route.
+def _default_routes_posix() -> list[tuple[str, str, str]]:
+    routes: list[tuple[str, str, str]] = []
+    if shutil.which("ip"):
+        out = _run(["ip", "-4", "route", "show", "default"])
+        for line in out.splitlines():
+            parts = line.split()
+            if not parts or parts[0] != "default":
+                continue
+            gw = ""
+            dev = ""
+            metric = "0"
+            for i, tok in enumerate(parts[:-1]):
+                if tok == "via":
+                    gw = parts[i + 1]
+                elif tok == "dev":
+                    dev = parts[i + 1]
+                elif tok == "metric":
+                    metric = parts[i + 1]
+            if dev or gw:
+                routes.append((dev or "?", gw or "direct", metric))
+        if routes:
+            return routes
 
-    More than one means the machine is multi-homed, and Windows sends the
-    packets wherever the *lowest metric* points -- which on a laptop with a
-    phone hotspot and a docked cable is frequently the hotspot.  That is not a
-    hypothetical: it is the exact shape of the "获取挑战码一直转圈" report that
-    started this module.
-    """
+    # Fallback: parse /proc/net/route
+    try:
+        with open("/proc/net/route", "r", encoding="utf-8") as f:
+            lines = f.readlines()[1:]
+        for line in lines:
+            cols = line.split()
+            if len(cols) >= 7 and cols[1] == "00000000":
+                gw_int = int(cols[2], 16)
+                gw = socket.inet_ntoa(gw_int.to_bytes(4, "little"))
+                metric = cols[6]
+                routes.append((cols[0], gw, metric))
+    except (OSError, ValueError):
+        pass
+    return routes
+
+
+def _default_routes() -> list[tuple[str, str, str]]:
+    """``(destination, interface address, metric)`` for every default route."""
     if not IS_WINDOWS:
-        return []
+        return _default_routes_posix()
     out = _run([
         "powershell", "-NoProfile", "-NonInteractive", "-Command",
         "Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | "
@@ -184,17 +218,25 @@ def _default_routes() -> list[tuple[str, str, str]]:
 
 
 def _firewall_state() -> dict[str, str]:
-    """Per-profile firewall state, empty when it cannot be read.
-
-    Read through PowerShell's object model rather than ``netsh`` text: the
-    profile names and the on/off words are localised, so parsing the console
-    output would need a table of translations and would still be wrong on the
-    next locale.  ``Get-NetFirewallProfile`` answers ``Domain/Private/Public``
-    with a boolean, which no translation can break.
-
-    A standard user gets nothing back, which is why the caller treats an empty
-    answer as "skip" rather than "off".
-    """
+    """Per-profile firewall state, empty when it cannot be read."""
+    if not IS_WINDOWS:
+        state: dict[str, str] = {}
+        if shutil.which("ufw"):
+            out = _run(["ufw", "status"])
+            for line in out.splitlines():
+                low = line.strip().lower()
+                if low.startswith("status:"):
+                    if "active" in low and "inactive" not in low:
+                        state["ufw"] = "ON"
+                    elif "inactive" in low:
+                        state["ufw"] = "OFF"
+        if not state and shutil.which("firewall-cmd"):
+            out = _run(["firewall-cmd", "--state"]).strip().lower()
+            if out == "running":
+                state["firewalld"] = "ON"
+            elif out:
+                state["firewalld"] = "OFF"
+        return state
     out = _run([
         "powershell", "-NoProfile", "-NonInteractive", "-Command",
         "Get-NetFirewallProfile -ErrorAction SilentlyContinue | "
@@ -246,11 +288,12 @@ def _check_account(report: Report, controller) -> None:
                          "在「账号」页补齐后重新登录；MAC 必须是本机网卡的物理地址。"))
     else:
         report.add(Check("account", "账号配置", OK, f"{masked}，密码与 MAC 已保存",
-                         "密码用 DPAPI 加密存放，日志里不会出现明文。"))
+                         "密码已加密存放，日志里不会出现明文。"))
 
 
 def _check_bind(report: Report, controller) -> None:
     from .binding import diagnose_bind_error, find_free_nearby, probe_bind
+    from .remote_engine import DEFAULT_API_PORT, daemon_status
 
     auth = controller.config.auth
     port = auth.bind_port
@@ -259,6 +302,16 @@ def _check_bind(report: Report, controller) -> None:
         report.add(Check("bind", "绑定端口", OK, f"UDP {port} 由本程序自己的会话占用",
                          "已在运行，跳过探测以免抢走保活回包。"))
         return
+
+    if getattr(auth, "native_core", False):
+        native_port = getattr(controller.engine, "api_port", None) or DEFAULT_API_PORT
+        st = daemon_status(native_port, timeout=0.3)
+        if isinstance(st, dict) and st.get("state") in (
+            "online", "binding", "challenging", "authenticating", "retry_wait"
+        ):
+            report.add(Check("bind", "绑定端口", OK, f"UDP {port} 由 drcomd 原生核心会话占用",
+                             "已在运行，跳过探测以免抢走保活回包。"))
+            return
 
     code = probe_bind(port, auth.bind_address)
     if code is None:
@@ -280,17 +333,24 @@ def _check_reserved(report: Report, controller) -> None:
     port = controller.config.auth.bind_port
     ranges = read_excluded_port_ranges()
     if not ranges:
+        if not IS_WINDOWS and Path("/proc/sys/net/ipv4/ip_local_reserved_ports").exists():
+            report.add(Check("reserved", "系统保留端口", OK,
+                             "未设置内核保留端口区间，61440 可正常使用", ""))
+            return
         report.add(Check("reserved", "系统保留端口", SKIP,
-                         "读不到系统的保留端口区间（需要管理员权限读取 HKLM）",
-                         "以管理员身份运行可补上这一项。"))
+                         "读不到系统的保留端口区间" + ("（需要管理员权限读取 HKLM）" if IS_WINDOWS else ""),
+                         "以管理员身份运行可补上这一项。" if IS_WINDOWS else ""))
         return
     covering = [r for r in ranges if r[0] <= port <= r[1]]
     if covering:
+        hint = (
+            f"用管理员 PowerShell 执行：\nnetsh int ipv4 set dynamicport udp start={port} num=1\n"
+            if IS_WINDOWS
+            else "检查 `/proc/sys/net/ipv4/ip_local_reserved_ports` 并用 `sysctl` 移除对应端口区间，\n"
+        )
         report.add(Check("reserved", "系统保留端口", FAIL,
                          f"UDP {port} 落在系统保留区间 {covering[0][0]}-{covering[0][1]}",
-                         "用管理员 PowerShell 执行：\n"
-                         f"netsh int ipv4 set dynamicport udp start={port} num=1\n"
-                         "或把「设置」里的绑定端口换到保留区间之外。"))
+                         hint + "或把「设置」里的绑定端口换到保留区间之外。"))
         return
     report.add(Check("reserved", "系统保留端口", OK,
                      f"UDP {port} 不在保留区间内（共 {len(ranges)} 段）", ""))
@@ -359,10 +419,12 @@ def _check_server(report: Report, controller) -> None:
 
 
 def _check_core(report: Report, controller) -> None:
-    from .remote_engine import daemon_is_up
+    from .remote_engine import DEFAULT_API_PORT, daemon_is_up
 
     engine = controller.engine
     native = getattr(engine, "api_port", None)
+    if native is None and getattr(controller, "_doctor_mode", False) and getattr(controller.config.auth, "native_core", False):
+        native = DEFAULT_API_PORT
     if native is None:
         report.add(Check("core", "原生核心", OK, "当前使用内置引擎，无需外部核心", ""))
         return
@@ -378,6 +440,25 @@ def _check_core(report: Report, controller) -> None:
 def _check_autostart(report: Report, controller) -> None:
     from . import autostart as task_autostart
     from .single_instance import is_autostart_enabled
+
+    if not IS_WINDOWS:
+        has_systemd = task_autostart.systemd_service_exists()
+        has_desktop = is_autostart_enabled()
+        cmd = task_autostart.systemd_service_command() if has_systemd else ""
+        report.context["自启方式"] = cmd or ("XDG autostart" if has_desktop else "（未注册）")
+        if has_systemd and has_desktop:
+            report.add(Check("autostart", "开机自启", WARN,
+                             "systemd 用户服务与 XDG autostart 同时存在",
+                             "在「设置」页关掉再打开一次开机自启，程序会保留其中一项并清理重复项。"))
+            return
+        if has_systemd:
+            report.add(Check("autostart", "开机自启", OK, "已启用 systemd --user 自启服务", cmd))
+            return
+        if has_desktop:
+            report.add(Check("autostart", "开机自启", OK, "已启用桌面 XDG autostart (.desktop)", ""))
+            return
+        report.add(Check("autostart", "开机自启", SKIP, "没有设置开机自启", "需要时在「设置」页打开。"))
+        return
 
     has_task = task_autostart.task_exists()
     has_run = is_autostart_enabled()

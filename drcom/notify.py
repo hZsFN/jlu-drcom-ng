@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -105,7 +106,15 @@ class Notifier:
 
     def _toast(self, event: NotificationEvent) -> None:
         if not IS_WINDOWS:
-            self.log.debug(f"[通知] {event.title} — {event.body}")
+            notify_bin = shutil.which("notify-send")
+            if notify_bin:
+                subprocess.run(
+                    [notify_bin, "-a", "JLU DrCOM NG", event.title, event.body],
+                    capture_output=True,
+                    timeout=8,
+                )
+            else:
+                self.log.debug(f"[通知] {event.title} — {event.body}")
             return
         xml = (
             "<toast><visual><binding template='ToastGeneric'>"

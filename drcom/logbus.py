@@ -159,6 +159,7 @@ class LogBus:
         keep_days: int = 14,
         max_file_mb: float = 8.0,
         buffer_size: int = 2000,
+        file_logging: bool = True,
     ) -> None:
         self.log_dir = Path(log_dir)
         self.mask_accounts = mask_accounts
@@ -172,33 +173,54 @@ class LogBus:
         self._seq = 0
         self.logger = logging.getLogger("drcom")
         self.file_path: Path | None = None
-        self._configure(level=level, keep_days=keep_days, max_file_mb=max_file_mb)
+        self._configure(
+            level=level,
+            keep_days=keep_days,
+            max_file_mb=max_file_mb,
+            file_logging=file_logging,
+        )
 
     # -- setup ---------------------------------------------------------
-    def _configure(self, *, level: str, keep_days: int, max_file_mb: float) -> None:
+    def _configure(
+        self,
+        *,
+        level: str,
+        keep_days: int,
+        max_file_mb: float,
+        file_logging: bool = True,
+    ) -> None:
+        for existing in list(self.logger.handlers):
+            try:
+                existing.close()
+            except Exception:
+                pass
         self.logger.handlers.clear()
         self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = False
 
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        self.file_path = self.log_dir / f"drcom-{stamp}.log"
+        if file_logging:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            self.file_path = self.log_dir / f"drcom-{stamp}.log"
 
-        file_handler = logging.handlers.RotatingFileHandler(
-            self.file_path,
-            maxBytes=int(max_file_mb * 1024 * 1024),
-            backupCount=5,
-            encoding="utf-8",
-        )
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(
-            _MaskedFormatter(
-                "%(asctime)s %(levelname)-7s %(message)s",
-                "%Y-%m-%d %H:%M:%S",
-                mask_accounts=self.mask_accounts,
+            file_handler = logging.handlers.RotatingFileHandler(
+                self.file_path,
+                maxBytes=int(max_file_mb * 1024 * 1024),
+                backupCount=5,
+                encoding="utf-8",
             )
-        )
-        self.logger.addHandler(file_handler)
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(
+                _MaskedFormatter(
+                    "%(asctime)s %(levelname)-7s %(message)s",
+                    "%Y-%m-%d %H:%M:%S",
+                    mask_accounts=self.mask_accounts,
+                )
+            )
+            self.logger.addHandler(file_handler)
+            self._prune_old_logs(keep_days)
+        else:
+            self.file_path = None
 
         console = logging.StreamHandler(sys.stderr)
         console.setLevel(getattr(logging, level.upper(), logging.INFO))
@@ -206,7 +228,6 @@ class LogBus:
         self.logger.addHandler(console)
 
         self.logger.addHandler(_RingHandler(self))
-        self._prune_old_logs(keep_days)
 
     def _prune_old_logs(self, keep_days: int) -> None:
         if keep_days <= 0:
@@ -235,6 +256,25 @@ class LogBus:
         with self._lock:
             if listener in self._listeners:
                 self._listeners.remove(listener)
+
+    def set_level(self, level: str) -> None:
+        lvl = getattr(logging, (level or "INFO").upper(), logging.INFO)
+        for handler in list(self.logger.handlers):
+            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                handler.setLevel(lvl)
+
+    def close(self) -> None:
+        """Close open file handlers cleanly without dropping the in-memory ring buffer."""
+        for handler in list(self.logger.handlers):
+            if isinstance(handler, logging.FileHandler):
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+                try:
+                    self.logger.removeHandler(handler)
+                except Exception:
+                    pass
 
     def snapshot(self) -> list[LogRecordView]:
         with self._lock:

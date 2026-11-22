@@ -101,6 +101,7 @@ class StatsStore:
         self._last_checkpoint = 0.0
         self._ip = ""
         self._account = ""
+        self._native_session: dict | None = None
         self.load()
 
     # -- persistence -----------------------------------------------------
@@ -118,6 +119,8 @@ class StatsStore:
                 if isinstance(value, dict)
             }
             self.totals = Totals.from_dict(raw.get("totals") or {})
+            ns = raw.get("native_session")
+            self._native_session = dict(ns) if isinstance(ns, dict) else None
 
     def save(self) -> None:
         with self._lock:
@@ -126,6 +129,8 @@ class StatsStore:
                 "daily": {k: v.as_dict() for k, v in self.daily.items()},
                 "totals": self.totals.as_dict(),
             }
+            if self._native_session is not None:
+                payload["native_session"] = dict(self._native_session)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
         try:
@@ -141,6 +146,7 @@ class StatsStore:
             self._last_checkpoint = self._session_start
             self._ip = ip
             self._account = account
+            self._native_session = None
             day = self.daily.setdefault(_today(), DayStats())
             day.sessions += 1
             if day.first_online_at is None:
@@ -149,21 +155,91 @@ class StatsStore:
             self.totals.last_online_at = self._session_start
         self.save()
 
+    def sync_native_session(
+        self,
+        *,
+        session_id: int,
+        online_since: float,
+        ip: str,
+        account: str,
+    ) -> bool:
+        """Attach to or record a resident ``drcomd`` session without double-counting.
+
+        Returns ``True`` when a new session was recorded and ``False`` when
+        re-attaching to the same ongoing native session (folding in any time
+        that elapsed while the UI process was closed).
+        """
+        with self._lock:
+            now = time.time()
+            start = min(float(online_since), now) if online_since and online_since > 0 else now
+            self._ip = ip
+            self._account = account
+            day = self.daily.setdefault(_today(), DayStats())
+
+            saved = self._native_session
+            same_session = (
+                isinstance(saved, dict)
+                and int(saved.get("id") or 0) == int(session_id)
+                and abs(float(saved.get("online_since") or 0.0) - start) < 5.0
+            )
+            if same_session:
+                flushed = float(saved.get("flushed_at") or start)
+                gap = max(0.0, now - max(flushed, start))
+                duration = max(0.0, now - start)
+                day.online_seconds += gap
+                day.longest_session = max(day.longest_session, duration)
+                self.totals.online_seconds += gap
+                self.totals.longest_session = max(self.totals.longest_session, duration)
+                self._session_start = start
+                self._last_checkpoint = now
+                self._native_session = {
+                    "id": int(session_id),
+                    "online_since": start,
+                    "flushed_at": now,
+                }
+                opened_new = False
+            else:
+                already = max(0.0, now - start)
+                day.sessions += 1
+                if day.first_online_at is None:
+                    day.first_online_at = start
+                day.online_seconds += already
+                day.longest_session = max(day.longest_session, already)
+                self.totals.sessions += 1
+                self.totals.last_online_at = start
+                self.totals.online_seconds += already
+                self.totals.longest_session = max(self.totals.longest_session, already)
+                self._session_start = start
+                self._last_checkpoint = now
+                self._native_session = {
+                    "id": int(session_id),
+                    "online_since": start,
+                    "flushed_at": now,
+                }
+                opened_new = True
+        self.save()
+        return opened_new
+
     def close_session(self, *, drop: bool = True) -> float:
         """Finish the current session; returns its duration in seconds."""
         with self._lock:
             if self._session_start is None:
+                self._native_session = None
                 return 0.0
-            duration = max(0.0, time.time() - self._session_start)
+            now = time.time()
+            duration = max(0.0, now - self._session_start)
+            unflushed = max(0.0, now - (self._last_checkpoint or self._session_start))
             day = self.daily.setdefault(_today(), DayStats())
-            day.online_seconds += duration
+            day.online_seconds += unflushed
             day.longest_session = max(day.longest_session, duration)
-            self.totals.online_seconds += duration
+            self.totals.online_seconds += unflushed
             self.totals.longest_session = max(self.totals.longest_session, duration)
             if drop:
                 day.drops += 1
                 self.totals.drops += 1
             self._session_start = None
+            self._last_checkpoint = 0.0
+            self._native_session = None
         self.save()
         return duration
 
@@ -188,6 +264,8 @@ class StatsStore:
             day.longest_session = max(day.longest_session, now - self._session_start)
             self.totals.online_seconds += elapsed
             self.totals.longest_session = max(self.totals.longest_session, now - self._session_start)
+            if self._native_session is not None:
+                self._native_session["flushed_at"] = now
         self.save()
 
     def add_traffic(self, rx: int, tx: int) -> None:
@@ -204,7 +282,16 @@ class StatsStore:
         with self._lock:
             if self._session_start is None:
                 return 0.0
-            return time.time() - self._session_start
+            return max(0.0, time.time() - self._session_start)
+
+    @property
+    def unflushed_session_seconds(self) -> float:
+        """Elapsed online time not yet folded into ``daily`` / ``totals`` by checkpoint."""
+        with self._lock:
+            if self._session_start is None:
+                return 0.0
+            anchor = self._last_checkpoint or self._session_start
+            return max(0.0, time.time() - anchor)
 
     def today(self) -> DayStats:
         with self._lock:
@@ -234,17 +321,19 @@ class StatsStore:
             self.save()
 
     def as_status(self) -> dict:
-        today = self.today()
-        return {
-            "today_seconds": round(today.online_seconds + (self.session_seconds if self._session_start else 0.0), 1),
-            "today_drops": today.drops,
-            "today_sessions": today.sessions,
-            "today_login_failures": today.login_failures,
-            "week_seconds": round(self.week_seconds(), 1),
-            "total_seconds": round(self.totals.online_seconds + (self.session_seconds if self._session_start else 0.0), 1),
-            "total_drops": self.totals.drops,
-            "total_sessions": self.totals.sessions,
-            "longest_session": round(self.totals.longest_session, 1),
-            "bytes_rx": self.totals.bytes_rx,
-            "bytes_tx": self.totals.bytes_tx,
-        }
+        with self._lock:
+            today = self.daily.setdefault(_today(), DayStats())
+            unflushed = self.unflushed_session_seconds
+            return {
+                "today_seconds": round(today.online_seconds + unflushed, 1),
+                "today_drops": today.drops,
+                "today_sessions": today.sessions,
+                "today_login_failures": today.login_failures,
+                "week_seconds": round(self.week_seconds() + unflushed, 1),
+                "total_seconds": round(self.totals.online_seconds + unflushed, 1),
+                "total_drops": self.totals.drops,
+                "total_sessions": self.totals.sessions,
+                "longest_session": round(self.totals.longest_session, 1),
+                "bytes_rx": self.totals.bytes_rx,
+                "bytes_tx": self.totals.bytes_tx,
+            }

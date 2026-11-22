@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import sys
 import threading
 import time
 from pathlib import Path
@@ -83,8 +84,8 @@ class DrcomApp:
 
         self.page: ft.Page | None = None
         self.hud = self._make_hud()
-        self.events: "queue.Queue[ControllerEvent]" = queue.Queue()
-        self.log_queue: "queue.Queue[LogRecordView]" = queue.Queue()
+        self.events: "queue.Queue[ControllerEvent]" = queue.Queue(maxsize=256)
+        self.log_queue: "queue.Queue[LogRecordView]" = queue.Queue(maxsize=1024)
 
         #: Set by the tray thread when the user asks for the window back after
         #: it was released.  A plain Event rather than the UI queue: with no
@@ -107,6 +108,9 @@ class DrcomApp:
         self._selfcheck_running = False
         self._last_tooltip = ""
         self._last_status_snapshot = ""
+        self._last_dashboard_key: tuple | None = None
+        self._ui_dirty = True
+        self._sweep_task = None
 
         # Exponential moving averages for the instrument feeds.  Raw readings
         # are far too jittery to point an instrument at: a needle that twitches
@@ -116,6 +120,8 @@ class DrcomApp:
         # Signature of the last painted frame, so an unchanged HUD is not
         # rebuilt (rebuilding 280 shapes every second also caused visible churn).
         self._hud_signature: tuple | None = None
+        self._hud_painter: HudPainter | None = None
+        self._hud_painter_key: tuple | None = None
         #: Real client-area size, as reported by ``page.on_resize``.  This is
         #: the only trustworthy source: ``page.window.width`` echoes back the
         #: value we assigned, which is how the canvas ended up wider than its
@@ -146,6 +152,21 @@ class DrcomApp:
         self.instrument_canvas: cv.Canvas | None = None
         self.canvas_host: ft.Container | None = None
         self.sweep_band: ft.Container | None = None
+        self.update_banner: ft.Container | None = None
+        self.update_banner_text: ft.Text | None = None
+        self.update_status_text: ft.Text | None = None
+
+    @staticmethod
+    def _enqueue_bounded(q: queue.Queue, item) -> None:
+        while True:
+            try:
+                q.put_nowait(item)
+                return
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    return
 
     # ------------------------------------------------------------------
     # token / style helpers
@@ -316,7 +337,7 @@ class DrcomApp:
 
         # Seed the log panel with whatever is already buffered.
         for record in self.controller.log.snapshot()[-200:]:
-            self.log_queue.put(record)
+            self._enqueue_bounded(self.log_queue, record)
 
         try:
             page.on_resize = lambda event: page.run_task(self._on_page_resize, event)
@@ -326,7 +347,8 @@ class DrcomApp:
         page.run_task(self._ui_tick)
         page.run_task(self._clock_tick)
         if self.hud.scanline_animation:
-            page.run_task(self._sweep_tick)
+            self._sweep_task = page.run_task(self._sweep_tick)
+        self._sync_update_banner()
 
         if self.enable_tray:
             self._setup_tray()
@@ -355,13 +377,62 @@ class DrcomApp:
     # ------------------------------------------------------------------
     # shell
     # ------------------------------------------------------------------
+    def _build_update_banner(self) -> ft.Container:
+        self.update_banner_text = self._text(
+            "", color=self.palette.cyan, size=self.hud.size_body, mono=True, expand=True
+        )
+        self.update_banner = ft.Container(
+            content=ft.Row(
+                [
+                    ft.Icon(ft.Icons.SYSTEM_UPDATE_ALT, color=self.palette.cyan, size=18),
+                    self.update_banner_text,
+                    self._button(
+                        "查看更新",
+                        lambda e: self._open_available_update(),
+                        primary=True,
+                        accent=self.palette.cyan,
+                    ),
+                    self._button(
+                        "跳过此版本",
+                        lambda e: self._skip_available_update(),
+                        accent=self.palette.text_muted,
+                    ),
+                ],
+                spacing=10,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            bgcolor=self.palette.panel_alt,
+            border=ft.Border.all(1, self.palette.cyan),
+            border_radius=self.hud.radius,
+            padding=ft.Padding.symmetric(horizontal=12, vertical=8),
+            margin=ft.Margin.only(left=self.hud.pad, right=self.hud.pad, bottom=6),
+            visible=False,
+        )
+        return self.update_banner
+
+    def _sync_update_banner(self) -> None:
+        banner = getattr(self, "update_banner", None)
+        label = getattr(self, "update_banner_text", None)
+        if banner is None or label is None:
+            return
+        info = getattr(self.controller, "available_update", None)
+        if info is None or info.version == self.controller.config.update.skipped_version:
+            banner.visible = False
+            label.value = ""
+        else:
+            label.value = f"发现新版本 v{info.version}（当前 v{self.controller.version}）"
+            banner.visible = True
+        self._ui_dirty = True
+
     def _build_shell(self) -> ft.Control:
+        self.view_host = None
         return ft.Column(
             [
                 self._build_header(),
                 self._build_nav(),
+                self._build_update_banner(),
                 ft.Container(
-                    content=self._build_view(VIEWS[0]),
+                    content=self._build_view(self.active_view),
                     expand=True,
                     padding=ft.Padding.only(left=self.hud.pad, right=self.hud.pad, bottom=self.hud.pad),
                 ),
@@ -458,12 +529,17 @@ class DrcomApp:
                 text.style.color = self.palette.cyan if active else self.palette.text_muted
                 text.style.shadow = self._glow(self.palette.cyan, 6) if (active and self.hud.glow) else None
 
-    def _switch_view(self, name: str) -> None:
-        if name == self.active_view or self.view_host is None:
+    def _switch_view(self, name: str, *, force: bool = False) -> None:
+        if (not force and name == self.active_view) or self.view_host is None:
             return
         self.active_view = name
         self._paint_nav()
         self.view_host.content = self._build_view(name)
+        if name == "状态":
+            self._hud_signature = None
+            self._last_dashboard_key = None
+            self._refresh_dashboard()
+        self._ui_dirty = True
         self._safe_update()
 
     def _build_view(self, name: str) -> ft.Control:
@@ -662,8 +738,9 @@ class DrcomApp:
     # view: 日志
     # ------------------------------------------------------------------
     def _view_logs(self) -> ft.Control:
+        self._log_rows = [self._log_row(r) for r in self.controller.log.snapshot()[-400:]]
         self.log_list = ft.ListView(
-            controls=list(self._log_rows[-400:]),
+            controls=list(self._log_rows),
             spacing=1,
             padding=8,
             auto_scroll=True,
@@ -805,8 +882,7 @@ class DrcomApp:
             target = controller.config.active_account()
             if target is None:
                 target = Account()
-                controller.add_account(target, make_active=True)
-                controller.config.active_account_id = target.id
+                controller.store.add_account(target, make_active=True)
             target.account = (account_field.value or "").strip()
             target.mac = (mac_field.value or "").strip().upper()
             target.label = (label_field.value or "").strip()
@@ -829,10 +905,15 @@ class DrcomApp:
                 _ok, message = controller.save_password(password_field.value)
                 notes.append(message)
                 password_field.value = ""
-            controller.store.save()
-            notes.append("配置已保存")
+            if controller.engine and controller.engine.is_running:
+                ok_apply, apply_msg = controller.apply_auth_settings(reconnect_if_needed=True)
+                notes.append(apply_msg if ok_apply else f"配置已保存，但热更新失败：{apply_msg}")
+            else:
+                controller.store.save()
+                notes.append("配置已保存")
             self._flash("；".join(notes), True)
             self._refresh_credentials_note()
+            self._switch_view("账号", force=True)
 
         def test_bind(_event) -> None:
             self._on_diagnose(None)
@@ -845,8 +926,8 @@ class DrcomApp:
                     ft.Column(
                         [
                             self._text(
-                                "凭据保存在本机配置中，密码使用 Windows DPAPI 加密"
-                                "（绑定当前 Windows 账号），配置文件里看不到明文。",
+                                "凭据保存在本机配置中，密码在 Windows 使用 DPAPI、在 Linux/macOS 使用 Fernet 加密，"
+                                "配置文件里看不到明文。",
                                 color=self.palette.text_dim,
                                 size=self.hud.size_body,
                             ),
@@ -920,9 +1001,9 @@ class DrcomApp:
             from ..config import Account
 
             new = Account(label=f"账号 {len(controller.config.accounts) + 1}")
-            controller.add_account(new, make_active=True)
+            controller.store.add_account(new, make_active=True)
             controller.store.save()
-            self._switch_view("账号")
+            self._switch_view("账号", force=True)
             self._flash("已新增账号，请填写信息", True)
 
         return self._panel(
@@ -968,9 +1049,14 @@ class DrcomApp:
 
     def _activate_account(self, account) -> None:
         self.controller.config.active_account_id = account.id
-        self.controller.store.save()
-        self._switch_view("账号")
-        self._flash(f"已切换到 {account.display_name}", True)
+        if self.controller.engine and self.controller.engine.is_running:
+            ok, msg = self.controller.apply_auth_settings(reconnect_if_needed=True)
+            self._switch_view("账号", force=True)
+            self._flash(f"已切换到 {account.display_name}（{msg}）", ok)
+        else:
+            self.controller.store.save()
+            self._switch_view("账号", force=True)
+            self._flash(f"已切换到 {account.display_name}", True)
 
     def _delete_account(self, account) -> None:
         if len(self.controller.config.accounts) <= 1:
@@ -983,7 +1069,7 @@ class DrcomApp:
             self.controller.config.active_account_id = self.controller.config.accounts[0].id
         self.controller.store.clear_password_cache()
         self.controller.store.save()
-        self._switch_view("账号")
+        self._switch_view("账号", force=True)
         self._flash(f"已删除 {account.display_name}", True)
 
     # ------------------------------------------------------------------
@@ -1007,12 +1093,24 @@ class DrcomApp:
             controller.store.save()
 
         # --- reconnect ---------------------------------------------------
-        reconnect_enabled = make_switch("掉线后自动重连", cfg.reconnect.enabled, on_change=lambda e: (
-            setattr(cfg.reconnect, "enabled", e.control.value), persist()))
+        reconnect_enabled = make_switch(
+            "掉线后自动重连",
+            cfg.reconnect.enabled,
+            on_change=lambda e: (
+                setattr(cfg.reconnect, "enabled", e.control.value),
+                controller.apply_reconnect_settings(),
+            ),
+        )
         min_delay = self._field("最小重试间隔（秒）", str(cfg.reconnect.min_delay))
         max_delay = self._field("最大重试间隔（秒）", str(cfg.reconnect.max_delay))
-        quiet_enabled = make_switch("启用夜间静默（重连间隔放宽）", cfg.reconnect.quiet_hours_enabled,
-                                    on_change=lambda e: (setattr(cfg.reconnect, "quiet_hours_enabled", e.control.value), persist()))
+        quiet_enabled = make_switch(
+            "启用夜间静默（重连间隔放宽）",
+            cfg.reconnect.quiet_hours_enabled,
+            on_change=lambda e: (
+                setattr(cfg.reconnect, "quiet_hours_enabled", e.control.value),
+                controller.apply_reconnect_settings(),
+            ),
+        )
         quiet_start = self._field("静默开始（HH:MM）", cfg.reconnect.quiet_hours_start)
         quiet_end = self._field("静默结束（HH:MM）", cfg.reconnect.quiet_hours_end)
 
@@ -1025,8 +1123,8 @@ class DrcomApp:
                 return
             cfg.reconnect.quiet_hours_start = quiet_start.value or "01:00"
             cfg.reconnect.quiet_hours_end = quiet_end.value or "06:00"
-            persist()
-            self._flash("重连策略已保存", True)
+            ok, msg = controller.apply_reconnect_settings()
+            self._flash(msg, ok)
 
         # --- startup ------------------------------------------------------
         autostart = make_switch(
@@ -1074,7 +1172,7 @@ class DrcomApp:
         # With the native core this switch has nothing left to control -- the
         # window process always exits on close -- so it is shown as locked
         # rather than removed, which would look like a missing feature.
-        native_tray = self._native_core_active()
+        native_tray = self._native_tray_active()
         release_ui = make_switch(
             "关闭窗口时释放界面内存（原生核心模式下界面进程整体退出）"
             if native_tray
@@ -1139,16 +1237,24 @@ class DrcomApp:
 
         def save_api(_event) -> None:
             try:
-                cfg.api.port = int(api_port.value or 8848)
+                port = int(api_port.value or 8848)
+                if not (1 <= port <= 65535):
+                    raise ValueError
+                cfg.api.port = port
             except ValueError:
-                self._flash("端口必须是数字", False)
+                self._flash("端口必须是 1–65535 的数字", False)
                 return
-            persist()
-            self._flash("接口设置已保存（启用状态需重启生效或使用上方开关）", True)
+            ok, msg = controller.apply_api_settings()
+            self._flash(msg, ok)
 
         # --- probe / traffic --------------------------------------------------
+        def toggle_probe(value: bool) -> None:
+            cfg.probe.enabled = bool(value)
+            ok, msg = controller.apply_probe_settings()
+            self._flash(msg, ok)
+
         probe_enabled = make_switch("启用网络质量探测（延迟 / 丢包）", cfg.probe.enabled,
-                                    on_change=lambda e: (setattr(cfg.probe, "enabled", e.control.value), persist()))
+                                    on_change=lambda e: toggle_probe(e.control.value))
         probe_targets = self._field("探测目标（逗号分隔）", ", ".join(cfg.probe.targets))
         traffic_enabled = make_switch("启用流量统计", cfg.traffic.enabled,
                                       on_change=lambda e: (setattr(cfg.traffic, "enabled", e.control.value), persist()))
@@ -1156,28 +1262,34 @@ class DrcomApp:
         def save_probe(_event) -> None:
             targets = [t.strip() for t in (probe_targets.value or "").split(",") if t.strip()]
             cfg.probe.targets = targets or list(DEFAULT_PROBE_TARGETS)
-            persist()
-            self._flash("探测设置已保存", True)
+            ok, msg = controller.apply_probe_settings()
+            self._flash(msg, ok)
 
         # --- advanced protocol ---------------------------------------------
-        # 原生核心是 2.0 的新默认。它第一次在真实校园网上跑的时候，谁也不敢保证
-        # 和 Python 引擎逐字节等价，所以这里必须留一个能立刻退回去的开关 ——
-        # 断网的时候人是没法翻配置文件改的。
         from ..remote_engine import daemon_path
 
+        core_bin = "drcomd.exe" if sys.platform == "win32" else "drcomd"
         native_present = daemon_path() is not None
+
+        def toggle_native_core(value: bool) -> None:
+            cfg.auth.native_core = bool(value)
+            ok, msg = controller.apply_auth_settings(
+                reconnect_if_needed=bool(controller.engine and controller.engine.is_running)
+            )
+            self._sync_close_action_control()
+            self._flash(msg, ok)
+
         native_core = make_switch(
-            "使用原生认证核心（drcomd.exe，常驻约 1 MB）",
+            f"使用原生认证核心（{core_bin}，常驻约 1 MB）",
             cfg.auth.native_core,
-            on_change=lambda e: (setattr(cfg.auth, "native_core", e.control.value), persist()),
+            on_change=lambda e: toggle_native_core(e.control.value),
             disabled=not native_present,
         )
         native_note = self._text(
-            ("开着：认证跑在独立的 drcomd.exe 里，关掉窗口它也继续工作；重新打开窗口会接回"
-             "原来那个会话，不会重新登录。关掉：认证和界面在同一个进程里，关掉窗口就一起退出。"
-             "改完下次点「登录」时生效。")
+            (f"开着：认证跑在独立的 {core_bin} 里，重新打开窗口会无缝接回原会话，不中断在线；"
+             "切换或修改协议参数后立即热更新生效。")
             if native_present else
-            "找不到 drcomd.exe，只能用内置的 Python 认证核心（功能一样，只是常驻内存高一些）。",
+            f"找不到 {core_bin}，只能用内置的 Python 认证核心（功能一样，只是常驻内存高一些）。",
             color=self.palette.text_dim,
             size=self.hud.size_micro,
         )
@@ -1185,7 +1297,10 @@ class DrcomApp:
         alt_port = make_switch(
             "允许备选源端口自愈（61440 被占用时改用邻近端口）",
             cfg.auth.allow_alternate_port,
-            on_change=lambda e: (setattr(cfg.auth, "allow_alternate_port", e.control.value), persist()),
+            on_change=lambda e: (
+                setattr(cfg.auth, "allow_alternate_port", e.control.value),
+                controller.apply_auth_settings(reconnect_if_needed=False),
+            ),
         )
         server_field = self._field("认证服务器", cfg.auth.server)
         port_field = self._field("认证端口", str(cfg.auth.port))
@@ -1207,7 +1322,10 @@ class DrcomApp:
         iface_fallback = make_switch(
             "收不到回应时改用本机各网卡地址重试（多网卡/VPN 抢路由时才需要）",
             cfg.auth.auto_interface_fallback,
-            on_change=lambda e: (setattr(cfg.auth, "auto_interface_fallback", e.control.value), persist()),
+            on_change=lambda e: (
+                setattr(cfg.auth, "auto_interface_fallback", e.control.value),
+                controller.apply_auth_settings(reconnect_if_needed=False),
+            ),
         )
 
         def detect_bindable(_event) -> None:
@@ -1233,8 +1351,31 @@ class DrcomApp:
             except ValueError:
                 self._flash("端口/超时必须为数字", False)
                 return
+            ok, msg = controller.apply_auth_settings(
+                reconnect_if_needed=bool(controller.engine and controller.engine.is_running)
+            )
+            self._flash(msg, ok)
+
+        # --- auto-update ---------------------------------------------------
+        update_auto = make_switch(
+            "联网后自动检查更新（GitHub Releases，仅在校园网认证上线后请求）",
+            cfg.update.auto_check,
+            on_change=lambda e: (setattr(cfg.update, "auto_check", e.control.value), persist()),
+        )
+        update_mirror = self._field(
+            "下载加速镜像前缀（可选，仅限 https://，留空直连 GitHub）",
+            cfg.update.mirror_prefix,
+            hint="例如 https://ghproxy.net",
+        )
+
+        def save_update(_event) -> None:
+            prefix = (update_mirror.value or "").strip()
+            if prefix and not prefix.lower().startswith("https://"):
+                self._flash("镜像前缀必须以 https:// 开头", False)
+                return
+            cfg.update.mirror_prefix = prefix
             persist()
-            self._flash("协议参数已保存，重连后生效", True)
+            self._flash("自动更新设置已保存", True)
 
         return ft.Column(
             [
@@ -1268,6 +1409,17 @@ class DrcomApp:
                 self._panel(ft.Column([probe_enabled, probe_targets, traffic_enabled,
                                        self._button("保存探测设置", save_probe, accent=self.palette.cyan)],
                                       spacing=self.hud.gap), title="探测与流量"),
+                self._panel(
+                    ft.Column(
+                        [
+                            update_auto,
+                            update_mirror,
+                            self._button("保存更新设置", save_update, accent=self.palette.cyan),
+                        ],
+                        spacing=self.hud.gap,
+                    ),
+                    title="自动更新",
+                ),
                 self._panel(ft.Column([server_field, ft.Row([port_field, timeout_field, keepalive_field], spacing=10),
                                        bind_field,
                                        bind_note,
@@ -1329,12 +1481,21 @@ class DrcomApp:
             "报文构造已与可用实现的真实抓包逐字节比对一致。",
             "注销说明：本变体的 Dr.COM 没有客户端注销报文，「注销」等于停止保活并关闭套接字，"
             "服务端在超时后释放会话。",
-            "密码使用 Windows DPAPI 加密后以 Base64 存储；DPAPI 不可用时改用 Fernet，"
-            "再不可用则降级为可逆混淆并在界面明确告警。",
+            "密码在 Windows 使用 DPAPI（绑定当前系统账号）加密、在 Linux/macOS 使用 Fernet 加密后以 Base64 存储；"
+            "两者均不可用时才降级为可逆混淆并在界面明确告警。",
             "账号写入日志前会脱敏，密码任何时候都不写日志。",
             "本程序以 AGPL-3.0 分发：原版客户端实现按 GPL-3.0 发布，依 GPLv3 第 13 条与 "
             "AGPLv3 的组合条款，整体改用 AGPL-3.0；用它对外提供网络服务时，修改后的源码同样要公开。",
         ]
+
+        self.update_status_text = self._text(
+            f"发现新版本 v{controller.available_update.version}"
+            if controller.available_update
+            else "点击「检查更新」向 GitHub Releases 查询最新版本。",
+            color=self.palette.cyan if controller.available_update else self.palette.text_muted,
+            size=self.hud.size_micro,
+            mono=True,
+        )
 
         return ft.Column(
             [
@@ -1346,6 +1507,8 @@ class DrcomApp:
                 ),
                 ft.Row(
                     [
+                        self._button("检查更新", self._on_check_updates, accent=self.palette.cyan,
+                                     icon=ft.Icons.SYSTEM_UPDATE_ALT),
                         self._button("打开数据目录", open_dir, accent=self.palette.cyan, icon=ft.Icons.FOLDER_OPEN),
                         self._button("导出日志", self._on_export_logs, accent=self.palette.green),
                         self._button("端口诊断", self._on_diagnose, accent=self.palette.violet),
@@ -1353,6 +1516,7 @@ class DrcomApp:
                     spacing=10,
                     wrap=True,
                 ),
+                self.update_status_text,
                 self._panel(
                     ft.Column(
                         [
@@ -1520,15 +1684,9 @@ class DrcomApp:
         self._flash(message, ok)
 
     def _toggle_api(self, enabled: bool) -> None:
-        controller = self.controller
-        controller.config.api.enabled = enabled
-        controller.store.save()
-        if enabled:
-            ok, message = controller.api.start()
-            self._flash(message, ok)
-        else:
-            controller.api.stop()
-            self._flash("本地状态接口已停止", True)
+        self.controller.config.api.enabled = bool(enabled)
+        ok, message = self.controller.apply_api_settings()
+        self._flash(message, ok)
 
     def _close_action_from_event(self, event) -> str:
         """Read the chosen value out of a SegmentedButton event.
@@ -1573,9 +1731,7 @@ class DrcomApp:
             if action == "ask":
                 note.value = "每次点关闭都会询问，并可选「记住我的选择」。"
             elif action == "tray":
-                if self._native_core_active():
-                    # The window process really ends here; the icon belongs to
-                    # the core, so "close to tray" is now a complete exit.
+                if self._native_tray_active():
                     note.value = (
                         "关闭即整个界面进程退出（只留约 1 MB 的原生核心），"
                         "认证不断；点托盘图标可重新打开窗口。"
@@ -1599,10 +1755,161 @@ class DrcomApp:
         setattr(self.controller.config.ui, name, value)
         self.controller.store.save()
         self.hud = self._make_hud()
-        if self.view_host is not None:
+        self._hud_signature = None
+        self._hud_painter = None
+        self._hud_painter_key = None
+        if name == "high_contrast" and self.page is not None:
+            try:
+                self.page.bgcolor = self.palette.bg
+                self.page.controls.clear()
+                self.page.add(self._build_shell())
+                self._sync_update_banner()
+            except Exception:
+                if self.view_host is not None:
+                    self.view_host.content = self._build_view(self.active_view)
+        elif self.view_host is not None:
             self.view_host.content = self._build_view(self.active_view)
+        if name in ("scanline_animation", "reduce_motion") and self.page is not None:
+            if self.hud.scanline_animation:
+                if self._sweep_task is None or self._sweep_task.done():
+                    self._sweep_task = self.page.run_task(self._sweep_tick)
+            elif self._sweep_task is not None and not self._sweep_task.done():
+                self._sweep_task.cancel()
+                self._sweep_task = None
+        self._ui_dirty = True
         self._safe_update()
         self._flash("界面设置已应用", True)
+
+    # ------------------------------------------------------------------
+    # auto-update UI
+    # ------------------------------------------------------------------
+    def _on_check_updates(self, _event) -> None:
+        self._flash("正在向 GitHub Releases 检查更新…", True)
+        if self.update_status_text is not None:
+            self.update_status_text.value = "正在检查更新…"
+            self._ui_dirty = True
+            self._safe_update()
+        self.controller.check_for_updates(manual=True, background=True)
+
+    def _skip_available_update(self) -> None:
+        info = getattr(self.controller, "available_update", None)
+        if info is not None:
+            self.controller.skip_update_version(info.version)
+        self._sync_update_banner()
+        self._safe_update()
+
+    def _open_available_update(self) -> None:
+        info = getattr(self.controller, "available_update", None)
+        if info is not None:
+            self._show_update_dialog(info)
+
+    def _show_update_dialog(self, info) -> None:
+        if self.page is None:
+            return
+        from .. import updater
+        from ..single_instance import open_url
+
+        install_kind = updater.detect_install_kind()
+        asset = updater.select_asset(info, install_kind=install_kind)
+        progress_bar = ft.ProgressBar(value=0.0, visible=False, color=self.palette.cyan, bgcolor=self.palette.panel_alt)
+        progress_text = self._text("", color=self.palette.text_muted, size=self.hud.size_micro, mono=True)
+        can_auto_install = bool(asset and asset.sha256 and install_kind != "source")
+
+        asset_summary = (
+            f"匹配安装包：{asset.name}（SHA-256: {asset.sha256[:16]}…）"
+            if asset and asset.sha256
+            else f"源码/手动更新模式（{install_kind}），可打开发布页手动获取。"
+        )
+        notes_text = (info.body or "无发布说明").strip()[:1600]
+
+        def start_download(_event) -> None:
+            if self.page is None:
+                return
+            progress_bar.visible = True
+            progress_bar.value = None
+            progress_text.value = "正在下载并校验 SHA-256…"
+            self._safe_update()
+
+            def _worker() -> None:
+                def on_progress(prog) -> None:
+                    frac = (
+                        prog.downloaded_bytes / prog.total_bytes
+                        if prog.total_bytes > 0
+                        else None
+                    )
+                    if self.page is not None:
+                        async def _upd() -> None:
+                            progress_bar.value = frac
+                            progress_text.value = prog.message
+                            self._safe_update()
+                        try:
+                            self.page.run_task(_upd)
+                        except Exception:
+                            pass
+
+                try:
+                    res = self.controller.download_and_apply_update(info, progress_cb=on_progress)
+                    if self.page is not None:
+                        async def _done() -> None:
+                            progress_bar.value = 1.0
+                            progress_text.value = res.get("message", "更新已就绪")
+                            self._safe_update()
+                            if res.get("should_exit"):
+                                await asyncio.sleep(0.4)
+                                self._quit(deliberate=True)
+                        self.page.run_task(_done)
+                except Exception as exc:
+                    if self.page is not None:
+                        async def _err() -> None:
+                            progress_bar.visible = False
+                            progress_text.value = f"更新失败：{exc}"
+                            progress_text.style.color = self.palette.amber
+                            self._safe_update()
+                        try:
+                            self.page.run_task(_err)
+                        except Exception:
+                            pass
+
+            threading.Thread(target=_worker, name="drcom-update-dl", daemon=True).start()
+
+        actions = []
+        if can_auto_install:
+            actions.append(
+                self._button("下载并安装", start_download, primary=True, accent=self.palette.green,
+                             icon=ft.Icons.DOWNLOAD)
+            )
+        actions.extend([
+            self._button("打开发布页", lambda e: open_url(info.html_url), accent=self.palette.cyan,
+                         icon=ft.Icons.OPEN_IN_NEW),
+            self._button("跳过此版本", lambda e: (self._skip_available_update(), self._close_dialog()),
+                         accent=self.palette.text_muted),
+            self._button("关闭", lambda e: self._close_dialog(), accent=self.palette.violet),
+        ])
+
+        dialog = ft.AlertDialog(
+            modal=False,
+            title=self._text(f"发现新版本 v{info.version}", color=self.palette.cyan,
+                             size=self.hud.size_title, mono=True),
+            content=ft.Container(
+                content=ft.Column(
+                    [
+                        self._text(f"当前版本 v{self.controller.version} → 最新版本 v{info.version}",
+                                   color=self.palette.text, size=self.hud.size_body, mono=True),
+                        self._text(asset_summary, color=self.palette.text_muted, size=self.hud.size_micro, mono=True),
+                        self._text(notes_text, color=self.palette.text_dim, size=self.hud.size_body, selectable=True),
+                        progress_bar,
+                        progress_text,
+                    ],
+                    spacing=8,
+                    scroll=ft.ScrollMode.AUTO,
+                ),
+                width=560,
+                height=340,
+            ),
+            bgcolor=self.palette.panel,
+            actions=actions,
+        )
+        self.page.show_dialog(dialog)
 
     # ------------------------------------------------------------------
     # dialogs / flash
@@ -1657,31 +1964,33 @@ class DrcomApp:
         if self.alert_panel is not None:
             self.alert_panel.visible = True
             self.alert_panel.border = ft.Border.only(left=ft.BorderSide(3, color))
+        self._ui_dirty = True
 
     # ------------------------------------------------------------------
     # tray / window
     # ------------------------------------------------------------------
     def _native_core_active(self) -> bool:
-        """Is authentication delegated to drcomd.exe?
-
-        It matters here because the daemon also owns the tray icon in that
-        mode, so this process holds nothing the user needs after the window
-        goes away -- no engine, no icon -- and can therefore exit outright
-        instead of lingering to rebuild a window later.
-        """
+        """Is authentication delegated to drcomd?"""
         from ..remote_engine import RemoteEngine
 
         return isinstance(getattr(self.controller, "engine", None), RemoteEngine)
+
+    def _native_tray_active(self) -> bool:
+        """Whether the resident native daemon itself owns the tray icon (Win32)."""
+        return (
+            sys.platform == "win32"
+            and self._native_core_active()
+            and bool(getattr(self.controller, "enable_tray", True))
+        )
 
     def _setup_tray(self) -> None:
         # Idempotent: a rebuilt window must reuse the icon started by the first
         # one, or the old icon would be orphaned (and quit twice).
         if self._tray is not None:
             return
-        if self._native_core_active():
-            # drcomd.exe owns it now.  A second icon would show up twice, and
-            # this one would vanish the moment the window closes -- which is
-            # exactly the thing the move was meant to fix.
+        if self._native_tray_active():
+            # Windows drcomd.exe owns the Win32 tray icon. On Linux, pystray
+            # in this process still provides the desktop tray icon.
             return
         if not tray_available():
             self.controller.log.warning(
@@ -1707,7 +2016,7 @@ class DrcomApp:
         the engine never depended on the window.
         """
         if self.page is not None:
-            self.events.put(ControllerEvent(kind=kind))
+            self._enqueue_bounded(self.events, ControllerEvent(kind=kind))
             return
         try:
             if kind == "tray_toggle":
@@ -1728,14 +2037,14 @@ class DrcomApp:
         wakes the ``run_gui`` loop, which starts a fresh client.
         """
         if self.page is not None:
-            self.events.put(ControllerEvent(kind="tray_show"))
+            self._enqueue_bounded(self.events, ControllerEvent(kind="tray_show"))
             return
         self._show_requested.set()
 
     def _tray_quit(self) -> None:
         """Tray "quit", which may arrive while no window exists."""
         if self.page is not None:
-            self.events.put(ControllerEvent(kind="tray_quit"))
+            self._enqueue_bounded(self.events, ControllerEvent(kind="tray_quit"))
             return
         # Released window: there is no page to run the graceful path on, so
         # wake the run_gui loop and let it shut down from the main thread.
@@ -1758,9 +2067,8 @@ class DrcomApp:
         """
         if self.page is None:
             return
-        if self._native_core_active():
-            # Nothing here outlives the window, so "close" can mean "end this
-            # process" -- which is the whole reason the tray moved into C.
+        if self._native_tray_active():
+            # Nothing here outlives the window on Windows native mode.
             self._leave_ui_to_core()
             return
         if self._tray is None:
@@ -1792,6 +2100,10 @@ class DrcomApp:
         # itself, so without this marker "close" would be undone five seconds
         # later, forever.  It never supervised the core, which is the part that
         # has to survive.
+        try:
+            self.controller.stats.checkpoint(force=True)
+        except Exception:
+            pass
         try:
             from ..watchdog import StopMarker
 
@@ -2013,17 +2325,24 @@ class DrcomApp:
     # async loops
     # ------------------------------------------------------------------
     async def _ui_tick(self) -> None:
-        """Drain controller events and refresh the dashboard."""
+        """Drain controller events and refresh only when state actually changes."""
         ticks = 0
         while True:
             await asyncio.sleep(0.5)
             try:
-                self._drain_events()
-                self._drain_logs()
+                events_handled = self._drain_events()
+                logs_added = self._drain_logs()
                 ticks += 1
-                if self.active_view == "状态" and ticks % 2 == 0:
-                    self._refresh_dashboard()
-                self._safe_update()
+                if events_handled or logs_added:
+                    self._ui_dirty = True
+                if ticks % 2 == 0:
+                    if self.active_view == "状态":
+                        self._refresh_dashboard()
+                    elif self._tray is not None:
+                        self._update_tooltip(self._build_telemetry())
+                if self._ui_dirty:
+                    self._ui_dirty = False
+                    self._safe_update()
             except Exception as exc:  # pragma: no cover - never kill the loop
                 self.controller.log.warning(f"界面刷新异常：{exc!r}")
                 await asyncio.sleep(1.0)
@@ -2034,21 +2353,23 @@ class DrcomApp:
             if self.clock_text is None or self.page is None:
                 continue
             try:
-                self.clock_text.value = time.strftime("%H:%M:%S")
+                now_str = time.strftime("%H:%M:%S")
+                if self.clock_text.value != now_str:
+                    self.clock_text.value = now_str
+                    self.clock_text.update()
+                old_phase = self.phase_bar.value if self.phase_bar is not None else None
                 self._update_phase()
+                if self.phase_bar is not None and self.phase_bar.value != old_phase:
+                    self.phase_bar.update()
             except Exception:
                 pass
 
     async def _sweep_tick(self) -> None:
-        """Animate the scanline band (opt-in; see UiConfig.scanline_animation).
-
-        Small steps at a steady interval: 7 px every 80 ms looked like it was
-        stuttering across the panel.
-        """
+        """Animate the scanline band (opt-in; see UiConfig.scanline_animation)."""
         offset = 0
-        while True:
+        while self.hud.scanline_animation:
             await asyncio.sleep(0.05)
-            if self.sweep_band is None or self.page is None:
+            if self.sweep_band is None or self.page is None or self.active_view != "状态":
                 continue
             offset = (offset + 3) % (int(self._canvas_size[1]) + 60)
             try:
@@ -2057,13 +2378,16 @@ class DrcomApp:
             except Exception:
                 pass
 
-    def _drain_events(self) -> None:
+    def _drain_events(self) -> int:
+        count = 0
         while True:
             try:
                 event = self.events.get_nowait()
             except queue.Empty:
                 break
             self._handle_event(event)
+            count += 1
+        return count
 
     def _on_controller_event(self, event: ControllerEvent) -> None:
         # Called from worker threads — only enqueue.
@@ -2073,7 +2397,7 @@ class DrcomApp:
             # pile up in a queue no one will ever read.
             self._notify_engine_headless(event)
             return
-        self.events.put(event)
+        self._enqueue_bounded(self.events, event)
 
     def _notify_engine_headless(self, event: ControllerEvent) -> None:
         """Tray balloon + tooltip while the window is closed."""
@@ -2100,7 +2424,7 @@ class DrcomApp:
             # The log bus keeps its own ring buffer; main() re-seeds the panel
             # from it when a window is next built, so nothing is lost here.
             return
-        self.log_queue.put(record)
+        self._enqueue_bounded(self.log_queue, record)
 
     def _handle_event(self, event: ControllerEvent) -> None:
         if event.kind == "engine" and event.engine_event is not None:
@@ -2126,6 +2450,35 @@ class DrcomApp:
                     self.message_text and self._set_alert(inner.message)
             elif inner.kind == "stopped":
                 self._set_alert("已停止认证。", "")
+            self._ui_dirty = True
+        elif event.kind == "update_available":
+            info = (event.payload or {}).get("info")
+            self._sync_update_banner()
+            if info is not None and self.update_status_text is not None:
+                self.update_status_text.value = f"发现新版本 v{info.version}（点击上方横幅查看详情）"
+                self.update_status_text.style.color = self.palette.cyan
+            if (event.payload or {}).get("manual") and info is not None:
+                self._show_update_dialog(info)
+            self._ui_dirty = True
+        elif event.kind == "update_checked":
+            payload = event.payload or {}
+            err = payload.get("error") or ""
+            info = payload.get("info")
+            if err:
+                if self.update_status_text is not None:
+                    self.update_status_text.value = f"检查更新失败：{err}"
+                    self.update_status_text.style.color = self.palette.amber
+                self._flash(f"检查更新失败：{err}", False)
+            elif payload.get("has_update") and info is not None:
+                self._sync_update_banner()
+                self._show_update_dialog(info)
+            else:
+                ver_note = f"当前 v{self.controller.version} 已是最新版本"
+                if self.update_status_text is not None:
+                    self.update_status_text.value = ver_note
+                    self.update_status_text.style.color = self.palette.green
+                self._flash(ver_note, True)
+            self._ui_dirty = True
         elif event.kind == "tray_show":
             self._show_window()
         elif event.kind == "tray_toggle":
@@ -2177,16 +2530,28 @@ class DrcomApp:
         if self._tray is not None:
             self._tray.notify(message, title)
 
-    def _drain_logs(self) -> None:
+    def _drain_logs(self) -> int:
         if self._log_paused:
-            # Still count them so the UI can say how many were skipped.
             while True:
                 try:
                     self.log_queue.get_nowait()
                     self._pending_log_count += 1
                 except queue.Empty:
                     break
-            return
+            return 0
+
+        if self.active_view != "日志":
+            # Off the Logs tab: discard queued notifications cleanly without
+            # allocating Flet Text controls.  LogBus keeps the authoritative
+            # ring buffer and _view_logs() rebuilds up to 400 rows on demand.
+            while True:
+                try:
+                    self.log_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if len(self._log_rows) > 400:
+                del self._log_rows[:-400]
+            return 0
 
         appended = 0
         while appended < 60:
@@ -2196,15 +2561,15 @@ class DrcomApp:
                 break
             row = self._log_row(record)
             self._log_rows.append(row)
-            if self.log_list is not None and self.active_view == "日志":
+            if self.log_list is not None:
                 self.log_list.controls.append(row)
             appended += 1
 
-        if self.log_list is not None and appended and self.active_view == "日志":
-            del self._log_rows[: max(0, len(self._log_rows) - 800)]
-            controls = self.log_list.controls
-            if len(controls) > 800:
-                del controls[: len(controls) - 800]
+        if len(self._log_rows) > 400:
+            del self._log_rows[:-400]
+        if self.log_list is not None and len(self.log_list.controls) > 400:
+            del self.log_list.controls[:-400]
+        return appended
 
     # ------------------------------------------------------------------
     # dashboard refresh
@@ -2284,9 +2649,34 @@ class DrcomApp:
         self._telemetry = telemetry
         self._sync_fatal_alert(telemetry)
 
+        stats = controller.stats
+        today_seconds = stats.today().online_seconds + stats.unflushed_session_seconds
+        dash_key = (
+            telemetry.online,
+            telemetry.state_label,
+            telemetry.ip,
+            int(telemetry.uptime),
+            int(today_seconds),
+            int(stats.week_seconds()),
+            stats.today().drops,
+            f"{telemetry.rx_rate:.0f}",
+            f"{telemetry.tx_rate:.0f}",
+            f"{telemetry.rtt_ms:.0f}" if telemetry.rtt_ms is not None else None,
+            f"{telemetry.loss_percent:.0f}" if telemetry.loss_percent is not None else None,
+            f"{telemetry.jitter_ms:.0f}" if telemetry.jitter_ms is not None else None,
+            telemetry.session_rx // 4096,
+            telemetry.session_tx // 4096,
+            round(telemetry.keepalive_phase, 2),
+            controller.last_error,
+            telemetry.account,
+            self._canvas_size,
+        )
+        if dash_key == self._last_dashboard_key and self._hud_signature is not None:
+            return
+        self._last_dashboard_key = dash_key
+        self._ui_dirty = True
+
         # --- HUD canvas -------------------------------------------------
-        # Only rebuild when something the HUD actually draws has moved.  The
-        # scanline band is animated separately, so an idle HUD costs nothing.
         if self.instrument_canvas is not None:
             signature = (
                 telemetry.online,
@@ -2304,10 +2694,15 @@ class DrcomApp:
             )
             if signature != self._hud_signature:
                 self._hud_signature = signature
-                painter = HudPainter(
-                    self.hud, width=self._canvas_size[0], height=self._canvas_size[1]
+                painter_key = (self._canvas_size, id(self.hud))
+                if self._hud_painter is None or self._hud_painter_key != painter_key:
+                    self._hud_painter = HudPainter(
+                        self.hud, width=self._canvas_size[0], height=self._canvas_size[1]
+                    )
+                    self._hud_painter_key = painter_key
+                self.instrument_canvas.shapes = self._hud_painter.render(
+                    telemetry, phase=time.time() % 60, include_decor=False
                 )
-                self.instrument_canvas.shapes = painter.render(telemetry, phase=time.time() % 60)
                 self.instrument_canvas.width = self._canvas_size[0]
                 self.instrument_canvas.height = self._canvas_size[1]
 
@@ -2336,8 +2731,6 @@ class DrcomApp:
                 row.controls[0].bgcolor = telemetry.state_color
 
         # --- stats --------------------------------------------------------
-        stats = controller.stats
-        today_seconds = stats.today().online_seconds + stats.session_seconds
         values = {
             "today": _format_uptime(today_seconds),
             "week": _format_uptime(stats.week_seconds()),
@@ -2367,7 +2760,9 @@ class DrcomApp:
         if self._tray is None:
             return
         if telemetry.online:
-            text = f"JLU DrCOM NG · 在线 {telemetry.ip} · {_format_uptime(telemetry.uptime)}"
+            mins = int(telemetry.uptime // 60)
+            dur = f"{mins} 分钟" if mins > 0 else "刚刚上线"
+            text = f"JLU DrCOM NG · 在线 {telemetry.ip} · {dur}"
             color = self.palette.online
         else:
             text = f"JLU DrCOM NG · {telemetry.state_label}"
@@ -2471,6 +2866,10 @@ class DrcomApp:
         release.  Calling it on the main thread lets ``run_gui`` return normally
         instead.
         """
+        try:
+            self.controller.stats.checkpoint(force=True)
+        except Exception:
+            pass
         try:
             from ..watchdog import StopMarker
 

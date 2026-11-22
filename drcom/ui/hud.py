@@ -555,13 +555,20 @@ class HudPainter:
                        size=self.hud.size_micro, align="right")
 
     # -- whole frame -------------------------------------------------------
-    def render(self, telemetry: HudTelemetry, *, phase: float = 0.0) -> list:
+    def render(
+        self,
+        telemetry: HudTelemetry,
+        *,
+        phase: float = 0.0,
+        include_decor: bool = True,
+    ) -> list:
         self.shapes = []
         palette = self.hud.palette
         cx, cy = self.w / 2, self.h / 2
 
-        self.grid()
-        self.frame_marks()
+        if include_decor:
+            self.grid()
+            self.frame_marks()
 
         self.heading_tape(telemetry)
         self.bank_arc(cx, cy, min(self.h * 0.25, 104.0), telemetry)
@@ -590,7 +597,8 @@ class HudPainter:
         ])
 
         self.mode_bar(telemetry)
-        self.scanlines(phase=phase)
+        if include_decor:
+            self.scanlines(phase=phase)
         self.outline_rect(0.5, 0.5, self.w - 1, self.h - 1, palette.border, width=1.0)
         del palette
         return self.shapes

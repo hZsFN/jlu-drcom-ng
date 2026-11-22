@@ -309,18 +309,27 @@ class ProbeHistory:
             return summaries[0]
 
         rtts = [s["rtt_ms"] for s in live]
-        sent = sum(s["samples"] for s in live)
+        total_sent = sum(r.sent for t in picks for r in self.results.get(t, ()))
+        total_recv = sum(r.received for t in picks for r in self.results.get(t, ()))
+        loss = (total_sent - total_recv) / total_sent * 100.0 if total_sent else 0.0
         return {
             "target": ", ".join(_short_name(s["target"]) for s in live),
             "kind": live[0]["kind"],
             "samples": sum(s["samples"] for s in summaries),
             "pings": sum(s["pings"] for s in summaries),
             "rtt_ms": round(sum(rtts) / len(rtts), 1),
-            "loss_percent": round(
-                sum(s["loss_percent"] or 0.0 for s in summaries) / max(1, sent), 1
-            ),
+            "loss_percent": round(loss, 1),
             "jitter_ms": _mean_or_none([s["jitter_ms"] for s in live]),
         }
+
+    def retain_targets(self, targets: list[str]) -> None:
+        """Drop history for targets no longer configured."""
+        keep = set(targets)
+        for key in list(self.results):
+            if key not in keep:
+                self.results.pop(key, None)
+                self._samples.pop(key, None)
+        self._order = [t for t in self._order if t in keep]
 
     def clear(self) -> None:
         self.results.clear()
@@ -413,10 +422,11 @@ class NetworkProbe:
         if self._stop.wait(3.0):
             return
         try:
-            self.warm_up()
+            if self.config.enabled:
+                self.warm_up()
         except Exception:  # pragma: no cover - a warm-up must never kill the loop
             pass
-        while not self._stop.is_set():
+        while not self._stop.is_set() and self.config.enabled:
             if not (self.config.only_when_offline and self._is_online()):
                 self.probe_now()
             if self._stop.wait(max(5.0, self.config.interval)):

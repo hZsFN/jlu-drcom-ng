@@ -148,8 +148,18 @@ def main() -> int:
 
     finally:
         try:
+            from drcom.remote_engine import _read_core_token
+
+            headers = {}
+            token = _read_core_token(config_file)
+            if token:
+                headers["X-DrCOM-Token"] = token
             urllib.request.urlopen(
-                urllib.request.Request(f"http://127.0.0.1:{api_port}/shutdown", method="POST"),
+                urllib.request.Request(
+                    f"http://127.0.0.1:{api_port}/shutdown",
+                    headers=headers,
+                    method="POST",
+                ),
                 timeout=2,
             ).read()
         except Exception:

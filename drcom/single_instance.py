@@ -42,6 +42,7 @@ class SingleInstance:
     def __init__(self, name: str = _MUTEX_NAME) -> None:
         self.name = name
         self._handle = None
+        self._lock_fd: int | None = None
         self._lock_path: Path | None = None
         self.already_running = False
 
@@ -69,9 +70,42 @@ class SingleInstance:
         self.already_running = last_error == ERROR_ALREADY_EXISTS
         return not self.already_running
 
+    def _posix_lock_path(self) -> Path:
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+        if runtime_dir:
+            candidate = Path(runtime_dir)
+            if candidate.is_dir() and os.access(candidate, os.W_OK | os.X_OK):
+                return candidate / "jlu-drcom-ng.lock"
+        return Path(tempfile.gettempdir()) / "jlu-drcom-ng.lock"
+
     def _acquire_posix(self) -> bool:
-        path = Path(tempfile.gettempdir()) / "jlu-drcom-ng.lock"
+        path = self._posix_lock_path()
         self._lock_path = path
+        try:
+            import fcntl
+        except ImportError:
+            fcntl = None  # type: ignore[assignment]
+
+        if fcntl is not None:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                self.already_running = True
+                return False
+            except OSError:
+                os.close(fd)
+                return True
+            try:
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, str(os.getpid()).encode("ascii"))
+            except OSError:
+                pass
+            self._lock_fd = fd
+            return True
+
         if path.exists():
             try:
                 pid = int(path.read_text(encoding="utf-8").strip() or "0")
@@ -80,13 +114,12 @@ class SingleInstance:
             if pid and _pid_alive(pid):
                 self.already_running = True
                 return False
-            # Stale lock from a crashed run.
             try:
                 path.unlink()
             except OSError:
                 pass
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             os.write(fd, str(os.getpid()).encode("ascii"))
             os.close(fd)
         except FileExistsError:
@@ -100,7 +133,14 @@ class SingleInstance:
 
             ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(ctypes.c_void_p(self._handle))
             self._handle = None
-        elif self._lock_path and self._lock_path.exists():
+        if self._lock_fd is not None:
+            try:
+                os.close(self._lock_fd)
+            except OSError:
+                pass
+            self._lock_fd = None
+            return
+        if not IS_WINDOWS and self._lock_path and self._lock_path.exists():
             try:
                 self._lock_path.unlink()
             except OSError:

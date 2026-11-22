@@ -22,17 +22,28 @@ defaults matter and would otherwise bite:
 
 from __future__ import annotations
 
+import os
+import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 __all__ = [
+    "SYSTEMD_UNIT",
     "TASK_NAME",
+    "build_systemd_unit",
     "build_task_xml",
     "install_current",
+    "install_systemd_service",
     "install_task",
     "launch_target",
+    "remove_systemd_service",
     "remove_task",
+    "systemd_available",
+    "systemd_service_command",
+    "systemd_service_exists",
+    "systemd_unit_path",
     "task_exists",
     "task_command",
 ]
@@ -40,6 +51,7 @@ __all__ = [
 IS_WINDOWS = sys.platform == "win32"
 
 TASK_NAME = "JLU-DrCOM-NG"
+SYSTEMD_UNIT = "jlu-drcom-ng.service"
 
 #: Above normal.  Task Scheduler's own scale runs 0 (highest) to 10; the default
 #: is 7, which is below normal.
@@ -155,7 +167,8 @@ def launch_target(*, minimized: bool = True, with_watchdog: bool = False) -> tup
     args.append("--autostart")
     if minimized:
         args.append("--minimized")
-    return command, subprocess.list2cmdline(args), workdir
+    joined_args = subprocess.list2cmdline(args) if IS_WINDOWS else shlex.join(args)
+    return command, joined_args, workdir
 
 
 def install_current(*, minimized: bool = True, with_watchdog: bool = False) -> tuple[bool, str]:
@@ -242,3 +255,112 @@ def task_command() -> str:
     if result.returncode != 0:
         return ""
     return (result.stdout or "").strip()
+
+
+# --------------------------------------------------------------------------
+# Linux: systemd --user unit
+# --------------------------------------------------------------------------
+def systemd_unit_path() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "systemd" / "user" / SYSTEMD_UNIT
+
+
+def systemd_available() -> bool:
+    if IS_WINDOWS:
+        return False
+    if not shutil.which("systemctl"):
+        return False
+    res = _run(["systemctl", "--user", "show-environment"])
+    return res.returncode == 0
+
+
+def build_systemd_unit(*, command: str, arguments: str, working_dir: str = "") -> str:
+    exec_cmd = f"{shlex.quote(command)} {arguments}".strip() if arguments else shlex.quote(command)
+    workdir_line = f"WorkingDirectory={working_dir}\n" if working_dir else ""
+    return (
+        "[Unit]\n"
+        "Description=JLU DrCOM NG Campus Network Client\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"{workdir_line}"
+        f"ExecStart={exec_cmd}\n"
+        "Restart=on-failure\n"
+        "RestartSec=5s\n\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def install_systemd_service(
+    *,
+    minimized: bool = True,
+    with_watchdog: bool = False,
+    command: str = "",
+    arguments: str = "",
+    working_dir: str = "",
+    unit_path: Path | None = None,
+) -> tuple[bool, str]:
+    if IS_WINDOWS:
+        return False, "systemd --user 仅支持 Linux"
+    if not command:
+        command, arguments, workdir = launch_target(minimized=minimized, with_watchdog=with_watchdog)
+        working_dir = working_dir or workdir
+    unit_file = unit_path or systemd_unit_path()
+    try:
+        unit_file.parent.mkdir(parents=True, exist_ok=True)
+        unit_file.write_text(
+            build_systemd_unit(command=command, arguments=arguments, working_dir=working_dir),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        return False, f"写入 systemd unit 失败：{exc}"
+
+    if shutil.which("systemctl"):
+        _run(["systemctl", "--user", "daemon-reload"])
+        res = _run(["systemctl", "--user", "enable", SYSTEMD_UNIT])
+        if res.returncode != 0:
+            detail = (res.stderr or res.stdout or "").strip()
+            return False, f"启用 systemd 用户服务失败：{detail}"
+    return True, f"已启用 systemd 用户服务「{SYSTEMD_UNIT}」"
+
+
+def remove_systemd_service(unit_path: Path | None = None) -> tuple[bool, str]:
+    if IS_WINDOWS:
+        return False, "systemd --user 仅支持 Linux"
+    unit_file = unit_path or systemd_unit_path()
+    if shutil.which("systemctl"):
+        _run(["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT])
+    try:
+        unit_file.unlink(missing_ok=True)
+    except OSError as exc:
+        return False, f"删除 systemd unit 失败：{exc}"
+    if shutil.which("systemctl"):
+        _run(["systemctl", "--user", "daemon-reload"])
+    return True, f"已移除 systemd 用户服务「{SYSTEMD_UNIT}」"
+
+
+def systemd_service_exists(unit_path: Path | None = None) -> bool:
+    if IS_WINDOWS:
+        return False
+    unit_file = unit_path or systemd_unit_path()
+    if not unit_file.exists():
+        return False
+    if shutil.which("systemctl"):
+        res = _run(["systemctl", "--user", "is-enabled", SYSTEMD_UNIT])
+        if res.returncode == 0 or res.stdout.strip() == "enabled":
+            return True
+    return True
+
+
+def systemd_service_command(unit_path: Path | None = None) -> str:
+    unit_file = unit_path or systemd_unit_path()
+    try:
+        for line in unit_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("ExecStart="):
+                return line[len("ExecStart="):].strip()
+    except OSError:
+        pass
+    return ""

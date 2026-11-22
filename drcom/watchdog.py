@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -135,10 +136,43 @@ def _kernel32():
     return kernel32
 
 
+def _iter_processes_posix() -> list[ProcessEntry]:
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return []
+    out: list[ProcessEntry] = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat_text = (entry / "stat").read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        lparen = stat_text.find("(")
+        rparen = stat_text.rfind(")")
+        if lparen < 0 or rparen <= lparen:
+            continue
+        try:
+            pid = int(stat_text[:lparen].strip())
+        except ValueError:
+            pid = int(entry.name)
+        name = stat_text[lparen + 1 : rparen]
+        tail = stat_text[rparen + 1 :].split()
+        # Format after ')': state(0) ppid(1) ...
+        if len(tail) < 2:
+            continue
+        try:
+            ppid = int(tail[1])
+        except ValueError:
+            ppid = 0
+        out.append(ProcessEntry(pid=pid, parent_pid=ppid, name=name))
+    return out
+
+
 def iter_processes() -> list[ProcessEntry]:
     """Every running process as ``(pid, parent pid, exe name)``."""
     if not IS_WINDOWS:
-        return []
+        return _iter_processes_posix()
     kernel32 = _kernel32()
     snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
     if not snapshot or snapshot == _INVALID_HANDLE_VALUE:
@@ -166,8 +200,14 @@ def iter_processes() -> list[ProcessEntry]:
 
 
 def _terminate(pid: int) -> bool:
-    if not IS_WINDOWS or pid <= 0:
+    if pid <= 0:
         return False
+    if not IS_WINDOWS:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            return True
+        except OSError:
+            return False
     kernel32 = _kernel32()
     handle = kernel32.OpenProcess(_PROCESS_TERMINATE, 0, pid)
     if not handle:
@@ -178,7 +218,7 @@ def _terminate(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
-def reap_leftover_windows(*, log=None, names: tuple[str, ...] = ("flet.exe",)) -> list[int]:
+def reap_leftover_windows(*, log=None, names: tuple[str, ...] = ("flet.exe", "flet")) -> list[int]:
     """Kill client windows whose parent process is gone.
 
     Returns the pids it killed.  Only windows whose *parent* has exited are

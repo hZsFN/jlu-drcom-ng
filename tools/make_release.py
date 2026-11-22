@@ -27,10 +27,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import pathlib
+import platform
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -86,6 +88,13 @@ def ensure_clean() -> None:
         raise SystemExit(1)
 
 
+def _linux_arch() -> str:
+    machine = (platform.machine() or "").lower()
+    if machine in ("aarch64", "arm64"):
+        return "arm64"
+    return "x86_64"
+
+
 def build_bundle_zip(version: str) -> pathlib.Path:
     """The Windows bundle, zipped as a single-rooted portable app folder."""
     if not DIST_DIR.exists():
@@ -109,6 +118,60 @@ def build_bundle_zip(version: str) -> pathlib.Path:
     return target
 
 
+def build_linux_bundle_tarball(version: str) -> pathlib.Path:
+    """The Linux desktop bundle (``dist/JLU-DrCOM-NG``) + install helper."""
+    if not DIST_DIR.exists():
+        raise SystemExit(
+            f"{DIST_DIR} not found -- run `python build.py` first "
+            "(add --fetch-runtime if the Flet runtime is not vendored yet)"
+        )
+    arch = _linux_arch()
+    target = RELEASE_DIR / f"{PACKAGE_NAME}-{version}-linux-{arch}.tar.gz"
+    RELEASE_DIR.mkdir(parents=True, exist_ok=True)
+    target.unlink(missing_ok=True)
+    prefix = f"{PACKAGE_NAME}-{version}"
+    count = 0
+    with tarfile.open(target, "w:gz") as archive:
+        for path in sorted(DIST_DIR.rglob("*")):
+            if path.is_file() or path.is_symlink():
+                rel = str(path.relative_to(DIST_DIR)).replace("\\", "/")
+                archive.add(path, arcname=f"{prefix}/{rel}", recursive=False)
+                count += 1
+        for helper in ("install.sh", "jlu-drcom-ng.service.in"):
+            hp = ROOT / "installer" / "linux" / helper
+            if hp.exists():
+                archive.add(hp, arcname=f"{prefix}/{helper}")
+                count += 1
+    size_mb = target.stat().st_size / 1048576
+    print(f"  bundle  {target.name}  ({count} files, {size_mb:.1f} MB)")
+    return target
+
+
+def build_linux_daemon_tarball(version: str) -> pathlib.Path | None:
+    """Standalone Linux native core (``drcomd``) tarball if compiled."""
+    drcomd_bin = ROOT / "native" / "drcomd"
+    if not drcomd_bin.exists():
+        return None
+    arch = _linux_arch()
+    target = RELEASE_DIR / f"drcomd-{version}-linux-{arch}.tar.gz"
+    RELEASE_DIR.mkdir(parents=True, exist_ok=True)
+    target.unlink(missing_ok=True)
+    prefix = f"drcomd-{version}"
+    with tarfile.open(target, "w:gz") as archive:
+        archive.add(drcomd_bin, arcname=f"{prefix}/drcomd")
+        for extra_src, arc_rel in (
+            (ROOT / "LICENSE", "LICENSE"),
+            (ROOT / "native" / "README.md", "README.md"),
+            (ROOT / "installer" / "linux" / "install.sh", "install.sh"),
+            (ROOT / "installer" / "linux" / "jlu-drcom-ng.service.in", "jlu-drcom-ng.service.in"),
+        ):
+            if extra_src.exists():
+                archive.add(extra_src, arcname=f"{prefix}/{arc_rel}")
+    size_kb = target.stat().st_size / 1024
+    print(f"  daemon  {target.name}  ({size_kb:.1f} KB)")
+    return target
+
+
 def find_installers(version: str) -> list[pathlib.Path]:
     """setup.exe files already sitting in release/ for this version.
 
@@ -125,13 +188,21 @@ def find_installers(version: str) -> list[pathlib.Path]:
     return found
 
 
-def write_checksums(paths: list[pathlib.Path], *, tag: str = "") -> pathlib.Path:
+def write_checksums(
+    paths: list[pathlib.Path], *, tag: str = "", merge_existing: bool = False
+) -> pathlib.Path:
     """Digests of what we upload, plus a pointer to the source GitHub adds."""
     target = RELEASE_DIR / "SHA256SUMS.txt"
-    lines = []
+    digests: dict[str, str] = {}
+    if merge_existing and target.exists():
+        for raw_line in target.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = re.match(r"^\s*([0-9a-fA-F]{64})\s+[* ]?(.+?)\s*$", raw_line)
+            if m:
+                digests[m.group(2)] = m.group(1).lower()
     for path in paths:
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        lines.append(f"{digest}  {path.name}")
+        digests[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    lines = [f"{digest}  {name}" for name, digest in digests.items()]
     if tag:
         lines.append("")
         lines.append(
@@ -148,15 +219,21 @@ def write_checksums(paths: list[pathlib.Path], *, tag: str = "") -> pathlib.Path
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--with-bundle", action="store_true",
-                        help="also zip dist/ (requires a completed build)")
+                        help="also archive dist/ (requires a completed build)")
+    parser.add_argument("--with-drcomd", action="store_true",
+                        help="also archive standalone native/drcomd on Linux")
+    parser.add_argument("--merge-checksums", action="store_true",
+                        help="preserve existing entries in SHA256SUMS.txt when adding new assets")
+    parser.add_argument("--tag-override", default="",
+                        help="override release tag (e.g. v2.2.0)")
     parser.add_argument("--upload", action="store_true",
                         help="upload the artefacts to the GitHub release")
     parser.add_argument("--skip-clean-check", action="store_true",
                         help="allow a dirty working tree")
     options = parser.parse_args()
 
-    version = current_version()
-    tag = f"v{version}"
+    version = (options.tag_override.lstrip("v") if options.tag_override else "") or current_version()
+    tag = options.tag_override or f"v{version}"
     print(f"building release artefacts for {tag}\n")
 
     if not options.skip_clean_check:
@@ -164,13 +241,29 @@ def main() -> int:
 
     artefacts: list[pathlib.Path] = []
     if options.with_bundle:
-        artefacts.append(build_bundle_zip(version))
+        if sys.platform == "win32":
+            artefacts.append(build_bundle_zip(version))
+        else:
+            artefacts.append(build_linux_bundle_tarball(version))
     else:
         print("  (没有 --with-bundle，只写校验文件)")
-    artefacts.extend(find_installers(version))
+
+    if options.with_drcomd or (not sys.platform == "win32" and options.with_bundle):
+        daemon_tar = build_linux_daemon_tarball(version)
+        if daemon_tar is not None:
+            artefacts.append(daemon_tar)
+
+    for existing in sorted(RELEASE_DIR.glob(f"*{version}*")):
+        if existing.name in ("SHA256SUMS.txt", "NOTES.md") or "-dart" in existing.name:
+            continue
+        if existing.suffix in (".zip", ".gz", ".deb", ".rpm", ".zst") and existing not in artefacts:
+            artefacts.append(existing)
+    for inst in find_installers(version):
+        if inst not in artefacts:
+            artefacts.append(inst)
     if not artefacts:
         print("  (release/ 里没有该版本的安装包，只写校验文件)")
-    write_checksums(artefacts, tag=tag)
+    write_checksums(artefacts, tag=tag, merge_existing=options.merge_checksums)
 
     print()
     if options.upload:

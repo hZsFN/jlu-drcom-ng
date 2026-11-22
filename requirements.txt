@@ -18,6 +18,7 @@
 #   本地 API    http.server
 #
 flet>=0.28
+flet-desktop>=0.28
 pystray>=0.19
 Pillow>=9.0
 cryptography>=41.0 ; sys_platform != "win32"

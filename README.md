@@ -112,10 +112,10 @@
 
 - `JLU-DrCOM-NG-2.2.1-setup.exe` —— Windows 安装版（推荐，支持安装后自动更新平滑替换）
 - `JLU-DrCOM-NG-2.2.1-windows-x64.zip` —— Windows 绿色便携版
-- `jlu-drcom-ng_2.2.1_amd64.deb` —— Debian / Ubuntu 系安装包（`sudo apt install ./jlu-drcom-ng_2.2.1_amd64.deb`）
-- `jlu-drcom-ng-2.2.1-1.x86_64.rpm` —— RedHat / Fedora / Rocky / Alma / openSUSE 系安装包（`sudo dnf install ./jlu-drcom-ng-2.2.1-1.x86_64.rpm`）
-- `jlu-drcom-ng-2.2.1-1-x86_64.pkg.tar.zst` —— Arch Linux 系安装包（`sudo pacman -U jlu-drcom-ng-2.2.1-1-x86_64.pkg.tar.zst`）
-- `JLU-DrCOM-NG-2.2.1-linux-x86_64.tar.gz` / `drcomd-2.2.1-linux-x86_64.tar.gz` —— Linux 通用桌面压缩包与纯原生无界面守护进程版
+- `jlu-drcom-ng_2.2.2_amd64.deb` —— Debian / Ubuntu 系安装包（`sudo apt install ./jlu-drcom-ng_2.2.2_amd64.deb`）
+- `jlu-drcom-ng-2.2.2-1.x86_64.rpm` —— RedHat / Fedora / Rocky / Alma / openSUSE 系安装包（`sudo dnf install ./jlu-drcom-ng-2.2.2-1.x86_64.rpm`）
+- `jlu-drcom-ng-2.2.2-1-x86_64.pkg.tar.zst` —— Arch Linux 系安装包（`sudo pacman -U jlu-drcom-ng-2.2.2-1-x86_64.pkg.tar.zst`）
+- `JLU-DrCOM-NG-2.2.2-linux-x86_64.tar.gz` / `drcomd-2.2.2-linux-x86_64.tar.gz` —— Linux 通用桌面压缩包与纯原生无界面守护进程版
 
 **双击装不上就右键「以管理员身份运行」。** 安装包要往 `C:\Program Files` 写文件，
 所以它会申请管理员权限；如果你用的账号关掉了 UAC 提示、或者双击后**窗口一闪就没了 /
@@ -249,7 +249,7 @@ python build.py --onefile       # 单文件 exe
 
 - 「注销」不是真正的注销报文 —— 这个 Dr.COM 变体没有客户端注销包。
   它做的是停止保活并关闭套接字，服务端超时后释放会话。界面上是这么写的，不装。
-- 托盘图标在 Windows 由 `drcomd.exe` 原生提供，在 Linux 由 Python `pystray` 提供；无托盘环境自动降级为最小化。
+- 托盘图标在 Windows 由 `drcomd.exe` 原生提供，在 Linux 优先走 D-Bus `StatusNotifierItem`（兼容 Wayland 与 X11，支持 KDE / GNOME AppIndicator / XFCE / Waybar 等）并回退 `pystray`；无托盘桌面下原生核心 `drcomd` 仍可在关窗后继续认证。
 - 关窗释放界面内存之后，重新打开需要重建窗口，约 1 秒；这段时间窗口不在，
   但认证和保活一直是连着的。
 - 界面只有深色主题（HUD 风格需要暗底），另提供高对比度模式。

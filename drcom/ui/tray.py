@@ -1,14 +1,18 @@
 """System-tray integration.
 
 Flet 1.0 exposes no tray control (``page.window`` can hide the window, but
-nothing can bring it back), so a real tray icon needs a separate native
-implementation.  We use `pystray <https://pypi.org/project/pystray/>`_, which
-is pure Python and only needs Pillow (already a dependency of most desktop
-Python stacks).
+nothing can bring it back), so a real tray icon needs a separate backend:
 
-If pystray is unavailable the app degrades honestly: "关闭时最小化" instead of
-"隐藏到托盘", because hiding a window with no way to restore it would strand
-the user.  :class:`TrayIcon.available` tells the UI which mode it is in.
+* **Linux (primary)**: StatusNotifierItem (SNI) + ``com.canonical.dbusmenu``
+  over the user's D-Bus session bus (:mod:`drcom.ui.sni_tray`).  Works on both
+  Wayland and X11 across KDE Plasma, GNOME (with AppIndicator extension),
+  XFCE4, Cinnamon, MATE, LXQt, and Waybar — without GTK/PyGObject/Xlib.
+* **Fallback / Windows / macOS**: `pystray <https://pypi.org/project/pystray/>`_
+  (with startup verification so a backend crash inside the tray thread is never
+  silently mistaken for a live icon).
+
+If no tray backend can register an icon, the app degrades honestly instead of
+hiding a window with no way to bring it back.
 """
 
 from __future__ import annotations
@@ -18,24 +22,46 @@ import sys
 import threading
 from typing import Callable
 
+from .sni_tray import LinuxSniTray, session_bus_configured, sni_module_available
+
 __all__ = ["TrayIcon", "tray_available"]
 
 _ICON_IMAGE_CACHE: dict[tuple[str, int], object] = {}
 
 
-def tray_available() -> bool:
-    """Whether a real tray icon can be created in this environment."""
-    try:
-        import pystray  # noqa: F401
-    except Exception:
-        return False
+def _pil_available() -> bool:
     try:
         from PIL import Image  # noqa: F401
     except Exception:
         return False
-    return sys.platform in ("win32", "darwin") or bool(
-        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    return True
+
+
+def _pystray_available() -> bool:
+    try:
+        import pystray  # noqa: F401
+    except Exception:
+        return False
+    return _pil_available() and (
+        sys.platform in ("win32", "darwin")
+        or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     )
+
+
+def _linux_sni_available() -> bool:
+    return (
+        sys.platform == "linux"
+        and _pil_available()
+        and session_bus_configured()
+        and sni_module_available()
+    )
+
+
+def tray_available() -> bool:
+    """Whether a real tray icon can be created in this environment."""
+    if sys.platform == "linux" and _linux_sni_available():
+        return True
+    return _pystray_available()
 
 
 def _make_icon_image(color: str = "#86FF86", size: int = 64):
@@ -96,9 +122,11 @@ class TrayIcon:
         self.on_quit = on_quit
         self.status_provider = status_provider
         self._icon = None
+        self._sni: LinuxSniTray | None = None
         self._thread: threading.Thread | None = None
         self._last_color: str = ""
         self._last_tooltip: str = ""
+        self._backend_name: str = ""
 
     @property
     def available(self) -> bool:
@@ -106,14 +134,45 @@ class TrayIcon:
 
     @property
     def running(self) -> bool:
+        if self._sni is not None and self._sni.running:
+            return True
         return self._icon is not None
+
+    @property
+    def backend_name(self) -> str:
+        return self._backend_name
 
     def start(self) -> bool:
         """Create the icon.  Returns ``False`` when unsupported/failed."""
-        if self._icon is not None:
+        if self.running:
             return True
-        if not self.available:
+
+        # On Linux prefer native D-Bus StatusNotifierItem (works on Wayland +
+        # X11 across KDE/GNOME-AppIndicator/XFCE/Waybar without GI or Xlib).
+        if sys.platform == "linux" and _linux_sni_available():
+            if self._start_sni():
+                return True
+
+        if not _pystray_available():
             return False
+        return self._start_pystray()
+
+    def _start_sni(self) -> bool:
+        sni = LinuxSniTray(
+            tooltip=self.tooltip,
+            icon_factory=_make_icon_image,
+            on_show=lambda: self._call(self.on_show),
+            on_toggle=lambda: self._call(self.on_toggle),
+            on_reconnect=lambda: self._call(self.on_reconnect),
+            on_quit=lambda: self._call(self.on_quit),
+        )
+        if sni.start():
+            self._sni = sni
+            self._backend_name = "sni"
+            return True
+        return False
+
+    def _start_pystray(self) -> bool:
         try:
             import pystray
         except Exception:
@@ -129,7 +188,7 @@ class TrayIcon:
             )
 
         try:
-            self._icon = pystray.Icon(
+            icon = pystray.Icon(
                 "jlu-drcom-ng",
                 icon=_make_icon_image(),
                 title=self.tooltip,
@@ -139,15 +198,45 @@ class TrayIcon:
             self._icon = None
             return False
 
-        self._thread = threading.Thread(target=self._run, name="drcom-tray", daemon=True)
-        self._thread.start()
-        return True
+        # Verify startup instead of blindly returning True: on Linux Wayland or
+        # headless X11 without an XEmbed tray, pystray's run() thread throws
+        # immediately. Waiting briefly for setup() catches that honestly.
+        started = threading.Event()
+        failed = threading.Event()
 
-    def _run(self) -> None:
-        try:
-            self._icon.run()  # type: ignore[union-attr]
-        except Exception:
-            pass
+        def _setup(active_icon) -> None:
+            try:
+                active_icon.visible = True
+            except Exception:
+                pass
+            started.set()
+
+        def _run() -> None:
+            try:
+                icon.run(setup=_setup)
+            except Exception:
+                failed.set()
+                started.set()
+            finally:
+                if not started.is_set():
+                    failed.set()
+                    started.set()
+
+        self._icon = icon
+        self._thread = threading.Thread(target=_run, name="drcom-tray", daemon=True)
+        self._thread.start()
+
+        if started.wait(1.5) and failed.is_set():
+            self._icon = None
+            self._thread = None
+            return False
+        if not self._thread.is_alive():
+            self._icon = None
+            self._thread = None
+            return False
+
+        self._backend_name = "pystray"
+        return True
 
     def _call(self, func: Callable[[], None] | None) -> None:
         if func is None:
@@ -157,29 +246,56 @@ class TrayIcon:
         except Exception:
             pass
 
-    def update(self, *, tooltip: str | None = None, color: str | None = None,
-               online: bool | None = None) -> None:
+    def update(
+        self,
+        *,
+        tooltip: str | None = None,
+        color: str | None = None,
+        online: bool | None = None,
+    ) -> None:
         """Refresh the icon appearance / hover text (only mutates on actual change)."""
-        if self._icon is None:
-            return
+        del online
+        new_tip: str | None = None
         if tooltip is not None:
             trimmed = tooltip[:127]
             if trimmed != self._last_tooltip:
-                try:
-                    self._icon.title = trimmed
-                    self._last_tooltip = trimmed
-                except Exception:
-                    pass
+                new_tip = trimmed
+
+        new_color: str | None = None
         if color is not None and color != self._last_color:
+            new_color = color
+
+        if new_tip is None and new_color is None:
+            return
+
+        if self._sni is not None and self._sni.running:
+            self._sni.update(tooltip=new_tip, color=new_color)
+            if new_tip is not None:
+                self._last_tooltip = new_tip
+            if new_color is not None:
+                self._last_color = new_color
+            return
+
+        if self._icon is None:
+            return
+        if new_tip is not None:
             try:
-                self._icon.icon = _make_icon_image(color)
-                self._last_color = color
+                self._icon.title = new_tip
+                self._last_tooltip = new_tip
             except Exception:
                 pass
-        del online
+        if new_color is not None:
+            try:
+                self._icon.icon = _make_icon_image(new_color)
+                self._last_color = new_color
+            except Exception:
+                pass
 
     def notify(self, message: str, title: str = "JLU DrCOM NG") -> None:
         """Show a balloon/toast via the tray, when the backend supports it."""
+        if self._sni is not None and self._sni.running:
+            self._sni.notify(message, title)
+            return
         if self._icon is None:
             return
         try:
@@ -188,6 +304,12 @@ class TrayIcon:
             pass
 
     def stop(self) -> None:
+        if self._sni is not None:
+            try:
+                self._sni.stop()
+            except Exception:
+                pass
+            self._sni = None
         if self._icon is not None:
             try:
                 self._icon.stop()
@@ -195,3 +317,4 @@ class TrayIcon:
                 pass
             self._icon = None
         self._thread = None
+        self._backend_name = ""

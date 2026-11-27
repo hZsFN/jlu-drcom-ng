@@ -48,6 +48,8 @@ HIDDEN_IMPORTS = [
     "pystray",
     "pystray._win32",
     "pystray._darwin",
+    "pystray._appindicator",
+    "pystray._gtk",
     "pystray._xorg",
     "PIL",
     "PIL.Image",
@@ -58,9 +60,23 @@ HIDDEN_IMPORTS = [
     "flet.controls.box",
     "flet_desktop",
     "drcom",
+    "drcom.ui.sni_tray",
 ]
 if not IS_WINDOWS:
     HIDDEN_IMPORTS += ["cryptography", "cryptography.fernet"]
+if sys.platform == "linux":
+    HIDDEN_IMPORTS += [
+        "dbus_fast",
+        "dbus_fast.aio",
+        "dbus_fast.service",
+        "dbus_fast.signature",
+        "dbus_fast.message",
+        "dbus_fast.constants",
+        "dbus_fast.errors",
+        "dbus_fast.introspection",
+        "dbus_fast.proxy_object",
+        "dbus_fast._private",
+    ]
 
 # Keep the bundle lean: none of these are used, and several are enormous.
 EXCLUDES = [
@@ -164,6 +180,8 @@ def build(*, onefile: bool = False, name: str = "JLU-DrCOM-NG", console: bool = 
     # control with an icon is constructed.  Static analysis cannot see those.
     for package in ("flet", "flet_desktop", "PIL"):
         arguments += ["--collect-data", package]
+    if sys.platform == "linux":
+        arguments += ["--collect-submodules", "dbus_fast"]
 
     # Ship the Flet runtime inside the package so no download is needed.
     runtime = FLET_ARCHIVE if FLET_ARCHIVE.exists() else None

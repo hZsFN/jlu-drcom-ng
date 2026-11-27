@@ -27,6 +27,8 @@ queue and mutates widgets — all Flet access stays on the UI event loop.
 from __future__ import annotations
 
 import asyncio
+import inspect
+import os
 import queue
 import sys
 import threading
@@ -99,6 +101,8 @@ class DrcomApp:
 
         self.active_view = VIEWS[0]
         self._tray: TrayIcon | None = None
+        self._view_proc = None
+        self._view_pid_file: str | None = None
         self._last_keepalive_at = 0.0
         self._telemetry = HudTelemetry()
         self._canvas_size = (820.0, 360.0)
@@ -1127,8 +1131,9 @@ class DrcomApp:
             self._flash(msg, ok)
 
         # --- startup ------------------------------------------------------
+        has_tray = self._tray is not None or self._native_tray_active() or tray_available()
         autostart = make_switch(
-            "开机自动启动" + ("" if tray_available() else "（需要 pystray 才能最小化到托盘）"),
+            "开机自动启动" + ("" if has_tray else "（当前环境无系统托盘）"),
             controller.autostart_enabled(),
             on_change=lambda e: self._on_autostart(e.control.value),
         )
@@ -1179,7 +1184,7 @@ class DrcomApp:
             else "关闭窗口时释放界面内存（约 100–190 MB，重新打开约需 1 秒）",
             cfg.ui.release_ui_on_close or native_tray,
             on_change=lambda e: (setattr(cfg.ui, "release_ui_on_close", e.control.value), persist()),
-            disabled=native_tray or not tray_available(),
+            disabled=native_tray or not has_tray,
         )
 
         # --- HUD / accessibility -------------------------------------------
@@ -1736,15 +1741,25 @@ class DrcomApp:
                         "关闭即整个界面进程退出（只留约 1 MB 的原生核心），"
                         "认证不断；点托盘图标可重新打开窗口。"
                     )
-                elif self.controller.config.ui.release_ui_on_close:
+                elif self._tray is not None or tray_available():
+                    if self.controller.config.ui.release_ui_on_close:
+                        note.value = (
+                            "关闭即释放界面进程并退到托盘，可回收一百多 MB 内存；"
+                            "认证继续在后台运行，点击托盘图标重新打开（约 1 秒）。"
+                        )
+                    else:
+                        note.value = (
+                            "关闭即隐藏到托盘，认证继续在后台运行；"
+                            "要真正退出请用托盘菜单的「退出」，或在「设置」里改回。"
+                        )
+                elif self._native_core_active():
                     note.value = (
-                        "关闭即释放界面进程并退到托盘，可回收一百多 MB 内存；"
-                        "认证继续在后台运行，双击托盘图标重新打开（约 1 秒）。"
+                        "当前桌面未检测到系统托盘，关闭即退出界面进程并由原生核心 drcomd "
+                        "在后台继续认证；可从应用菜单重新打开窗口。"
                     )
                 else:
                     note.value = (
-                        "关闭即隐藏到托盘，认证继续在后台运行；"
-                        "要真正退出请用托盘菜单的「退出」，或在「设置」里改回。"
+                        "当前环境无可用系统托盘，关闭窗口将改为最小化到任务栏，认证不中断。"
                     )
             else:
                 note.value = "关闭即退出程序，认证会中断。"
@@ -1993,10 +2008,16 @@ class DrcomApp:
             # in this process still provides the desktop tray icon.
             return
         if not tray_available():
-            self.controller.log.warning(
-                "未安装 pystray，无法创建系统托盘图标；「关闭时隐藏」将改为最小化，"
-                "以免窗口无法找回。安装：pip install pystray"
-            )
+            if sys.platform == "linux":
+                self.controller.log.warning(
+                    "未检测到可用的 Linux 托盘后端（需要 dbus-fast 或 pystray）；"
+                    "若使用原生核心 drcomd，关闭窗口仍可在后台保持认证。"
+                )
+            else:
+                self.controller.log.warning(
+                    "未安装 pystray，无法创建系统托盘图标；「关闭时隐藏」将改为最小化，"
+                    "以免窗口无法找回。安装：pip install pystray"
+                )
             return
         self._tray = TrayIcon(
             tooltip="JLU DrCOM NG · 待机",
@@ -2007,6 +2028,15 @@ class DrcomApp:
         )
         if not self._tray.start():
             self._tray = None
+            if sys.platform == "linux":
+                self.controller.log.warning(
+                    "当前桌面环境未提供系统托盘服务（GNOME 请启用 AppIndicator 扩展）；"
+                    "关闭窗口后原生核心仍会在后台保持认证。"
+                )
+        else:
+            backend = getattr(self._tray, "backend_name", "")
+            if backend:
+                self.controller.log.info("系统托盘图标已就绪（后端：%s）", backend)
 
     def _tray_engine(self, kind: str) -> None:
         """Tray login/logout or reconnect.
@@ -2062,8 +2092,9 @@ class DrcomApp:
           rebuilt on demand (about a second).
         * hide -- keep the client alive and just stop showing the window.
 
-        Without a tray there is nothing to come back from, so the window is
-        only minimised.
+        Without a tray, native-core Linux can still close the window cleanly
+        (``drcomd`` stays online and reattaches on next launch); Python-only
+        mode minimises instead so the session is not lost.
         """
         if self.page is None:
             return
@@ -2072,6 +2103,11 @@ class DrcomApp:
             self._leave_ui_to_core()
             return
         if self._tray is None:
+            if self._native_core_active():
+                # Linux without a desktop tray host (e.g. stock GNOME): drcomd
+                # still keeps the session alive after the UI process exits.
+                self._leave_ui_to_core()
+                return
             self._minimize()
             return
         if self.controller.config.ui.release_ui_on_close:
@@ -2086,15 +2122,106 @@ class DrcomApp:
             pass
         self._minimize()
 
+    def _is_flet_view_alive(self) -> bool:
+        proc = self._view_proc
+        if proc is None:
+            return False
+        poll = getattr(proc, "poll", None)
+        if callable(poll):
+            try:
+                return poll() is None
+            except Exception:
+                return False
+        return getattr(proc, "returncode", None) is None
+
+    def _terminate_flet_view(self) -> None:
+        """Force-close a wedged Flet client process (notably on Linux GTK/Wayland)."""
+        proc = self._view_proc
+        pid_file = self._view_pid_file
+        if proc is not None and self._is_flet_view_alive():
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        if pid_file:
+            try:
+                from flet_desktop import close_flet_view
+
+                close_flet_view(pid_file)
+            except Exception:
+                pass
+        if proc is not None and self._is_flet_view_alive():
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        self._view_proc = None
+        self._view_pid_file = None
+
+    async def _teardown_window(self) -> None:
+        """Disarm close interception, flush it, then destroy/close the client.
+
+        On Linux GTK (``window_manager``), calling ``window.destroy()`` while
+        ``prevent_close`` is still ``True`` (or before the ``prevent_close =
+        False`` update has been flushed to the client) can leave the window
+        stuck open.  Clearing and flushing ``prevent_close`` first, then
+        falling back to ``window.close()`` and finally terminating a wedged
+        Flet view process guarantees the window always closes cleanly.
+        """
+        page = self.page
+        if page is None:
+            return
+        window = getattr(page, "window", None)
+        had_real_view = self._is_flet_view_alive()
+        if window is not None:
+            try:
+                window.prevent_close = False
+            except Exception:
+                pass
+            try:
+                window.on_event = None
+            except Exception:
+                pass
+            self._safe_update()
+            if had_real_view:
+                await asyncio.sleep(0.05)
+
+            try:
+                await asyncio.wait_for(window.destroy(), timeout=1.5)
+            except Exception as exc:
+                # Destroy usually *succeeds and then* drops the session: the
+                # client tears the window down, exits, and only then does the
+                # awaiting call notice the socket is gone ("Session closed").
+                self.controller.log.debug("销毁窗口时连接先断了：%r", exc)
+
+            if had_real_view and self._is_flet_view_alive():
+                for _ in range(5):
+                    await asyncio.sleep(0.05)
+                    if not self._is_flet_view_alive():
+                        break
+            if had_real_view and self._is_flet_view_alive():
+                close_fn = getattr(window, "close", None)
+                if callable(close_fn):
+                    try:
+                        await asyncio.wait_for(close_fn(), timeout=1.0)
+                    except Exception:
+                        pass
+                for _ in range(7):
+                    await asyncio.sleep(0.05)
+                    if not self._is_flet_view_alive():
+                        break
+            if had_real_view and self._is_flet_view_alive():
+                self.controller.log.debug("前端窗口未自行退出，强制结束 Flet 客户端进程。")
+                self._terminate_flet_view()
+
     def _leave_ui_to_core(self) -> None:
         """Close the window by ending this process; drcomd keeps the session.
 
         This is the native-core variant of "close to tray".  There is no tray
-        here any more (the daemon owns it) and no engine either, so keeping the
-        process alive would buy nothing: it would sit in the background with a
-        Flet client to rebuild and no way for the user to reach it.  Instead the
-        window closes, this process exits, and the icon the user clicks belongs
-        to the core that never stopped authenticating.
+        here any more (the daemon owns it on Windows, or no tray host exists on
+        Linux) and no engine either, so keeping the process alive would buy
+        nothing.  Instead the window closes, this process exits, and the core
+        never stops authenticating.
         """
         # Stand the supervisor down.  It restarts a client that exited by
         # itself, so without this marker "close" would be undone five seconds
@@ -2111,21 +2238,26 @@ class DrcomApp:
         except Exception:
             pass
         self.controller.log.info(
-            "界面已关闭，认证由 drcomd 核心继续；托盘图标可以重新打开窗口。"
+            "界面已关闭，认证由 drcomd 核心继续；重新打开客户端即可接回当前会话。"
         )
         self.relaunch_wanted = False
+        self._exit_now.clear()
+        threading.Thread(
+            target=self._force_exit_after,
+            args=(self.quit_watchdog_seconds,),
+            daemon=True,
+        ).start()
         try:
             self.page.run_task(self._destroy_window_then_exit)
         except Exception:
+            self._terminate_flet_view()
             self._finish_quit_now()
 
     async def _destroy_window_then_exit(self) -> None:
         """Close the client window first, then end the process."""
         try:
-            await self.page.window.destroy()
+            await self._teardown_window()
         except Exception:
-            # The connection often dies *because* the window was destroyed --
-            # that is success, not failure.
             pass
         self._finish_quit_now()
 
@@ -2145,17 +2277,7 @@ class DrcomApp:
             self._minimize()
 
     async def _destroy_window(self) -> None:
-        if self.page is None:
-            return
-        try:
-            await self.page.window.destroy()
-        except Exception as exc:
-            # Destroy usually *succeeds and then* drops the session: the client
-            # tears the window down, exits, and only then does the awaiting
-            # call notice the socket is gone ("Session closed").  So this is
-            # only worth a warning when the client is still there -- otherwise
-            # ft.run returns normally and the release worked as intended.
-            self.controller.log.debug("销毁窗口时连接先断了：%r", exc)
+        await self._teardown_window()
 
     def _minimize(self) -> None:
         if self.page is None:
@@ -2216,7 +2338,12 @@ class DrcomApp:
             self.page.window.skip_task_bar = False
             self.page.window.visible = True
             self.page.window.minimized = False
-            self.page.window.to_front()
+            to_front = getattr(self.page.window, "to_front", None)
+            if callable(to_front):
+                if inspect.iscoroutinefunction(to_front):
+                    self.page.run_task(to_front)
+                else:
+                    to_front()
             self._safe_update()
         except Exception:
             pass
@@ -2233,7 +2360,12 @@ class DrcomApp:
         """
         try:
             close_event = getattr(ft.WindowEventType, "CLOSE", None)
-            if close_event is not None and event.type != close_event:
+            ev_type = getattr(event, "type", None)
+            is_close = (
+                (close_event is not None and ev_type == close_event)
+                or str(getattr(ev_type, "value", ev_type)).lower() == "close"
+            )
+            if not is_close:
                 return
 
             action = self.controller.config.ui.close_action
@@ -2259,22 +2391,37 @@ class DrcomApp:
             label_style=ft.TextStyle(color=self.palette.text_dim, size=self.hud.size_body),
         )
 
-        tray_ok = self._tray is not None or self._native_core_active()
+        native_tray = self._native_tray_active()
+        native_core = self._native_core_active()
         release = self.controller.config.ui.release_ui_on_close
-        if self._native_core_active():
+        if native_tray:
             hint = (
                 "关闭后整个界面进程退出，只留约 1 MB 的原生核心继续认证；"
                 "点托盘图标可以重新打开窗口。"
             )
-        elif tray_ok:
+            primary_label = "关闭界面、继续认证"
+        elif self._tray is not None:
             hint = (
                 "关闭后界面进程会被释放（可回收一百多 MB 内存），认证继续在后台运行；"
-                "双击托盘图标可以重新打开窗口。"
+                "点击托盘图标可以重新打开窗口。"
                 if release
-                else "隐藏到托盘后，认证继续在后台运行，双击托盘图标可以再打开。"
+                else "隐藏到托盘后，认证继续在后台运行，点击托盘图标可以再打开。"
             )
+            primary_label = "最小化到托盘"
+        elif native_core:
+            hint = (
+                "当前桌面未检测到系统托盘（GNOME 请启用 AppIndicator 扩展）；"
+                "关闭窗口后原生核心 drcomd 仍会在后台保持认证，可从应用菜单重新打开窗口。"
+            )
+            primary_label = "关闭界面、继续认证"
         else:
-            hint = "未安装 pystray，无法隐藏到托盘，将改为最小化到任务栏。安装：pip install pystray"
+            hint = (
+                "未检测到可用系统托盘（Linux 需 dbus-fast 或桌面托盘服务，其他环境需 pystray），"
+                "将改为最小化到任务栏。"
+                if sys.platform == "linux"
+                else "未安装 pystray，无法隐藏到托盘，将改为最小化到任务栏。安装：pip install pystray"
+            )
+            primary_label = "最小化到托盘"
 
         def choose(action: str) -> None:
             if remember.value:
@@ -2285,7 +2432,7 @@ class DrcomApp:
             self._close_dialog()
             if action == "tray":
                 # Flash first: releasing the window throws the banner away.
-                self._flash("已隐藏到托盘，认证继续在后台运行", True)
+                self._flash("已退到托盘，认证继续在后台运行", True)
                 self._hide_window()
             else:
                 self._quit()
@@ -2311,7 +2458,7 @@ class DrcomApp:
             bgcolor=self.palette.panel,
             actions=[
                 self._button(
-                    "关闭界面、继续认证" if self._native_core_active() else "最小化到托盘",
+                    primary_label,
                     lambda e: choose("tray"), primary=True,
                     accent=self.palette.green, icon=ft.Icons.MINIMIZE),
                 self._button("退出程序", lambda e: choose("quit"), accent=self.palette.amber,
@@ -2880,6 +3027,12 @@ class DrcomApp:
             self._tray.stop()
             self._tray = None
         self.controller.shutdown()
+        native_quit = getattr(self.controller.engine, "shutdown_daemon", None)
+        if callable(native_quit):
+            try:
+                native_quit()
+            except Exception:
+                pass
         self._exit_now.set()
 
     def _quit(self, deliberate: bool = True) -> None:
@@ -2959,19 +3112,21 @@ class DrcomApp:
         """
         try:
             if self.page is not None:
-                await self.page.window.destroy()
-                self.page.update()
+                await self._teardown_window()
+                self._safe_update()
                 # Give the client a moment to process the message before the
                 # socket is torn down underneath it.
                 await asyncio.sleep(0.2)
         except Exception:
             pass
         finally:
+            self._terminate_flet_view()
             self._finish_quit_now()
 
     def _force_exit_after(self, delay: float) -> None:
         """Watchdog: exit if the graceful path has not finished within *delay*."""
         if delay and not self._exit_now.wait(delay):
+            self._terminate_flet_view()
             self._hard_exit()
 
     @staticmethod
@@ -3020,15 +3175,51 @@ def run_gui(
         )
         return
 
+    if sys.platform == "linux":
+        # Match installer's jlu-drcom-ng.desktop so Wayland/X11 docks show our
+        # app icon and title instead of a generic "flet" entry.
+        os.environ.setdefault("FLET_APP_ID", "jlu-drcom-ng")
+
+    # Track the active Flet desktop subprocess so _teardown_window() can
+    # cleanly terminate a wedged Linux GTK/Wayland client if window.destroy()
+    # fails to exit it.
+    flet_desktop_mod = None
+    orig_open_async = None
+    try:
+        import flet_desktop as _fd
+
+        orig_open_async = getattr(_fd, "open_flet_view_async", None)
+        if callable(orig_open_async):
+            flet_desktop_mod = _fd
+
+            async def _tracked_open_flet_view_async(*args, **kwargs):
+                proc, pid_file = await orig_open_async(*args, **kwargs)
+                app._view_proc = proc
+                app._view_pid_file = pid_file
+                return proc, pid_file
+
+            _fd.open_flet_view_async = _tracked_open_flet_view_async
+    except Exception:
+        flet_desktop_mod = None
+        orig_open_async = None
+
     # Each ft.run() blocks until its client process is gone.  Closing to the
     # tray destroys the client to reclaim its memory, so the window is rebuilt
     # from here on demand instead of ending the program.
-    while True:
-        ft.run(target, assets_dir=None)
-        if not app.relaunch_wanted:
-            return
-        app.relaunch_wanted = False
-        app.prepare_new_window()
-        if not app.wait_for_show():
-            app.shutdown_from_main_thread()
-            return
+    try:
+        while True:
+            app._view_proc = None
+            app._view_pid_file = None
+            ft.run(target, assets_dir=None)
+            app._view_proc = None
+            app._view_pid_file = None
+            if not app.relaunch_wanted:
+                return
+            app.relaunch_wanted = False
+            app.prepare_new_window()
+            if not app.wait_for_show():
+                app.shutdown_from_main_thread()
+                return
+    finally:
+        if flet_desktop_mod is not None and orig_open_async is not None:
+            flet_desktop_mod.open_flet_view_async = orig_open_async
